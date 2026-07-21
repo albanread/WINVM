@@ -18,6 +18,17 @@ pub(crate) fn name_of(o: crate::oops::Oop) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+/// Same line, for a frame whose bci is not recoverable — see the tier
+/// bridge in [`print_stack_trace`].
+fn print_frame_line_unknown_bci(vm: &mut VmState, method: MethodOop) {
+    let sel = name_of(method.selector());
+    let holder = match KlassOop::try_from(method.holder()) {
+        Some(k) => name_of(k.name()),
+        None => "?".to_string(),
+    };
+    let _ = writeln!(vm.out, "  {holder}>>{sel} @?");
+}
+
 fn print_frame_line(vm: &mut VmState, method: MethodOop, bci: usize) {
     let sel = name_of(method.selector());
     let holder = match KlassOop::try_from(method.holder()) {
@@ -69,17 +80,72 @@ pub fn print_stack_trace(vm: &mut VmState) {
     print_frame_line(vm, top_method, top_bci);
 
     let mut fp = vm.stack.fp;
+    // A cursor into `tier_links`, consumed from the top down as the walk
+    // crosses tier boundaries (see the bridging step below).
+    let mut link_cursor = vm.tier_links.len();
+
     // Bounded so a corrupt/cyclic chain can't spin forever, and every frame
-    // read is the non-panicking variant: when the erroring activation was
-    // entered from compiled code the walk reaches a boundary whose slots aren't
-    // valid interpreter-frame words, and STOPPING there (a truncated trace) is
-    // the right answer — aborting the VM from inside its own error reporter is
-    // not (the `Frame::saved_fp: not a smi` crash this replaces).
+    // read is the non-panicking variant: aborting the VM from inside its own
+    // error reporter is not an option (the `Frame::saved_fp: not a smi` crash
+    // this replaces).
     for _ in 0..MAX_TRACE_FRAMES {
         let frame = Frame { fp };
         let saved_fp = match frame.saved_fp_opt(&vm.stack) {
             Some(v) if v != ENTRY_FRAME_SENTINEL => v,
-            _ => break,
+            _ => {
+                // A tier boundary, not the bottom of the stack. Compiled
+                // code pushes no `vm.stack` frame, so the interpreted
+                // chain simply ends here — and this walk used to stop,
+                // silently dropping every frame BELOW the compiled one.
+                //
+                // `TierLink::IntoCompiled` records exactly what is needed
+                // to continue: which nmethod is running, and
+                // `interp_frame`, the fp of the interpreted caller on the
+                // far side of it. Bridge across and keep walking.
+                //
+                // Stopping was defensible when a compiled activation was
+                // necessarily the OUTERMOST thing on the stack (D1's
+                // send-free methods could not nest, so nothing was below
+                // it to lose). Once compiled code can call back into the
+                // interpreter that stopped being true, and the truncation
+                // became a real loss: a guest error under the JIT showed a
+                // stack cut off at the tier boundary.
+                let Some(i) = vm.tier_links[..link_cursor]
+                    .iter()
+                    .rposition(|l| matches!(l, TierLink::IntoCompiled { .. }))
+                else {
+                    break;
+                };
+                let TierLink::IntoCompiled {
+                    interp_frame,
+                    nm_id,
+                    ..
+                } = vm.tier_links[i]
+                else {
+                    break;
+                };
+                link_cursor = i;
+                let _ = nm_id;
+                // Deliberately NOT printing a compiled frame line here.
+                // The nmethod named by this link is frequently the same
+                // activation the interpreted walk has already reported —
+                // a compiled method that deoptimized mid-flight leaves a
+                // materialized interpreted frame AND its now-dead tier
+                // link, so printing both duplicates it. The link's job in
+                // this walk is purely to say where the chain resumes.
+                fp = interp_frame;
+                let Some(m) = (Frame { fp }).method_opt(&vm.stack) else {
+                    break;
+                };
+                // The bci is the one thing the bridge genuinely cannot
+                // recover: an interpreted caller's resume point is read
+                // from its CALLEE's frame, and a compiled callee has no
+                // frame to read it from. Print `?` — a frame named with
+                // an honest unknown beats both a missing frame and a
+                // confident `@0` that reads like a real bytecode index.
+                print_frame_line_unknown_bci(vm, m);
+                continue;
+            }
         };
         let caller_bci = frame.saved_bci_opt(&vm.stack).unwrap_or(0);
         fp = saved_fp as usize;
