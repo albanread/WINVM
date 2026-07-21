@@ -646,7 +646,54 @@ pub fn build_stub_box_double_x64(rt_box_double_addr: u64) -> CodeBlob {
 
 /// `stub_call_primitive` — `rt_call_primitive(vm, prim_id, argc_plus_recv)`.
 pub fn build_stub_call_primitive_x64(rt_call_primitive_addr: u64, kind: u64) -> CodeBlob {
-    build_shift_and_call_stub(rt_call_primitive_addr, 2, kind)
+    let mut a = X64Assembler::new();
+
+    // The payload arrives in R10/R11, NOT in the argument registers —
+    // and that is the whole point. `RCX/RDX/R8/R9` here hold the
+    // compiled method's own receiver and arguments, which the prologue
+    // below archives into the RootSpill as the primitive's `&[Oop]`
+    // argument slice. Passing `prim_id` in RCX would overwrite the
+    // receiver with an integer and hand the primitive its own id as
+    // `self`.
+    //
+    // This is exactly what the AArch64 stub does with x10/x11, and it is
+    // why this stub cannot be `build_shift_and_call_stub` — an earlier
+    // version was, reading RCX/RDX, and nothing caught it because
+    // `prim_shim` was declined on x64 so the stub was never called.
+    //
+    // Both payloads arrive PACKED in R11: `(prim_id << 8) | argc_plus_recv`.
+    //
+    // One register, not two, because only one is actually available.
+    // R10 is out on both counts — the prologue clobbers it for the
+    // return-address and kind stores, and `call_far` loads its target
+    // into it, so a `prim_id` placed there is overwritten by the
+    // stub's own address before the call even happens. (That was the
+    // first version, and it failed with "unknown primitive id
+    // 140694972008352" — a code address, which named the bug exactly.)
+    //
+    // Packing is safe: `argc_plus_recv` is a method's arity plus one, far
+    // below 256, and primitive ids are small. The alternative was
+    // clobbering a callee-saved register, which would have depended on
+    // spill-all-at-safepoints in a way that is true but too subtle to
+    // rest an ABI on.
+    a.emit("mov", &[r64(RAX), r64(R11)]); // packed payload
+    emit_stub_prologue_x64(&mut a, kind);
+    a.emit("mov", &[r64(ARG_REGS[2]), r64(RAX)]);
+    a.emit("and", &[r64(ARG_REGS[2]), imm(0xFF)]); // argc_plus_recv
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(RAX)]);
+    a.emit("shr", &[r64(ARG_REGS[1]), imm(8)]); // prim_id
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    let lit = a.literal_u64(rt_call_primitive_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(lit);
+    // Park the result across the epilogue, which reloads the argument
+    // registers from the RootSpill — that reload is what lets the
+    // shim's FAIL path fall straight through into the method body with
+    // the receiver and arguments exactly as they arrived.
+    a.emit("mov", &[r64(R11), r64(RAX)]);
+    emit_stub_epilogue_x64(&mut a);
+    a.emit("mov", &[r64(RAX), r64(R11)]);
+    a.emit("ret", &[]);
+    a.finish()
 }
 
 /// `stub_nlr_originate` — `rt_nlr_originate(vm, closure, value)`, which
@@ -836,7 +883,7 @@ mod tests {
         use crate::vendor::wfasm::native_windows::WinJit;
 
         let stub = build_call_stub_x64();
-        let method = emit_x64(&add_method(), &regalloc(&add_method()), RuntimeAddrs::default(), None).blob;
+        let method = emit_x64(&add_method(), &regalloc(&add_method()), RuntimeAddrs::default(), None, None).blob;
 
         let jit = WinJit::with_capacity(stub.code.len() + method.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -876,7 +923,7 @@ mod tests {
         use crate::vendor::wfasm::native_windows::WinJit;
 
         let stub = build_call_stub_x64();
-        let method = emit_x64(&add_method(), &regalloc(&add_method()), RuntimeAddrs::default(), None).blob;
+        let method = emit_x64(&add_method(), &regalloc(&add_method()), RuntimeAddrs::default(), None, None).blob;
 
         // A harness, in machine code, that loads a distinct sentinel into
         // every callee-saved register, calls the stub, then XORs each

@@ -237,6 +237,8 @@ pub struct RuntimeAddrs {
     pub stub_poll: u64,
     /// `stub_must_be_boolean` — coerces or raises on a non-boolean.
     pub must_be_boolean: u64,
+    /// `stub_call_primitive` — the primitive shim's entry.
+    pub call_primitive: u64,
     /// `stub_alloc_slow` — the allocation slow path.
     pub alloc_slow: u64,
     /// `stub_box_double` — `FBox`'s eden-overflow tail. Added when the
@@ -279,6 +281,7 @@ struct Emitter<'a> {
     must_be_boolean_lit: LiteralId,
     alloc_slow_lit: LiteralId,
     box_double_lit: LiteralId,
+    call_primitive_lit: LiteralId,
     current_bci: usize,
     /// This op's index in regalloc's linear numbering.
     pos: u32,
@@ -746,6 +749,7 @@ pub fn emit_x64(
     regalloc: &RegallocResult,
     rt: RuntimeAddrs,
     guard: Option<&EntryGuard>,
+    prim_shim: Option<(i64, u8)>,
 ) -> Emitted {
     let mut asm = X64Assembler::new();
 
@@ -769,6 +773,8 @@ pub fn emit_x64(
     let must_be_boolean_lit = asm.literal_u64(rt.must_be_boolean, Some(RelocKind::RuntimeAddr));
     let alloc_slow_lit = asm.literal_u64(rt.alloc_slow, Some(RelocKind::RuntimeAddr));
     let box_double_lit = asm.literal_u64(rt.box_double, Some(RelocKind::RuntimeAddr));
+    let call_primitive_lit =
+        asm.literal_u64(rt.call_primitive, Some(RelocKind::RuntimeAddr));
 
     let labels: Vec<Label> = (0..method.blocks.len()).map(|_| asm.new_label()).collect();
     let epilogue = asm.new_label();
@@ -788,6 +794,7 @@ pub fn emit_x64(
         must_be_boolean_lit,
         alloc_slow_lit,
         box_double_lit,
+        call_primitive_lit,
         current_bci: 0,
         pos: 0,
         method,
@@ -843,6 +850,45 @@ pub fn emit_x64(
             e.asm
                 .emit("mov", &[mem(RBP, spill_offset(slot)), r64(SCRATCH0)]);
         }
+    }
+
+    // A shimmable primitive-bearing method's entry prefix: try the
+    // primitive first, and only run the bytecode body if it fails. Not a
+    // mid-method `Ir` node, because a primitive is always attempted
+    // before any of the method's own bytecode.
+    if let Some((prim_id, argc_plus_recv)) = prim_shim {
+        let fail = e.asm.new_label();
+        // R11, NOT an argument register: those hold this method's real
+        // receiver and arguments, which `stub_call_primitive` archives
+        // into the RootSpill as the primitive's own argument slice.
+        //
+        // And R11 specifically, not R10: `call_far` below loads the stub
+        // address into R10, so anything placed there is destroyed before
+        // the call. Both payloads are therefore packed into the one
+        // register that survives — see the stub for the unpacking.
+        let packed = (prim_id << 8) | (argc_plus_recv as i64);
+        e.asm.emit("mov", &[r64(SCRATCH1), imm(packed)]);
+        let lit = e.call_primitive_lit;
+        let ret_pc = e.emit_runtime_call(lit);
+        // The primitive can allocate, so this is a safepoint. Nothing
+        // regalloc-tracked is live yet (position 0, before any real IR),
+        // so its oop map is empty — correct rather than a gap: the live
+        // receiver and arguments are covered by the RootSpill instead.
+        e.record_safepoint_at(ret_pc);
+        e.asm.emit(
+            "cmp",
+            &[r64(RAX), imm(crate::oops::layout::PRIM_FAIL_SENTINEL as i64)],
+        );
+        e.asm.jcc(Cond::E, fail);
+        // Success: the tagged result is already in RAX, which is also
+        // this method's return register — so unlike AArch64 (which moves
+        // x16 to x0) there is nothing to move.
+        let ep = e.epilogue;
+        e.asm.jmp(ep);
+        e.asm.bind(fail);
+        // Fall through into the body with the argument registers restored
+        // by the stub's epilogue, exactly as an ordinary entry would have
+        // them.
     }
 
     // ── Blocks ──────────────────────────────────────────────────────────
@@ -1701,7 +1747,7 @@ mod tests {
     fn compile_and_run(method: &IrMethod, a: u64, b: u64) -> u64 {
         use crate::vendor::wfasm::native_windows::WinJit;
         let ra = regalloc(method);
-        let blob = emit_x64(method, &ra, RuntimeAddrs::default(), None).blob;
+        let blob = emit_x64(method, &ra, RuntimeAddrs::default(), None, None).blob;
         let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX region");
         let (base, _cap) = jit.region_raw();
         // SAFETY: the region was just allocated with room for the blob.
@@ -2008,6 +2054,7 @@ mod tests {
                 must_be_boolean_lit: LiteralId(0),
                 alloc_slow_lit: LiteralId(0),
                 box_double_lit: LiteralId(0),
+            call_primitive_lit: LiteralId(0),
                 current_bci: 0,
                 pos: 0,
                 method: &hand_method(Vec::new(), Vec::new(), 0),
@@ -2172,7 +2219,7 @@ mod tests {
             0,
         );
         let ra = regalloc(&m);
-        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None);
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None, None);
 
         // The emitter recorded the site, keyed by the trap's own offset.
         assert_eq!(out.trap_sites.len(), 1);
@@ -2304,7 +2351,7 @@ mod tests {
             oops(2),
             1,
         );
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2391,7 +2438,7 @@ mod tests {
             oops(3),
             2,
         );
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2633,7 +2680,7 @@ mod tests {
             stub_poll: poll_stub_probe as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2687,7 +2734,7 @@ mod tests {
             oops(1),
             0,
         );
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None);
         assert_eq!(out.safepoints.len(), 1, "one poll, one safepoint");
         // It is a return address, so it must be strictly inside the code,
         // past the call that precedes it.
@@ -2734,7 +2781,7 @@ mod tests {
             must_be_boolean: double_it as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2838,7 +2885,7 @@ mod tests {
             alloc_slow: alloc_slow_probe as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -3022,7 +3069,7 @@ mod tests {
             static_klass: None,
         }];
 
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None);
         assert_eq!(out.ic_sites.len(), 1, "one send, one IC site");
         assert_eq!(out.ic_sites[0].site, 0);
         assert_eq!(out.safepoints.len(), 1, "a send is a deopt safepoint");
@@ -3119,7 +3166,7 @@ mod tests {
             static_klass: None,
         }];
 
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None);
         let site_off = out.ic_sites[0].off as usize;
         let blob = out.blob;
         let stub = build_call_stub_x64();
@@ -3299,7 +3346,7 @@ mod tests {
         use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
         use crate::vendor::wfasm::native_windows::WinJit;
         let vmreg = [0u64; 8];
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -3375,7 +3422,7 @@ mod tests {
             key_klass_bits: KEY_KLASS,
             resolve_addr: resolve_probe as usize as u64,
         };
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), Some(&guard));
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), Some(&guard), None);
         assert!(
             out.verified_entry_off > 0,
             "a guard was requested, so the verified entry must sit past it"
@@ -3460,7 +3507,7 @@ mod tests {
             0,
         );
         let ra = regalloc(&m);
-        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None);
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None, None);
         assert_eq!(out.safepoints.len(), 1, "one Poll, one safepoint");
 
         // Recompute the Poll's position by walking regalloc's own order,
@@ -3510,6 +3557,7 @@ mod tests {
             must_be_boolean_lit: LiteralId(0),
             alloc_slow_lit: LiteralId(0),
             box_double_lit: LiteralId(0),
+            call_primitive_lit: LiteralId(0),
             current_bci: 0,
             pos: 0,
             method: &m,

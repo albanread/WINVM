@@ -1198,7 +1198,6 @@ fn compile_method_full(
             box_float64x2_addr,
             box_float32x4_addr,
             box_int32x4_addr,
-            call_primitive_addr,
             nlr_originate_addr,
             &osr_req,
         );
@@ -1210,8 +1209,10 @@ fn compile_method_full(
                 must_be_boolean: must_be_boolean_addr,
                 alloc_slow: alloc_slow_addr,
                 box_double: box_double_addr,
+                call_primitive: call_primitive_addr,
             },
             if method.is_block() { None } else { Some(&guard) },
+            prim_shim,
         );
         let block_pcs: Vec<emit::BlockPc> = em
             .block_pcs
@@ -1588,9 +1589,6 @@ fn x64_decline_reason(
 ) -> Option<String> {
     use crate::compiler::emit_x64::{ir_op_name, SUPPORTED_OPS};
 
-    if let Some((prim, _)) = prim_shim {
-        return Some(format!("primitive shim (prim {prim}) is not lowered on x64"));
-    }
     for block in &ir_method.blocks {
         for op in &block.code {
             let name = ir_op_name(op);
