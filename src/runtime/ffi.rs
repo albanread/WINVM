@@ -100,23 +100,6 @@ const DESC_ADDR_CACHE: usize = 6;
 /// function is still alive in a local for a scavenge to invalidate —
 /// there is nothing here for a `HandleScope` to protect.
 pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> PrimitiveOutcome {
-    // WINVM: the FFI invoke trampolines (`codecache::ffi_stubs`) are still
-    // AArch64 machine code — executing one on x64 is an instant fault. Fail
-    // the doit cleanly until the Phase-3 x64 backend re-emits the stubs
-    // (MIGRATION.md §4). Guest-fatal, not a prim Fail: same rationale as
-    // the Tier-2 arm below — the generated method body is empty besides the
-    // pragma, so a silent fallthrough would look like a successful send.
-    if cfg!(not(target_arch = "aarch64")) {
-        crate::runtime::error::guest_fatal(
-            vm,
-            format!(
-                "FFI: native calls aren't available on this platform yet (the invoke \
-                 trampolines are AArch64; the x64 backend is Phase 3 — MIGRATION.md) — \
-                 function {name:?}",
-                name = sym_text(m.literals().at(DESC_NAME)),
-            ),
-        );
-    }
     let desc = m.literals();
 
     let kind = sym_text(desc.at(DESC_KIND));
@@ -196,7 +179,136 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
     // `1..=argc` are the real arguments, in declared order.
     let base = vm.stack.sp - argc_usize - 1;
 
+    // ── Win64 marshalling ───────────────────────────────────────────────
+    //
+    // ONE buffer in signature-position order plus a float-position mask,
+    // because Win64 assigns argument SLOTS by position and picks the
+    // register file by type: slot i is RCX/RDX/R8/R9 or XMM0-3. The
+    // pragma's own token list is already in position order, so the mask
+    // falls straight out of it — see `codecache::ffi_stubs_x64` for why
+    // the AArch64 pair of class-partitioned buffers cannot express this.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        use crate::codecache::ffi_stubs_x64::ARGV_WORDS;
+        let mut argv = [0u64; ARGV_WORDS];
+        let mut class_mask = 0u32;
+        if argc_usize > ARGV_WORDS {
+            crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: function {name:?} takes {argc_usize} arguments, more than the \
+                     {ARGV_WORDS} the trampoline buffer holds"
+                ),
+            );
+        }
+        for i in 0..argc_usize {
+            let arg_oop = vm.stack.get(base + 1 + i);
+            let tok = sym_text(args_desc.at(i));
+            match tok.as_str() {
+                "g" => {
+                    let Some(word) = marshal_g(arg_oop) else {
+                        return PrimitiveOutcome::Fallthrough;
+                    };
+                    argv[i] = word;
+                }
+                "f" => {
+                    let Some(word) = marshal_f(arg_oop) else {
+                        return PrimitiveOutcome::Fallthrough;
+                    };
+                    argv[i] = word;
+                    class_mask |= 1 << i;
+                }
+                other => crate::runtime::error::guest_fatal(
+                    vm,
+                    format!(
+                        "FFI: unsupported argument-shape token {other:?} (arg #{i} of \
+                         function {name:?}) — only \"g\"/\"f\" have a marshaling path \
+                         today; struct/HFA argument shapes are Tier 2/deferred territory \
+                         (docs/FFI.md §3)"
+                    ),
+                ),
+            }
+        }
+
+        // Past this point no `Fallthrough` can happen, so truncate the
+        // operand stack exactly as the AArch64 arm does below — a compiled
+        // caller's static stack model depends on it.
+        vm.stack.sp = base;
+
+        let argc_u32 = argc_usize as u32;
+        if let Some(cached) = SmallInt::try_from(desc.at(DESC_ADDR_CACHE)) {
+            let target = cached.value() as u64;
+            let result =
+                vm.ffi_stubs
+                    .invoke_win64(ret_class, target, &argv, class_mask, argc_u32);
+            return unmarshal_ret(vm, ret_class, result, &name);
+        }
+
+        // Resolution, knowledge base first. `winkb` knows which DLL
+        // exports the symbol, which matters because `dlsym_resolve`'s
+        // fallback only probes a handful of well-known modules — it would
+        // never find, say, a d2d1.dll or ole32.dll export. When no
+        // database is present this simply falls through to that probe, so
+        // the machine without one behaves exactly as before.
+        let mut resolved = None;
+        if crate::runtime::winkb::available() {
+            match crate::runtime::winkb::lookup_function(&name) {
+                Ok(sig) => {
+                    // Cross-check the hand-authored pragma against the real
+                    // signature. A pragma that disagrees is a guest bug
+                    // that would otherwise mis-marshal silently — the
+                    // exact failure mode this whole FFI path is careful
+                    // about — so it is named, loudly, rather than trusted.
+                    if sig.params.len() == argc_usize && sig.class_mask() != class_mask {
+                        crate::runtime::error::guest_fatal(
+                            vm,
+                            format!(
+                                "FFI: function {name:?}'s pragma declares float positions \
+                                 {class_mask:#b} but {} really takes {:#b} — a mismatched \
+                                 token list passes a float's bits in an integer register \
+                                 without faulting",
+                                sig.dll,
+                                sig.class_mask()
+                            ),
+                        );
+                    }
+                    resolved = crate::vendor::wfasm::native::dlsym_resolve(Some(&sig.dll), &name);
+                }
+                Err(crate::runtime::winkb::WinkbError::NotFound(_))
+                | Err(crate::runtime::winkb::WinkbError::DbMissing(_)) => {}
+                Err(e) => crate::runtime::error::guest_fatal(
+                    vm,
+                    format!("FFI: {name:?} cannot be called: {e}"),
+                ),
+            }
+        }
+        let target = match resolved.or_else(|| {
+            crate::vendor::wfasm::native::dlsym_resolve(None, &name)
+        }) {
+            Some(t) => t,
+            None => crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: no exported symbol named {name:?} was found — check the \
+                     function: name in the pragma (and note that Windows text APIs are \
+                     named CreateFileW/CreateFileA, never CreateFile)"
+                ),
+            ),
+        };
+        desc.at_put(DESC_ADDR_CACHE, SmallInt::new(target as i64).oop());
+        let result = vm
+            .ffi_stubs
+            .invoke_win64(ret_class, target, &argv, class_mask, argc_u32);
+        return unmarshal_ret(vm, ret_class, result, &name);
+    }
+
+    // The AArch64 arm. Unreachable on x64 (the block above returns), but
+    // left compiled rather than cfg-gated: the two arms share every helper
+    // around them, and splitting the whole tail would duplicate the
+    // resolution and unmarshalling logic for no benefit.
+    #[allow(unused_mut, unused_variables)]
     let mut argv_g = [0u64; crate::codecache::ffi_stubs::ARGV_G_WORDS];
+
     let mut argv_f = [0u64; 8];
     let mut next_g = 0usize;
     let mut next_f = 0usize;

@@ -45,6 +45,17 @@ fn load_tests_list(vm: &mut macvm::runtime::VmState) {
             Some(rest) => rest,
             None => line,
         };
+        // The mirror image: a suite that exercises Win32/COM has nothing
+        // to run against on macOS. Both tags exist so neither platform's
+        // coverage is expressed as the absence of the other's.
+        let line = match line.strip_prefix("win32-only:") {
+            Some(rest) if !cfg!(windows) => {
+                eprintln!("[tests.list] SKIP {rest} — Win32-only, not available on this host");
+                continue;
+            }
+            Some(rest) => rest,
+            None => line,
+        };
         world::load_file(vm, &dir.join(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
         if vm.exit_requested {
             break;

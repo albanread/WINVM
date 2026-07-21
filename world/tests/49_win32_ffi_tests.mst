@@ -1,0 +1,92 @@
+"49_win32_ffi_tests.mst — Win32 FFI (docs/FFI.md). The Windows counterpart
+ of 30_ffi_alien_tests, which is POSIX-only (getpid, mmap) and skipped on
+ this host. Exercises the real end-to-end pipeline through the actual
+ world/macvm boot path: the <primitive: FFI ...> pragma, the winkb
+ resolver, and the x64 shape-keyed trampoline.
+
+ Tagged win32-only: in tests.list, so a macOS run skips it exactly as this
+ host skips the POSIX suites."
+
+Object subclass: Win32FfiPosix [
+    Win32FfiPosix class >> getTickCount [
+        <primitive: FFI function: #GetTickCount ret: #g args: #()>
+    ]
+    Win32FfiPosix class >> getCurrentProcessId [
+        <primitive: FFI function: #GetCurrentProcessId ret: #g args: #()>
+    ]
+    Win32FfiPosix class >> getCurrentThreadId [
+        <primitive: FFI function: #GetCurrentThreadId ret: #g args: #()>
+    ]
+    "shlwapi.dll — deliberately NOT one of the modules dlsym_resolve
+     probes by default. Reaching it proves the winkb DLL lookup is doing
+     the work rather than a lucky fallback."
+    Win32FfiPosix class >> pathIsRelative: aPtr [
+        <primitive: FFI function: #PathIsRelativeW ret: #g args: #(g)>
+    ]
+    "Two integer arguments, so slots 0 and 1 both carry real values."
+    Win32FfiPosix class >> muldivA: a b: b c: c [
+        <primitive: FFI function: #MulDiv ret: #g args: #(g g g)>
+    ]
+]
+
+TestCase subclass: Win32FfiTests [
+    runAll [
+        self runTest: #testProcessIdIsPlausible do: [ self testProcessIdIsPlausible ].
+        self runTest: #testThreadIdIsPlausible do: [ self testThreadIdIsPlausible ].
+        self runTest: #testTickCountAdvances do: [ self testTickCountAdvances ].
+        self runTest: #testResolvesOutsideTheProbeList do: [ self testResolvesOutsideTheProbeList ].
+        self runTest: #testThreeArgumentCall do: [ self testThreeArgumentCall ].
+        self runTest: #testResultIsASmallInteger do: [ self testResultIsASmallInteger ].
+    ]
+
+    testProcessIdIsPlausible [
+        | pid |
+        pid := Win32FfiPosix getCurrentProcessId.
+        self assert: pid > 0.
+        "Called twice, the same process must answer the same id — a
+         zero-argument call that returned garbage would rarely repeat."
+        self assert: pid = Win32FfiPosix getCurrentProcessId
+    ]
+
+    testThreadIdIsPlausible [
+        self assert: Win32FfiPosix getCurrentThreadId > 0
+    ]
+
+    testTickCountAdvances [
+        | a b |
+        a := Win32FfiPosix getTickCount.
+        self assert: a > 0.
+        b := Win32FfiPosix getTickCount.
+        "Monotonic within one run. Not asserting movement: the call is far
+         faster than the ~15ms tick, so requiring an increase would be a
+         flake, and equality is the expected result."
+        self assert: b >= a
+    ]
+
+    testResolvesOutsideTheProbeList [
+        "PathIsRelativeW(NULL) answers FALSE (0) rather than faulting. The
+         point is the RESOLUTION: shlwapi.dll is not among the modules the
+         dlsym fallback probes, so a non-fatal answer here means the winkb
+         database supplied the DLL."
+        self assert: (Win32FfiPosix pathIsRelative: 0) = 0
+    ]
+
+    testThreeArgumentCall [
+        "MulDiv(a,b,c) = a*b/c with rounding — three integer arguments, so
+         slots 0,1,2 (RCX,RDX,R8) all carry real values and a marshalling
+         mistake shows up as a wrong number rather than a crash."
+        self assert: (Win32FfiPosix muldivA: 100 b: 3 c: 2) = 150.
+        self assert: (Win32FfiPosix muldivA: 7 b: 6 c: 1) = 42
+    ]
+
+    testResultIsASmallInteger [
+        "The g-class return must come back as a real Smalltalk integer,
+         not an Alien or a raw word."
+        self assert: (Win32FfiPosix getCurrentProcessId isKindOf: SmallInteger)
+    ]
+]
+
+"Registers its own run rather than being named from 99_run_all.mst, so
+ that excluding this file on a non-Windows host cannot leave the shared
+ runner referencing a class that was never declared."
+TestRunner run: Win32FfiTests.

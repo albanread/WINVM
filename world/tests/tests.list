@@ -52,4 +52,5 @@ posix-only:45_iostream_tests.mst
 46_scaleddecimal_tests.mst
 posix-only:47_socket_tests.mst
 posix-only:48_accel_tests.mst
+win32-only:49_win32_ffi_tests.mst
 99_run_all.mst

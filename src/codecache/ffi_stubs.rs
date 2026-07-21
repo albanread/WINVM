@@ -125,6 +125,30 @@ impl FfiStubs {
         let call: FfiCallFn = unsafe { std::mem::transmute(entry) };
         unsafe { call(target, argv_g.as_ptr(), argv_f.as_ptr()) }
     }
+
+    /// The Win64 call: ONE buffer in signature-position order plus a mask
+    /// naming which positions are floating point.
+    ///
+    /// Separate from [`Self::invoke`] rather than a generalisation of it
+    /// because the two ABIs genuinely disagree about what an argument
+    /// list IS — AAPCS64 has two independent register sequences, Win64
+    /// has one interleaved sequence of slots. Papering that over with a
+    /// shared signature would mean one of the two callers silently
+    /// lying about its arguments.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn invoke_win64(
+        &self,
+        ret_class: FfiRetClass,
+        target: u64,
+        argv: &[u64; crate::codecache::ffi_stubs_x64::ARGV_WORDS],
+        class_mask: u32,
+        argc: u32,
+    ) -> u64 {
+        let entry = self.addr_for(ret_class);
+        let call: crate::codecache::ffi_stubs_x64::FfiCallFnX64 =
+            unsafe { std::mem::transmute(entry) };
+        unsafe { call(target, argv.as_ptr(), class_mask, argc) }
+    }
 }
 
 /// Shared prologue every trampoline below starts with: stash the 3
@@ -217,6 +241,38 @@ fn build_ffi_call_ret_v() -> CodeBlob {
 /// Build and publish all 3 trampolines into `cache`. Call once, alongside
 /// `codecache::stubs::install`, before any FFI primitive can run.
 pub fn install(cache: &mut CodeCache) -> FfiStubs {
+    // WINVM: arch-selected, like `stubs::install` and
+    // `deopt_trap::install`. The x64 trampolines are a different SHAPE,
+    // not a transliteration — see `ffi_stubs_x64`'s module doc for why
+    // Win64's single argument-slot sequence cannot use the AArch64 pair
+    // of class-partitioned buffers.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        use crate::codecache::ffi_stubs_x64::{build_ffi_trampoline_x64, FfiRetClassX64};
+        let mut place = |blob: crate::compiler::assembler::CodeBlob| {
+            let h = cache
+                .alloc(blob.code.len())
+                .expect("ffi_stubs::install: code cache too small for an FFI trampoline");
+            cache.publish(h, &blob);
+            h
+        };
+        // `v` shares the `g` trampoline: the callee writes no result and
+        // the raw RAX is simply ignored by the caller.
+        let g = place(build_ffi_trampoline_x64(FfiRetClassX64::G));
+        return FfiStubs {
+            ret_g: g,
+            ret_f: place(build_ffi_trampoline_x64(FfiRetClassX64::F)),
+            ret_v: g,
+        };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        install_a64(cache)
+    }
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn install_a64(cache: &mut CodeCache) -> FfiStubs {
     let ret_g_blob = build_ffi_call_ret_g();
     let ret_g = cache
         .alloc(ret_g_blob.code.len())
