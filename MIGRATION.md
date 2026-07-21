@@ -389,16 +389,34 @@ relative-to-C ratios.
     safepoint, and one that always fired would call into the runtime on
     every loop iteration, so neither direction alone is sufficient.
   - 691 lib tests pass; world interpreter still 5891/0.
-- **Next (rest of Phase 3):** `Alloc` (inline eden-bump fast path plus
-  slow call), `CallSend` + inline caches (the `call_patchable` site shape
-  is already in place), `ArrayAt/AtPut`, and `oopmap.rs` register
-  numbering. Then wiring `compiled_call.rs` and `driver.rs` to select the
-  x64 back end so tier-up actually fires, plus `adapters.rs`.
+- **2026-07-21 — Phase 3h: inline allocation.** `Alloc` bumps the live
+  eden top, bounds-checks against `eden_end`, stamps `[mark][klass]`,
+  nils the body, and `MEM_TAG`s the result; overflow calls
+  `rt_alloc_slow(klass, size_bytes)`, whose return address is a safepoint
+  (a real allocation may scavenge).
+  - **The double indirection is load-bearing.** The VM register block
+    holds the *address of* `eden.top`, not a copy — a value copy would go
+    stale the moment a nested allocation or a GC beneath this frame moved
+    the real pointer. `eden_end`, by contrast, is a genesis-fixed bound
+    and *is* safe to read as a value. Both facts are recorded at the site.
+  - The test asserts on the **heap**, not just the return value, because
+    neither path is checkable from the result alone: header and nil'd
+    body read back off the heap, the published eden top, a second bump,
+    then a third allocation past `eden_end` that calls the slow path
+    exactly once, receives the size in bytes, and provably does not bump
+    eden itself.
+  - 692 lib tests pass; world interpreter still 5891/0.
+- **Next (rest of Phase 3):** `CallSend` + inline caches (the
+  `call_patchable` site shape is already in place from Phase 3a),
+  `ArrayAt/AtPut`, and `oopmap.rs` register numbering. Then wiring
+  `compiled_call.rs` and `driver.rs` to select the x64 back end so
+  tier-up actually fires, plus `adapters.rs`.
   **Status to be clear about:** the x64 back end is proven op-by-op by
   execution tests, but no running Smalltalk program reaches it yet —
   every benchmark and world-test number above is still the interpreter.
-  That wiring step is what closes the gap and re-enables the
-  `target_arch = "aarch64"`-gated tier-1 tests.
+  `CallSend` is the last substantial op, and that wiring step is what
+  closes the gap and re-enables the `target_arch = "aarch64"`-gated
+  tier-1 tests.
 
 ## 7. What deliberately does *not* change
 
