@@ -490,7 +490,39 @@ Surveyed rather than guessed:
 | `compiler/driver.rs` | back-end selection | **DONE (Phase 3v).** Declines what the back end cannot lower — unsupported IR ops (checked against `SUPPORTED_OPS` itself, turning a compiler panic into an interpreted method), `prim_shim`, and OSR — rather than approximating. `RuntimeAddrs` deliberately stayed at three fields: the other six addresses all belong to declined ops, so they would be fields no emitted instruction reads |
 | `compiler/disasm_a64.rs` | trace/debug disassembly | replace with `iced-x86` (already a dev-dependency) |
 
-### Status: the back end is wired, and the first real program crashes
+### Status: the x64 JIT executes Smalltalk correctly
+
+A hot-loop program (`Hot>>sum:` over 300 iterations) compiles **7
+nmethods** and answers `5050` under `MACVM_JIT=threshold=1`, identical
+to the interpreter. That is the first Smalltalk program to execute x64
+JIT-compiled code correctly, and it closes Phase 3.
+
+Differential sweep over the golden + repro corpus, JIT vs interpreter:
+**6 identical, 7 differing.** The seven are all closure / NLR / deopt /
+OSR repros — the areas Phase 5 has not built (`NlrReturn` is not
+lowered, OSR is declined). `closure_a2_value_dispatch_nlr` faults with
+an ACCESS_VIOLATION at a foreign pc, so compiled code is corrupting
+state that Rust later dereferences. These are the next work, and they
+are now failing loudly with a PROBE verdict line rather than silently.
+
+Four bugs stood between the wired back end and this result, and all
+four were the same shape: **two separately-correct components
+disagreeing about a shared convention.** None was visible from inside
+either component, and none would have been caught by reading the
+AArch64 source and translating it faithfully.
+
+| bug | the disagreement |
+|---|---|
+| A64 stubs installed on x64 | `install` vs the host |
+| A64 trampolines, adapters, mega thunks, PIC stubs | the same, in four more places |
+| IC sites patched as A64 words | "patch a call site" is not one operation across ISAs |
+| stub prologue never stored `last_compiled_pc` | AArch64 keeps it in `x30`; x64 has no link register |
+
+The last one is the sharpest: a *missing* store is not a wrong value.
+`last_compiled_pc` simply kept whatever the previous writer left, so
+`rt_interpret_call` read a stale trap pc as its caller's return address.
+Every stub test asserted `fp`, several asserted the kind, none asserted
+the pc — the field was untested precisely because nothing wrote it.
 
 `MACVM_JIT=threshold=1` on a hot-loop program now compiles one nmethod
 (240 bytes) and then **segfaults**. This is not a regression — before

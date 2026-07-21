@@ -237,7 +237,10 @@ pub(crate) const ROOTSPILL: i64 = crate::oops::layout::ROOTSPILL_BYTES as i64;
 const STUB_FRAME: i64 = ROOTSPILL + 32;
 
 pub(crate) fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
-    use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
+    use crate::oops::layout::{
+        VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET,
+        VMREG_LAST_COMPILED_PC_OFFSET,
+    };
     a.emit("push", &[r64(RBP)]);
     a.emit("mov", &[r64(RBP), r64(RSP)]);
     a.emit("sub", &[r64(RSP), imm(STUB_FRAME)]);
@@ -247,6 +250,27 @@ pub(crate) fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
     a.emit(
         "mov",
         &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)],
+    );
+    // The send site's return address. On AArch64 this is `x30`, which a
+    // `bl` sets and which a guard's or PIC's tail-`b` leaves untouched —
+    // so the original site's address survives every door into a stub.
+    // x64 has no link register: the same value is the return address the
+    // original `call` pushed, at `[rbp+8]` once this frame is set up, and
+    // a tail-`jmp` into a stub pushes nothing, so it is still the
+    // original site's. Same invariant, different storage.
+    //
+    // This store was MISSING, and the consequence was not a fault but a
+    // stale read: `last_compiled_pc` kept whatever the previous writer
+    // (an uncommon trampoline) had left, and `rt_interpret_call` used
+    // that address as its caller's return site — landing in the middle of
+    // an unrelated method and panicking with "no IcSite at offset ...".
+    // R10 is safe to use here: the kind store below already clobbers it,
+    // which is exactly why `mega_shared` moves its payload out of R10
+    // before calling this.
+    a.emit("mov", &[r64(R10), mem(RBP, 8)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_PC_OFFSET as i64), r64(R10)],
     );
     a.emit("mov", &[r64(R10), imm(kind as i64)]);
     a.emit(
@@ -1342,6 +1366,109 @@ mod tests {
         );
     }
 
+
+    /// Every stub prologue must publish ALL THREE walker fields — fp,
+    /// pc, and kind — before it can reach Rust.
+    ///
+    /// The pc store was missing on x64 for the whole of Phase 3, and
+    /// nothing caught it, because a missing store is not a wrong value:
+    /// `last_compiled_pc` simply kept whatever the previous writer left
+    /// there. Every stub test asserted `fp`, several asserted the kind,
+    /// none asserted the pc — so the field was read by
+    /// `rt_interpret_call` as its caller's return address, pointing into
+    /// a stale, unrelated method.
+    ///
+    /// This runs a real stub through the real call stub and reads all
+    /// three back, so a future prologue that drops any one of them fails
+    /// here rather than in a Smalltalk program days later.
+    #[cfg(windows)]
+    #[test]
+    fn every_stub_prologue_publishes_fp_pc_and_kind() {
+        use crate::oops::layout::{
+            VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET,
+            VMREG_LAST_COMPILED_PC_OFFSET,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEEN_FP: AtomicU64 = AtomicU64::new(0);
+        static SEEN_PC: AtomicU64 = AtomicU64::new(0);
+        static SEEN_KIND: AtomicU64 = AtomicU64::new(0);
+
+        // Reads the walker record mid-stub, exactly where a GC or a
+        // runtime function like `rt_interpret_call` would.
+        extern "C" fn peek(vm: *const u64, _a: u64) -> u64 {
+            // SAFETY: `vm` is the test's own register block.
+            unsafe {
+                SEEN_FP.store(*vm.add(VMREG_LAST_COMPILED_FP_OFFSET / 8), Ordering::Relaxed);
+                SEEN_PC.store(*vm.add(VMREG_LAST_COMPILED_PC_OFFSET / 8), Ordering::Relaxed);
+                SEEN_KIND.store(
+                    *vm.add(VMREG_LAST_COMPILED_KIND_OFFSET / 8),
+                    Ordering::Relaxed,
+                );
+            }
+            0
+        }
+
+        let stub = build_stub_must_be_boolean_x64(peek as usize as u64);
+
+        // A caller that CALLs the stub, so there is a genuine return
+        // address to publish, and returns its own call-site address so
+        // the test can compare against what the stub reported.
+        let mut h = X64Assembler::new();
+        h.emit("push", &[r64(RBP)]);
+        h.emit("mov", &[r64(RBP), r64(RSP)]);
+        h.emit("push", &[r64(VM_STATE)]);
+        h.emit("sub", &[r64(RSP), imm(40)]);
+        h.emit("mov", &[r64(VM_STATE), r64(RDX)]); // vm
+        h.emit("mov", &[r64(R10), r64(RCX)]); // stub
+        h.emit("call", &[r64(R10)]);
+        let after_call = h.offset();
+        h.emit("add", &[r64(RSP), imm(40)]);
+        h.emit("pop", &[r64(VM_STATE)]);
+        h.emit("pop", &[r64(RBP)]);
+        h.emit("ret", &[]);
+        let harness = h.finish();
+
+        // Both blobs in one region, stub first.
+        use crate::vendor::wfasm::native_windows::WinJit;
+        let jit = WinJit::with_capacity(stub.code.len() + harness.code.len() + 4096)
+            .expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let h_off = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(
+                harness.code.as_ptr(),
+                base.add(h_off),
+                harness.code.len(),
+            );
+        }
+        let stub_addr = base as u64;
+        let harness_addr = base as u64 + h_off as u64;
+
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+        let f: extern "C" fn(u64, u64) -> u64 =
+            unsafe { std::mem::transmute(harness_addr as *const u8) };
+        f(stub_addr, vm);
+
+        assert_ne!(SEEN_FP.load(Ordering::Relaxed), 0, "fp published");
+        assert_eq!(
+            SEEN_KIND.load(Ordering::Relaxed),
+            crate::codecache::stubs::KIND_MUST_BE_BOOLEAN,
+            "kind published"
+        );
+        assert_eq!(
+            SEEN_PC.load(Ordering::Relaxed),
+            harness_addr + after_call as u64,
+            "pc published, and it is the RETURN ADDRESS of the call that \
+             entered the stub — the value a caller-site lookup depends on"
+        );
+        assert_eq!(
+            vmreg[VMREG_LAST_COMPILED_FP_OFFSET / 8],
+            0,
+            "walker record cleared on the way out"
+        );
+    }
 
     /// `value_dispatch` takes two different tails, and only running both
     /// distinguishes them: the fast path TAIL-JUMPS to a compiled closure

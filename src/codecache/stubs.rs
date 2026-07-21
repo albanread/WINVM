@@ -954,7 +954,52 @@ fn find_caller_site(
         .ic_sites
         .iter()
         .position(|s| s.off == site_off)
-        .unwrap_or_else(|| panic!("no IcSite at offset {site_off} in nmethod {caller_id:?}"));
+        .unwrap_or_else(|| {
+            // Say enough to diagnose without a second run: which method,
+            // where we thought the site was, and what sites actually
+            // exist. The recorded offsets are the key fact — a site list
+            // that BRACKETS `site_off` means the back-up width is wrong
+            // for this call shape, while one that misses entirely means
+            // the return address came from a door that is not an IC site
+            // at all.
+            let sites: Vec<String> = caller_nm
+                .ic_sites
+                .iter()
+                .map(|s| format!("{:#x}({})", s.off, s.selector.as_string()))
+                .collect();
+            let sel = crate::oops::wrappers::SymbolOop::try_from(caller_nm.key_selector.oop())
+                .map(|s| s.as_string())
+                .unwrap_or_else(|| "?".into());
+            // What instruction actually precedes `ret_addr` is the whole
+            // question, so decode it rather than describe the offset.
+            #[cfg(not(target_arch = "aarch64"))]
+            let context = {
+                // SAFETY: published, immovable code bytes of this nmethod.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(caller_code.base, caller_code.len)
+                };
+                crate::compiler::disasm_x64::window(
+                    bytes,
+                    caller_code.base as u64,
+                    site_off as usize,
+                    3,
+                    2,
+                    None,
+                )
+                .join("\n    ")
+            };
+            #[cfg(target_arch = "aarch64")]
+            let context = String::from("(disassembly: aarch64 path)");
+            panic!(
+                "no IcSite at offset {site_off:#x} in nmethod {caller_id:?} ({sel}) \
+                 v{}: ret_addr={ret_addr:#x} base={:#x} len={:#x} \
+                 call_len={CALL_INSN_LEN}; recorded sites: [{}]\n    {context}",
+                caller_nm.version,
+                caller_code.base as u64,
+                caller_code.len,
+                sites.join(", ")
+            )
+        });
     let site = &caller_nm.ic_sites[site_idx];
     (
         caller_id,
