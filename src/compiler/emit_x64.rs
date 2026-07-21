@@ -104,13 +104,21 @@ const ARRAY_LENGTH_OFF: i64 = (crate::oops::layout::HEADER_WORDS
 /// own offset rather than the first element's.
 const ARRAY_ELEM_BASE: i64 = ARRAY_LENGTH_OFF;
 
-/// One safepoint the emitter recorded — currently only deopt trap sites.
-/// `pc_off` is the trapping instruction's OWN offset (for a trap site the
-/// trapping pc IS the `int3`), which is what the VEH reports in `Rip`.
+/// One safepoint the emitter recorded. Mirrors the AArch64 emitter's
+/// `SafepointPc` field-for-field, because `driver::build_deopt_metadata`
+/// keys deopt scopes off exactly these three values.
+///
+/// `pc_off` is the trapping instruction's OWN offset for a trap site (the
+/// trapping pc IS the `int3`), or the RETURN address for a runtime call.
+/// `position` is the op's index in the SAME linear numbering
+/// `regalloc::compute_intervals` used — that is what ties a safepoint to
+/// its oop map, so it must be the position the op was actually emitted
+/// at, not a recount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrapSite {
     pub pc_off: u32,
     pub bci: usize,
+    pub position: u32,
 }
 
 /// What [`emit_x64`] produces: the blob plus the metadata the deopt
@@ -247,6 +255,8 @@ struct Emitter<'a> {
     must_be_boolean_lit: LiteralId,
     alloc_slow_lit: LiteralId,
     current_bci: usize,
+    /// This op's index in regalloc's linear numbering.
+    pos: u32,
     method: &'a IrMethod,
 }
 
@@ -454,7 +464,12 @@ impl<'a> Emitter<'a> {
     fn record_safepoint(&mut self) {
         let pc_off = self.asm.offset();
         let bci = self.current_bci;
-        self.safepoints.push(TrapSite { pc_off, bci });
+        let position = self.pos;
+        self.safepoints.push(TrapSite {
+            pc_off,
+            bci,
+            position,
+        });
     }
 
     /// The generational write barrier: dirty the card covering a stored
@@ -643,6 +658,7 @@ pub fn emit_x64(
         must_be_boolean_lit,
         alloc_slow_lit,
         current_bci: 0,
+        pos: 0,
         method,
     };
 
@@ -671,14 +687,24 @@ pub fn emit_x64(
     }
 
     // ── Blocks ──────────────────────────────────────────────────────────
+    // Blocks are emitted in REGALLOC's order, not source order — and
+    // `pos` advances once per op, AFTER emitting it, in exactly the
+    // numbering `regalloc::compute_intervals` used. Both matter: a
+    // safepoint's `position` is how its oop map is found, so a different
+    // walk order or an off-by-one here would hand the GC the wrong live
+    // set for a frame. (This emitter originally walked `method.blocks`,
+    // which is only coincidentally the same order.)
     let mut block_pcs: Vec<u32> = vec![0; method.blocks.len()];
-    for (bi, block) in method.blocks.iter().enumerate() {
+    for &bid in &regalloc.block_order {
+        let bi = bid.0 as usize;
+        let block = &method.blocks[bi];
         let l = e.labels[bi];
         e.asm.bind(l);
         block_pcs[bi] = e.asm.offset();
         e.current_bci = block.bci;
         for op in &block.code {
             emit_op(&mut e, op);
+            e.pos += 1;
         }
     }
 
@@ -780,6 +806,7 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.trap_sites.push(TrapSite {
                 pc_off,
                 bci: *bci,
+                position: e.pos,
             });
             e.asm.emit_bytes(&crate::codecache::deopt_trap::deopt_int3_bytes(
                 crate::codecache::deopt_trap::TRAP_UNCOMMON,
@@ -1609,6 +1636,7 @@ mod tests {
                 must_be_boolean_lit: LiteralId(0),
                 alloc_slow_lit: LiteralId(0),
                 current_bci: 0,
+                pos: 0,
                 method: &hand_method(Vec::new(), Vec::new(), 0),
             };
             e.emit_two_address("sub", false, dst, a, b);
@@ -2969,6 +2997,61 @@ mod tests {
         );
     }
 
+    /// A safepoint's `position` must be the op's index in REGALLOC's
+    /// linear numbering, because that is how `driver::build_deopt_metadata`
+    /// finds the oop map describing which stack slots are live there.
+    ///
+    /// This is not a cosmetic field. Hand the GC a position that names a
+    /// different op and it walks the wrong live set for that frame —
+    /// tracing dead slots as roots, or worse, missing live ones. Nothing
+    /// faults; the heap just quietly goes wrong later.
+    ///
+    /// The method below puts a `Poll` at a known op index, in a block that
+    /// regalloc orders SECOND, so a walk in source order rather than
+    /// `block_order` would record a different position.
+    #[test]
+    fn safepoint_position_matches_regallocs_numbering() {
+        let m = hand_method(
+            vec![
+                block(0, vec![Ir::Jump { target: BlockId(1) }]),
+                block(
+                    1,
+                    vec![
+                        Ir::ConstSmi {
+                            dst: VReg(0),
+                            value: 1,
+                        },
+                        Ir::Poll,
+                        Ir::Ret { val: VReg(0) },
+                    ],
+                ),
+            ],
+            oops(1),
+            0,
+        );
+        let ra = regalloc(&m);
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None);
+        assert_eq!(out.safepoints.len(), 1, "one Poll, one safepoint");
+
+        // Recompute the Poll's position by walking regalloc's own order,
+        // the same way compute_intervals numbers ops.
+        let mut expected = None;
+        let mut pos = 0u32;
+        for &bid in &ra.block_order {
+            for op in &m.blocks[bid.0 as usize].code {
+                if matches!(op, Ir::Poll) {
+                    expected = Some(pos);
+                }
+                pos += 1;
+            }
+        }
+        assert_eq!(
+            out.safepoints[0].position,
+            expected.expect("the Poll was emitted"),
+            "safepoint position must index regalloc's numbering, not source order"
+        );
+    }
+
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
@@ -2997,6 +3080,7 @@ mod tests {
             must_be_boolean_lit: LiteralId(0),
             alloc_slow_lit: LiteralId(0),
             current_bci: 0,
+            pos: 0,
             method: &m,
         };
         let _ = &ra;
