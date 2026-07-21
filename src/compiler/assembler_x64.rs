@@ -195,6 +195,14 @@ pub enum Cond {
     No,
     S,
     Ns,
+    /// Parity — set when a floating-point compare is UNORDERED, i.e. an
+    /// operand was NaN. `ucomisd` signals NaN this way and no other, so
+    /// float comparisons cannot be lowered correctly without it: an
+    /// unordered compare otherwise looks exactly like "equal" (NaN sets
+    /// ZF, PF and CF together).
+    P,
+    /// Not-parity — the compare was ordered.
+    Np,
 }
 
 impl Cond {
@@ -215,6 +223,8 @@ impl Cond {
             Cond::No => "jno",
             Cond::S => "js",
             Cond::Ns => "jns",
+            Cond::P => "jp",
+            Cond::Np => "jnp",
         }
     }
 
@@ -239,6 +249,8 @@ impl Cond {
             Cond::No => "cmovno",
             Cond::S => "cmovs",
             Cond::Ns => "cmovns",
+            Cond::P => "cmovp",
+            Cond::Np => "cmovnp",
         }
     }
 
@@ -261,6 +273,8 @@ impl Cond {
             Cond::No => Cond::O,
             Cond::S => Cond::Ns,
             Cond::Ns => Cond::S,
+            Cond::P => Cond::Np,
+            Cond::Np => Cond::P,
         }
     }
 }
@@ -835,6 +849,45 @@ mod tests {
             outgoing_stack_slot(last) + 8
         );
         assert_eq!(OUTGOING_ARG_BYTES % 16, 0, "RSP stays 16-aligned at the call");
+    }
+
+    /// Parity conditions must actually ENCODE, not merely exist in the
+    /// `Cond` enum.
+    ///
+    /// I initially recorded `setp`/`setnp` as missing from the vendored
+    /// encoder and wrote off correct NaN handling as blocked on encoder
+    /// work. That was wrong: the encoder resolves `setcc`/`jcc`/`cmovcc`
+    /// generically (`strip_prefix("set").and_then(cc_code)`), and
+    /// `cc_code` has covered `p`/`pe` and `np`/`po` all along. The gap
+    /// was in this file's hand-written `Cond` subset. Grepping for
+    /// quoted mnemonics missed a table-driven implementation.
+    #[test]
+    fn parity_conditions_encode_for_jcc_setcc_and_cmov() {
+        // `ucomisd` sets ZF+PF+CF together on unordered, so a float
+        // compare that ignores PF cannot tell NaN from equal.
+        let mut a = X64Assembler::new();
+        let l = a.new_label();
+        a.bind(l);
+        a.jcc(Cond::P, l);
+        a.jcc(Cond::Np, l);
+        a.emit(Cond::P.cmov(), &[r64(RAX), r64(RCX)]);
+        a.emit(Cond::Np.cmov(), &[r64(RAX), r64(RCX)]);
+        a.emit("setp", &[Operand::Reg(crate::vendor::wfasm::rasm::parse::Reg {
+            class: crate::vendor::wfasm::rasm::parse::RegClass::R8,
+            num: RCX,
+        })]);
+        let blob = a.finish();
+        // 0x0F 0x8A/0x8B = jp/jnp rel32; 0x0F 0x4A/0x4B = cmovp/cmovnp;
+        // 0x0F 0x9A = setp.
+        let code = &blob.code[..blob.literal_off as usize];
+        for want in [0x8Au8, 0x8B, 0x4A, 0x4B, 0x9A] {
+            assert!(
+                code.windows(2).any(|w| w[0] == 0x0F && w[1] == want),
+                "no 0F {want:02X} in {code:02X?}"
+            );
+        }
+        assert_eq!(Cond::P.inverse(), Cond::Np);
+        assert_eq!(Cond::Np.inverse(), Cond::P);
     }
 
     /// `call_patchable` lays the exact 5-byte `E8 rel32` shape the code
