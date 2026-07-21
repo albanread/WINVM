@@ -1,0 +1,59 @@
+"COM Tier 2 proof. A synthetic IUnknown: an object word pointing at a
+ vtable whose slots 1 and 2 hold DIFFERENT real function addresses.
+ IUnknown is QueryInterface=0, AddRef=1, Release=2 — so if #AddRef reaches
+ slot 1 and #Release reaches slot 2, both the winkb index lookup and the
+ vtable arithmetic are right. Two distinguishable functions is the point:
+ one would pass even if every method resolved to the same slot."
+
+Object subclass: W [
+    W class >> malloc: n [ <primitive: FFI function: #malloc ret: #g args: #(g)> ]
+    W class >> free: p [ <primitive: FFI function: #free ret: #v args: #(g)> ]
+    W class >> tickCount [ <primitive: FFI function: #GetTickCount ret: #g args: #()> ]
+    W class >> pid [ <primitive: FFI function: #GetCurrentProcessId ret: #g args: #()> ]
+    W class >> moduleA: p [ <primitive: FFI function: #GetModuleHandleA ret: #g args: #(g)> ]
+    W class >> proc: h name: n [ <primitive: FFI function: #GetProcAddress ret: #g args: #(g g)> ]
+    W class >> addRefOn: p [
+        <primitive: FFI selector: #AddRef class: #IUnknown classSide: false ret: #g args: #(g)>
+    ]
+    W class >> releaseOn: p [
+        <primitive: FFI selector: #Release class: #IUnknown classSide: false ret: #g args: #(g)>
+    ]
+    W class >> in: a putAddr: v at: byteBase [
+        | x |
+        x := v.
+        1 to: 8 do: [ :i |
+            a byteAt: byteBase + i put: (x \\ 256).
+            x := x // 256 ]
+    ]
+    W class >> in: a putAscii: codes at: byteBase [
+        codes doWithIndex: [ :b :i | a byteAt: byteBase + i put: b ]
+    ]
+]
+
+MEM := W malloc: 256.
+Transcript showCr: 'malloc non-zero: ', (MEM > 0) printString.
+A := Alien forAddress: MEM size: 256.
+
+"[0..64) = name buffers, [64..96) = vtable, [96..104) = the object word."
+W in: A putAscii: #(71 101 116 84 105 99 107 67 111 117 110 116 0) at: 0.
+W in: A putAscii: #(71 101 116 67 117 114 114 101 110 116 80 114 111 99 101 115 115 73 100 0) at: 32.
+
+W in: A putAscii: #(107 101 114 110 101 108 51 50 46 100 108 108 0) at: 128.
+K := W moduleA: MEM + 128.
+Transcript showCr: 'GetModuleHandleA(kernel32) non-zero: ', (K > 0) printString.
+FTICK := W proc: K name: MEM.
+FPID := W proc: K name: MEM + 32.
+Transcript showCr: 'both exports resolved: ', ((FTICK > 0) and: [ FPID > 0 ]) printString.
+Transcript showCr: 'and they differ: ', (FTICK ~= FPID) printString.
+
+"vtable at MEM+64: slot0 unused, slot1 = GetTickCount, slot2 = GetCurrentProcessId"
+W in: A putAddr: 0 at: 64.
+W in: A putAddr: FTICK at: 72.
+W in: A putAddr: FPID at: 80.
+"the object: one word holding the vtable pointer"
+W in: A putAddr: MEM + 64 at: 96.
+OBJ := MEM + 96.
+
+Transcript showCr: 'AddRef  -> slot 1 (tick) > 0    : ', ((W addRefOn: OBJ) > 0) printString.
+Transcript showCr: 'Release -> slot 2 (pid) matches : ', ((W releaseOn: OBJ) = W pid) printString.
+W free: MEM.

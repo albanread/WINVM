@@ -67,6 +67,8 @@ const DESC_NAME: usize = 1;
 // `DESC_CLASS` (2) and `DESC_CLASS_SIDE` (3) are Tier 2-only (ObjC class
 // name + classSide flag) — Tier 1 dispatch never reads either, per this
 // step's own brief.
+/// Tier 2 (COM on Windows, ObjC on macOS): the interface/class name.
+const DESC_CLASS: usize = 2;
 const DESC_RET: usize = 4;
 const DESC_ARGS: usize = 5;
 /// The resolved native address, cached by the first call (nil until then —
@@ -103,6 +105,208 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
     let desc = m.literals();
 
     let kind = sym_text(desc.at(DESC_KIND));
+
+    // ── Tier 2: COM ─────────────────────────────────────────────────────
+    //
+    // The Windows counterpart of MACVM's `objc_msgSend` path, and it reuses
+    // that pragma verbatim — `selector:` names the method, `class:` names
+    // the COM INTERFACE:
+    //
+    //     <primitive: FFI selector: #CreateSwapChain class: #IDXGIFactory
+    //                     classSide: false ret: #g args: #(g g)>
+    //
+    // Only the dispatch differs. ObjC looks a selector up in a live
+    // runtime; COM looks a method up by its VTABLE INDEX, which is what
+    // `winkb` supplies. A COM object pointer's first field is `lpVtbl`, so
+    // the target is two loads away and needs no new trampoline at all:
+    //
+    //     vtbl   = *(void**)this
+    //     target = vtbl[index]
+    //
+    // The RECEIVER is the COM object — unlike a Tier 1 `#function` call,
+    // where the receiver is meaningless and skipped, here it is argument
+    // slot 0 and the call cannot be made without it.
+    #[cfg(windows)]
+    'com: {
+        if kind != "selector" {
+            break 'com;
+        }
+        use crate::codecache::ffi_stubs_x64::ARGV_WORDS;
+
+        let iface = sym_text(desc.at(DESC_CLASS));
+        let method = sym_text(desc.at(DESC_NAME));
+
+        // The vtable INDEX is cached, not a resolved address. For Tier 1
+        // the address is a property of the process and cacheable; a COM
+        // method's address is a property of the OBJECT — two instances of
+        // the same interface may have entirely different vtables, which is
+        // the whole point of COM. Caching the target would call the first
+        // object's implementation on every later one.
+        // STRICTLY ADDITIVE: this arm only claims a `selector:` pragma it
+        // can actually resolve as a COM method. Anything else — notably
+        // the world's ObjC bindings, which use the IDENTICAL pragma shape
+        // — falls through to the Tier-2 report below, exactly as before.
+        //
+        // Learned the hard way: the first version claimed EVERY
+        // `selector:` pragma, turning the ObjC ones into COM errors that
+        // surfaced somewhere else entirely as a doesNotUnderstand. A
+        // dispatch arm that half-claims a case is worse than one that
+        // declines it cleanly.
+        let resolved_index = match SmallInt::try_from(desc.at(DESC_ADDR_CACHE)) {
+            Some(cached) => Some(cached.value()),
+            None if crate::runtime::winkb::available() => {
+                match crate::runtime::winkb::lookup_com_method(&iface, &method) {
+                    Ok(m) => {
+                        let idx = m.vtable_index;
+                        desc.at_put(DESC_ADDR_CACHE, SmallInt::new(idx).oop());
+                        Some(idx)
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+        let index = match resolved_index {
+            Some(i) => i,
+            // Not a COM method here. Fall through to the Tier-2 arm.
+            None => break 'com,
+        };
+
+        let args_desc = crate::oops::wrappers::ArrayOop::try_from(desc.at(DESC_ARGS))
+            .expect("runtime::ffi: descriptor's args slot must be an Array");
+        let argc_usize = argc as usize;
+        if args_desc.len() != argc_usize {
+            crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: COM method {iface}::{method}'s pragma declares {} arg token(s) \
+                     but the method takes {argc_usize} — the token list must match the \
+                     selector's arity exactly",
+                    args_desc.len()
+                ),
+            );
+        }
+        // +1 for the implicit `this`.
+        if argc_usize > ARGV_WORDS {
+            crate::runtime::error::guest_fatal(
+                vm,
+                format!("FFI: COM method {iface}::{method} has too many arguments"),
+            );
+        }
+
+        // `this` is the FIRST DECLARED ARGUMENT, not the receiver.
+        //
+        // MACVM's ObjC Tier 2 dispatches on the receiver, but there the
+        // receiver is a real wrapper object the runtime can introspect.
+        // A COM interface pointer is a bare address, so making it an
+        // ordinary declared argument keeps the pragma self-describing and
+        // keeps both WINVM tiers consistent: the receiver is never
+        // marshalled, in either. It also means the arity check above
+        // covers `this` like any other argument.
+        if argc_usize == 0 {
+            crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: COM method {iface}::{method} declares no arguments — the first                      must be the interface pointer (`this`)"
+                ),
+            );
+        }
+        let base = vm.stack.sp - argc_usize - 1;
+        let Some(this) = marshal_g(vm.stack.get(base + 1)) else {
+            // Not an integer-shaped pointer: a genuine calling error, so
+            // the ordinary primitive convention applies.
+            return PrimitiveOutcome::Fallthrough;
+        };
+        if this == 0 {
+            crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: COM dispatch of {iface}::{method} on a null interface pointer"
+                ),
+            );
+        }
+
+        let mut argv = [0u64; ARGV_WORDS];
+        let mut class_mask = 0u32;
+        argv[0] = this;
+        // Declared argument 0 was `this`; the rest follow it in the slot
+        // sequence, so declared `i` lands in slot `i`.
+        for i in 1..argc_usize {
+            let arg_oop = vm.stack.get(base + 1 + i);
+            let tok = sym_text(args_desc.at(i));
+            match tok.as_str() {
+                "g" => {
+                    let Some(w) = marshal_g(arg_oop) else {
+                        return PrimitiveOutcome::Fallthrough;
+                    };
+                    argv[i] = w;
+                }
+                "f" => {
+                    let Some(w) = marshal_f(arg_oop) else {
+                        return PrimitiveOutcome::Fallthrough;
+                    };
+                    argv[i] = w;
+                    class_mask |= 1 << i;
+                }
+                other => crate::runtime::error::guest_fatal(
+                    vm,
+                    format!(
+                        "FFI: unsupported argument-shape token {other:?} (arg #{i} of COM \
+                         method {iface}::{method})"
+                    ),
+                ),
+            }
+        }
+
+        let ret_tok = sym_text(desc.at(DESC_RET));
+        let ret_class = match ret_tok.as_str() {
+            "g" => crate::codecache::ffi_stubs::FfiRetClass::G,
+            "f" => crate::codecache::ffi_stubs::FfiRetClass::F,
+            "v" => crate::codecache::ffi_stubs::FfiRetClass::V,
+            other => crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: unsupported return-shape token {other:?} for COM method \
+                     {iface}::{method}"
+                ),
+            ),
+        };
+
+        // Two loads through `this` to reach the method. Delegated to
+        // `codecache`, the crate's designated owner of raw pointer work —
+        // `runtime` is under `deny(unsafe_code)`, and that boundary is
+        // worth keeping even for two dereferences.
+        //
+        // SAFETY: `this` is guest-supplied, so this is exactly as
+        // trustworthy as the pointer the guest passed — the contract every
+        // FFI call operates under. A null vtable is reported below; a
+        // non-null but wrong pointer faults, and PROBE names it.
+        let target = match crate::codecache::ffi_stubs_x64::com_vtable_slot(
+            this,
+            index as usize,
+        ) {
+            Some(t) => t,
+            None => crate::runtime::error::guest_fatal(
+                vm,
+                format!(
+                    "FFI: COM dispatch of {iface}::{method}: object at {this:#x} has a null \
+                     vtable pointer — not a COM interface pointer"
+                ),
+            ),
+        };
+
+        vm.stack.sp = base;
+        let result = vm.ffi_stubs.invoke_win64(
+            ret_class,
+            target,
+            &argv,
+            class_mask,
+            argc_usize as u32,
+        );
+        let name = format!("{iface}::{method}");
+        return unmarshal_ret(vm, ret_class, result, &name);
+    }
+
     if kind != "function" {
         // Tier 2 (`kind == "selector"`, ObjC message dispatch) has no
         // runtime support yet (S20 step 7) — and unlike a genuinely bad

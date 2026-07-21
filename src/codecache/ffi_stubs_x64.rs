@@ -164,6 +164,40 @@ pub fn build_ffi_trampoline_x64(ret: FfiRetClassX64) -> CodeBlob {
     a.finish()
 }
 
+/// Resolve a COM method's address: `(*(*this))[index]`.
+///
+/// A COM interface pointer's first field is `lpVtbl`, a pointer to an
+/// array of function pointers, so a method is two loads away and needs no
+/// trampoline of its own — the ordinary [`FfiCallFnX64`] call works once
+/// the target is known, with `this` in argument slot 0.
+///
+/// Lives here rather than in `runtime::ffi` because `codecache` is the
+/// crate's designated owner of raw pointer work; everything else is under
+/// `deny(unsafe_code)`.
+///
+/// `None` means the vtable pointer was null — i.e. `this` was not a COM
+/// interface pointer. A non-null but WRONG pointer cannot be detected
+/// here and will fault on use, which is the same contract every FFI call
+/// operates under.
+///
+/// Safe by the same convention as [`FfiStubs::invoke`](crate::codecache::ffi_stubs::FfiStubs::invoke):
+/// the whole FFI surface trusts guest-supplied addresses, so wrapping the
+/// dereference in an `unsafe fn` would push that judgement outward without
+/// making anything safer. The unsafety is contained and documented here.
+pub fn com_vtable_slot(this: u64, index: usize) -> Option<u64> {
+    if this == 0 {
+        return None;
+    }
+    // SAFETY: the caller's contract above.
+    unsafe {
+        let vtbl = *(this as *const *const u64);
+        if vtbl.is_null() {
+            return None;
+        }
+        Some(*vtbl.add(index))
+    }
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
