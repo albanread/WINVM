@@ -49,7 +49,9 @@ use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::emit::{EmittedIcSite, EntryGuard};
 use crate::compiler::assembler_x64::{
     imm, mem, mem_byte, mem_index, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
-    SCRATCH0, SCRATCH1, SHADOW_SPACE, VM_STATE,
+    incoming_stack_slot, outgoing_arg_bytes, outgoing_stack_slot, MAX_REG_ARGS,
+    OUTGOING_ARG_BYTES, SCRATCH0,
+    SCRATCH1, SHADOW_SPACE, VM_STATE,
 };
 use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
 use crate::vendor::wfasm::rasm::parse::Operand;
@@ -353,13 +355,29 @@ impl<'a> Emitter<'a> {
     /// Spilled sources are never part of a cycle — a memory operand is
     /// nobody's destination — so they can always be loaded directly.
     fn marshal_args(&mut self, args: &[VReg]) {
-        assert!(
-            args.len() <= ARG_REGS.len(),
-            "emit_x64: {} arguments exceeds the {} Win64 register slots — stack-passed \
-             arguments are not in the Phase-3 slice yet",
-            args.len(),
-            ARG_REGS.len()
-        );
+        // Stack arguments FIRST: they are written from wherever their
+        // values currently live, and the register shuffle below is about
+        // to overwrite ARG_REGS. Doing it the other way round would read
+        // an argument register that had already been reassigned.
+        //
+        // The caller has already reserved `outgoing_arg_bytes(args.len())`,
+        // so these are RSP-relative; spill reads stay RBP-relative and are
+        // unaffected by that reservation.
+        for (i, &v) in args.iter().enumerate().skip(MAX_REG_ARGS) {
+            let slot_off = outgoing_stack_slot(i);
+            match self.assignment[v.0 as usize] {
+                Some(Assignment::Reg(r)) => {
+                    self.asm.emit("mov", &[mem(RSP, slot_off), r64(r)]);
+                }
+                Some(Assignment::Spill(slot)) => {
+                    self.asm
+                        .emit("mov", &[r64(SCRATCH0), mem(RBP, spill_offset(slot))]);
+                    self.asm.emit("mov", &[mem(RSP, slot_off), r64(SCRATCH0)]);
+                }
+                None => panic!("emit_x64: argument vreg v{} has no assignment", v.0),
+            }
+        }
+
 
         #[derive(Clone, Copy)]
         enum Src {
@@ -372,6 +390,7 @@ impl<'a> Emitter<'a> {
         let mut pending: Vec<(u8, Src)> = args
             .iter()
             .enumerate()
+            .take(MAX_REG_ARGS)
             .filter_map(|(i, &v)| {
                 let dst = ARG_REGS[i];
                 match self.assignment[v.0 as usize] {
@@ -452,11 +471,14 @@ impl<'a> Emitter<'a> {
     /// odd number of registers. The two numbers are both correct and the
     /// difference is not an inconsistency.)
     fn emit_runtime_call(&mut self, target: LiteralId) {
+        // The full outgoing area, not just the shadow space: these
+        // callees are the same stubs a send reaches, and their epilogue
+        // writes the RootSpill's stack slots back into this reservation.
         self.asm
-            .emit("sub", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+            .emit("sub", &[r64(RSP), imm(OUTGOING_ARG_BYTES)]);
         self.asm.call_far(target);
         self.asm
-            .emit("add", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+            .emit("add", &[r64(RSP), imm(OUTGOING_ARG_BYTES)]);
     }
 
     /// Record a deopt safepoint at the CURRENT offset — used right after
@@ -755,14 +777,18 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
         }
 
         Ir::Param { dst, index } => {
-            let src = *ARG_REGS.get(*index as usize).unwrap_or_else(|| {
-                panic!(
-                    "emit_x64: parameter #{index} is past the {} Win64 register arguments — \
-                     stack-passed parameters are not in the Phase-3 slice",
-                    ARG_REGS.len()
-                )
-            });
+            // The callee half of the Win64 argument layout: the first four
+            // arrive in registers, the rest in the caller's outgoing area
+            // above this frame's return address (`incoming_stack_slot`).
+            let idx = *index as usize;
             let d = e.def_reg(*dst, SCRATCH0);
+            if idx >= MAX_REG_ARGS {
+                e.asm
+                    .emit("mov", &[r64(d), mem(RBP, incoming_stack_slot(idx))]);
+                e.store_def(*dst, d);
+                return;
+            }
+            let src = ARG_REGS[idx];
             if d != src {
                 e.asm.emit("mov", &[r64(d), r64(src)]);
             }
@@ -1019,16 +1045,19 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
         }
 
         Ir::CallSend { dst, site, args } => {
+            // Reserve the outgoing argument area BEFORE marshaling: the
+            // stack arguments `marshal_args` writes are RSP-relative and
+            // must land inside this reservation. (Register-only sends
+            // reserve exactly the 32-byte shadow space, as before.)
+            let outgoing = outgoing_arg_bytes(args.len());
+            e.asm.emit("sub", &[r64(RSP), imm(outgoing)]);
             e.marshal_args(args);
             // The patchable site: a 5-byte `call rel32` whose displacement
             // the code cache rewrites to point at the current IC target.
-            // It sits INSIDE the shadow-space reservation, because the
-            // callee is ordinary Win64 code like any other.
-            e.asm
-                .emit("sub", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+            // It sits INSIDE the outgoing reservation, because the callee
+            // is ordinary Win64 code like any other.
             let off = e.asm.call_patchable(RelocKind::InlineCache);
-            e.asm
-                .emit("add", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+            e.asm.emit("add", &[r64(RSP), imm(outgoing)]);
             // A send is a deopt safepoint, keyed on the return address.
             e.record_safepoint();
             let info = e.method.call_sites[*site as usize];

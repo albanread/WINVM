@@ -93,6 +93,87 @@ pub const ARG_REGS: [u8; 4] = [RCX, RDX, R8, R9];
 /// Win64's mandatory 32-byte shadow space every call must reserve.
 pub const SHADOW_SPACE: i32 = 32;
 
+// ── Win64 outgoing/incoming argument layout ─────────────────────────────
+//
+// AArch64 passes eight arguments in registers, so MACVM's whole compiled
+// call path could assume "arguments are registers". Win64 passes four and
+// puts the rest on the stack, and FOUR separate components have to agree
+// on exactly where: the send-site marshaling in `emit_x64`, the `Param`
+// reads in the compiled callee, the RootSpill fill in every stub
+// prologue (which is what the GC scans and what `argv` consumers read),
+// and the interpreter's `call_stub`.
+//
+// Every previous bug on this port was two components disagreeing about a
+// shared convention, so the convention lives HERE, once, and all four
+// call these helpers rather than open-coding an offset.
+//
+// The layout, at the moment of `call`:
+//
+//     rsp+0  .. rsp+32   shadow space (home for RCX/RDX/R8/R9)
+//     rsp+32            argument 4
+//     rsp+40            argument 5   ...
+//
+// and inside a callee that has done `push rbp; mov rbp, rsp`:
+//
+//     [rbp+0]           saved rbp
+//     [rbp+8]           return address
+//     [rbp+16..48)      shadow space
+//     [rbp+48]          argument 4
+//     [rbp+56]          argument 5   ...
+
+/// How many arguments travel in registers. The rest go on the stack.
+pub const MAX_REG_ARGS: usize = ARG_REGS.len();
+
+/// Bytes every caller reserves for outgoing arguments: shadow space plus
+/// a stack slot for each argument past the fourth, sized for the FULL
+/// `ROOTSPILL_SLOTS` arity regardless of how many this particular site
+/// passes.
+///
+/// The fixed size is deliberate, and it is what makes the GC story sound.
+/// A stub's prologue copies incoming stack arguments into the RootSpill
+/// so the collector can see them; its epilogue has to copy them BACK,
+/// because a moving GC rewrites the RootSpill and a tail-jumping stub's
+/// target reads its arguments from the caller's outgoing area, not from
+/// the RootSpill.
+///
+/// Those two directions are not symmetric. Reading above a frame is
+/// always safe — it is mapped memory either way. WRITING is not: if the
+/// caller had reserved only its own smaller area, the write-back would
+/// land in the caller's locals and corrupt them. A stub is built once,
+/// not once per call site, so it cannot size the copy by arity.
+///
+/// Reserving the maximum at every site costs at most 32 bytes of stack
+/// per call and makes both directions unconditionally in-bounds.
+pub const OUTGOING_ARG_BYTES: i64 =
+    SHADOW_SPACE as i64 + 8 * (crate::oops::layout::ROOTSPILL_SLOTS - MAX_REG_ARGS) as i64;
+
+// 16-byte alignment at the `call` is an ABI requirement, not a nicety:
+// getting it wrong does not fault here, it corrupts an alignment-
+// sensitive callee much later.
+const _: () = assert!(OUTGOING_ARG_BYTES % 16 == 0);
+
+/// Bytes a caller must reserve to pass `nargs` total values. Constant by
+/// construction — see [`OUTGOING_ARG_BYTES`].
+pub fn outgoing_arg_bytes(_nargs: usize) -> i64 {
+    OUTGOING_ARG_BYTES
+}
+
+/// Offset from `RSP` (with the outgoing area already reserved) at which
+/// the caller writes stack argument `i`. Only valid for `i >= MAX_REG_ARGS`.
+pub fn outgoing_stack_slot(i: usize) -> i64 {
+    debug_assert!(i >= MAX_REG_ARGS, "argument {i} travels in a register");
+    SHADOW_SPACE as i64 + 8 * (i - MAX_REG_ARGS) as i64
+}
+
+/// Offset from `RBP` at which a callee finds incoming stack argument `i`,
+/// after the standard `push rbp; mov rbp, rsp` prologue. Only valid for
+/// `i >= MAX_REG_ARGS`.
+pub fn incoming_stack_slot(i: usize) -> i64 {
+    debug_assert!(i >= MAX_REG_ARGS, "argument {i} arrives in a register");
+    // saved rbp (8) + return address (8) + shadow space (32) = 48.
+    48 + 8 * (i - MAX_REG_ARGS) as i64
+}
+
 // ── Condition codes ─────────────────────────────────────────────────────
 
 /// x86-64 condition codes. Signed comparisons use `L`/`Le`/`G`/`Ge`
@@ -716,6 +797,44 @@ mod tests {
             3 * 8,
             "three distinct pool words"
         );
+    }
+
+    /// The caller's outgoing slot and the callee's incoming slot must
+    /// name the SAME memory for every argument.
+    ///
+    /// They are computed from opposite ends — one from `RSP` after the
+    /// reservation, the other from `RBP` after the callee's prologue —
+    /// and four separate components rely on them agreeing. Every bug on
+    /// this port so far has been two components disagreeing about a
+    /// shared convention, so this pins the arithmetic rather than
+    /// trusting two hand-derived constants to stay in step.
+    #[test]
+    fn outgoing_and_incoming_stack_slots_describe_the_same_memory() {
+        // At the `call`, the caller's RSP is `rbp_callee + 8 (saved rbp)
+        // + 8 (return address)` below the callee's RBP — i.e. the callee
+        // sees the caller's `rsp + N` at `rbp + N + 16`.
+        for i in MAX_REG_ARGS..crate::oops::layout::ROOTSPILL_SLOTS {
+            assert_eq!(
+                incoming_stack_slot(i),
+                outgoing_stack_slot(i) + 16,
+                "argument {i}: caller writes rsp+{}, callee reads rbp+{}",
+                outgoing_stack_slot(i),
+                incoming_stack_slot(i)
+            );
+        }
+    }
+
+    /// The reservation must cover every slot either side addresses, or a
+    /// stub's write-back lands in the caller's locals.
+    #[test]
+    fn outgoing_reservation_covers_every_stack_slot() {
+        let last = crate::oops::layout::ROOTSPILL_SLOTS - 1;
+        assert!(
+            outgoing_stack_slot(last) + 8 <= OUTGOING_ARG_BYTES,
+            "slot {last} ends at {} but only {OUTGOING_ARG_BYTES} bytes are reserved",
+            outgoing_stack_slot(last) + 8
+        );
+        assert_eq!(OUTGOING_ARG_BYTES % 16, 0, "RSP stays 16-aligned at the call");
     }
 
     /// `call_patchable` lays the exact 5-byte `E8 rel32` shape the code

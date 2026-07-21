@@ -205,23 +205,22 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
 ///
 /// This is an ISA capacity, not a policy: AArch64 marshals into `x0..x7`
 /// (8 registers, so 7 real args), Win64 into `RCX RDX R8 R9` (4, so 3).
-/// The cap was AArch64's `7` on every host until WINVM Phase 5 — which
-/// meant a perfectly legal 4-argument send passed eligibility on x64 and
-/// then hit `emit_x64::marshal_args`' assert, crashing the compiler on a
-/// valid Smalltalk program. `ROOTSPILL_SLOTS` is 8 on both hosts, so the
-/// spill area is oversized rather than short on x64; the shortage is
-/// purely in registers.
+/// Both hosts now cap at `ROOTSPILL_SLOTS - 1` real arguments, because
+/// the RootSpill — not the register file — is the real limit: it is what
+/// the GC scans for a stub frame. Win64's four argument registers are no
+/// longer the constraint, since arguments past the fourth travel in the
+/// caller's outgoing stack area (`assembler_x64::OUTGOING_ARG_BYTES`).
 #[cfg(target_arch = "aarch64")]
 const MAX_SEND_ARGC: u8 = 7;
 #[cfg(not(target_arch = "aarch64"))]
-const MAX_SEND_ARGC: u8 = 3;
+const MAX_SEND_ARGC: u8 = 7;
 
 /// Most arguments a compiled METHOD's own entry convention can accept,
 /// same register budget seen from the callee side.
 #[cfg(target_arch = "aarch64")]
 const MAX_METHOD_ARGC: usize = 5;
 #[cfg(not(target_arch = "aarch64"))]
-const MAX_METHOD_ARGC: usize = 3;
+const MAX_METHOD_ARGC: usize = 5;
 
 /// D1 point 2 (mono-smi-inline gate): a `Send` site only clears eligibility
 /// when its own IC is already `Mono`, guarded on `SmallInteger`, targeting a

@@ -37,7 +37,7 @@
 use crate::codecache::stubs::KIND_DEOPT_BRIDGE;
 use crate::compiler::assembler::{CodeBlob, RelocKind};
 use crate::compiler::assembler_x64::{
-    imm, mem, r64, Cond, X64Assembler, ARG_REGS, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX,
+    imm, incoming_stack_slot, mem, r64, Cond, X64Assembler, ARG_REGS, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX,
     RDI, RDX, RSI, RSP, R8, R9, VM_STATE,
 };
 
@@ -56,7 +56,7 @@ const SAVED: [u8; 7] = [RBX, RSI, RDI, R12, R13, R14, R15];
 
 /// Shadow space (32, mandatory on Win64) plus 8 bytes of realignment —
 /// see the module header's alignment arithmetic.
-const CALL_AREA: i64 = 40;
+const CALL_AREA: i64 = 40 + 8 * (crate::oops::layout::ROOTSPILL_SLOTS as i64 - 4);
 
 /// Build the x86-64 call stub.
 pub fn build_call_stub_x64() -> CodeBlob {
@@ -93,6 +93,32 @@ pub fn build_call_stub_x64() -> CodeBlob {
 
     // ── The call ────────────────────────────────────────────────────────
     a.emit("sub", &[r64(RSP), imm(CALL_AREA)]);
+
+    // Arguments 4.. go on the stack (Win64 passes only four in
+    // registers), written AFTER the outgoing area is reserved because
+    // they are RSP-relative. Same compare-and-skip shape as the register
+    // chain above; `argv` is still in R11 and `argc` in RAX.
+    //
+    // `CALL_AREA` already includes the full `ROOTSPILL_SLOTS` worth of
+    // stack-argument space, so every slot written here is in bounds — and
+    // so is the write-back a stub's epilogue performs into it.
+    let stack_done = a.new_label();
+    for i in ARG_REGS.len()..crate::oops::layout::ROOTSPILL_SLOTS {
+        a.emit("cmp", &[r64(RAX), imm(i as i64 + 1)]);
+        a.jcc(Cond::L, stack_done);
+        // RBX, not R10: R10 still holds `entry`, and by this point RCX
+        // holds the receiver, so there is nothing left to reload it from.
+        // RBX is in this stub's own saved bank, so it is free scratch.
+        a.emit("mov", &[r64(RBX), mem(R11, 8 * i as i64)]);
+        a.emit(
+            "mov",
+            &[
+                mem(RSP, crate::compiler::assembler_x64::outgoing_stack_slot(i)),
+                r64(RBX),
+            ],
+        );
+    }
+    a.bind(stack_done);
     a.emit("call", &[r64(R10)]);
     a.emit("add", &[r64(RSP), imm(CALL_AREA)]);
     // The compiled method's result is already in RAX, which is also this
@@ -247,6 +273,24 @@ pub(crate) fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
     for (i, r) in ARG_REGS.iter().enumerate() {
         a.emit("mov", &[mem(RBP, -ROOTSPILL + 8 * i as i64), r64(*r)]);
     }
+    // Arguments 4.. arrived on the STACK, not in registers — Win64 passes
+    // only four. They still have to reach the RootSpill, because that is
+    // both what the collector scans for a stub frame and the `argv` every
+    // `rt_*` consumer reads. Spilling registers alone would leave a
+    // high-arity send's tail arguments invisible to the GC and garbage to
+    // the runtime.
+    //
+    // All remaining slots are copied unconditionally rather than by
+    // arity: a stub is built once, not once per call site, so it cannot
+    // know the arity. Copying is safe — `incoming_stack_slot` addresses
+    // the caller's own frame, which is mapped whether or not it reserved
+    // that much outgoing space — and slots past the real arity are never
+    // read, because the collector takes its live count from the call
+    // site, not from this area's size.
+    for i in ARG_REGS.len()..crate::oops::layout::ROOTSPILL_SLOTS {
+        a.emit("mov", &[r64(R10), mem(RBP, incoming_stack_slot(i))]);
+        a.emit("mov", &[mem(RBP, -ROOTSPILL + 8 * i as i64), r64(R10)]);
+    }
     a.emit(
         "mov",
         &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)],
@@ -295,6 +339,19 @@ pub(crate) fn emit_stub_epilogue_x64(a: &mut X64Assembler) {
     );
     for (i, r) in ARG_REGS.iter().enumerate() {
         a.emit("mov", &[r64(*r), mem(RBP, -ROOTSPILL + 8 * i as i64)]);
+    }
+    // The stack arguments have to go BACK, for the same reason the
+    // register ones are reloaded: a moving GC rewrote the RootSpill, and
+    // a tail-jumping stub's target reads its arguments from the caller's
+    // outgoing area rather than from the RootSpill. Reloading registers
+    // only would hand the target stale pointers for arguments 4 and up.
+    //
+    // Unconditional, and in-bounds because every caller reserves the full
+    // `OUTGOING_ARG_BYTES` (see its doc — this write-back is exactly why
+    // that reservation is a constant instead of being sized by arity).
+    for i in ARG_REGS.len()..crate::oops::layout::ROOTSPILL_SLOTS {
+        a.emit("mov", &[r64(R10), mem(RBP, -ROOTSPILL + 8 * i as i64)]);
+        a.emit("mov", &[mem(RBP, incoming_stack_slot(i)), r64(R10)]);
     }
     a.emit("mov", &[r64(RSP), r64(RBP)]);
     a.emit("pop", &[r64(RBP)]);
