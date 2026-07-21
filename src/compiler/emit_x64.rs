@@ -69,6 +69,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "StoreField",
     "BoolBr",
     "Poll",
+    "Alloc",
     "CallRuntime",
     "Jump",
     "UncommonTrap",
@@ -150,7 +151,6 @@ struct Emitter<'a> {
     /// Pool entries holding the runtime entry points.
     stub_poll_lit: LiteralId,
     must_be_boolean_lit: LiteralId,
-    #[allow(dead_code)] // consumed when Alloc lands
     alloc_slow_lit: LiteralId,
     current_bci: usize,
     method: &'a IrMethod,
@@ -696,6 +696,87 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.emit("mov", &[r64(RAX), r64(RECEIVER)]);
             let ep = e.epilogue;
             e.asm.jmp(ep);
+        }
+
+        Ir::Alloc {
+            dst,
+            klass,
+            size_words,
+        } => {
+            use crate::oops::layout::{
+                HEADER_WORDS, MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET,
+                WORD_SIZE,
+            };
+            let size_bytes = *size_words as i64 * WORD_SIZE as i64;
+            debug_assert!(
+                *size_words as usize >= HEADER_WORDS && size_bytes < 4096,
+                "emit_x64 Alloc: size_bytes {size_bytes} outside the inline range — \
+                 ir.rs is responsible for gating this"
+            );
+            let d = e.def_reg(*dst, RAX);
+            let slow = e.asm.new_label();
+            let done = e.asm.new_label();
+
+            // Fast path: bump the LIVE eden top. The VM register block
+            // holds the *address of* `eden.top`, not a copy of it — a
+            // value copy would go stale the moment a nested allocation or
+            // a GC beneath this frame moved the real pointer. (Same
+            // reasoning as the AArch64 emitter; it is the whole reason
+            // this is a double indirection.)
+            e.asm.emit(
+                "mov",
+                &[r64(SCRATCH1), mem(VM_STATE, VMREG_EDEN_TOP_ADDR_OFFSET as i64)],
+            );
+            e.asm.emit("mov", &[r64(SCRATCH0), mem(SCRATCH1, 0)]);
+            // new_top = top + size; compare against eden_end (a
+            // genesis-fixed bound, so a value copy IS safe for this one).
+            e.asm.emit("lea", &[r64(RAX), mem(SCRATCH0, size_bytes)]);
+            e.asm.emit(
+                "cmp",
+                &[r64(RAX), mem(VM_STATE, VMREG_EDEN_END_OFFSET as i64)],
+            );
+            e.asm.jcc(Cond::A, slow); // unsigned: past the end -> slow
+            e.asm.emit("mov", &[mem(SCRATCH1, 0), r64(RAX)]); // publish new top
+
+            // Stamp the header: [mark][klass], then nil the body. SCRATCH0
+            // still holds the object's base address.
+            let mark_lit = e.literal_ids[e.method.mark_slots_lit.0 as usize];
+            e.asm.load_literal(RAX, mark_lit);
+            e.asm.emit("mov", &[mem(SCRATCH0, 0), r64(RAX)]);
+            let klass_lit = e.literal_ids[klass.0 as usize];
+            e.asm.load_literal(RAX, klass_lit);
+            e.asm
+                .emit("mov", &[mem(SCRATCH0, WORD_SIZE as i64), r64(RAX)]);
+            let body_words = *size_words as usize - HEADER_WORDS;
+            if body_words > 0 {
+                let nil_lit = e.literal_ids[e.method.nil_lit.0 as usize];
+                e.asm.load_literal(RAX, nil_lit);
+                for i in 0..body_words {
+                    let off = ((HEADER_WORDS + i) * WORD_SIZE) as i64;
+                    e.asm.emit("mov", &[mem(SCRATCH0, off), r64(RAX)]);
+                }
+            }
+            // Tag the result: an oop's word is its address plus MEM_TAG.
+            e.asm
+                .emit("lea", &[r64(d), mem(SCRATCH0, MEM_TAG as i64)]);
+            e.asm.jmp(done);
+
+            // Slow path: rt_alloc_slow(klass_oop, size_bytes).
+            e.asm.bind(slow);
+            let klass_lit = e.literal_ids[klass.0 as usize];
+            e.asm.load_literal(ARG_REGS[0], klass_lit);
+            e.asm
+                .emit("mov", &[r64(ARG_REGS[1]), imm(size_bytes)]);
+            let lit = e.alloc_slow_lit;
+            e.emit_runtime_call(lit);
+            // A real allocation may scavenge, so this is a safepoint.
+            e.record_safepoint();
+            if d != RAX {
+                e.asm.emit("mov", &[r64(d), r64(RAX)]);
+            }
+
+            e.asm.bind(done);
+            e.store_def(*dst, d);
         }
 
         Ir::Poll => {
@@ -1894,6 +1975,161 @@ mod tests {
         assert_eq!(unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) }, 42);
         let argv = [100u64];
         assert_eq!(unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) }, 200);
+    }
+
+    /// Records what the Alloc test's stand-in slow path was called with.
+    #[cfg(windows)]
+    static ALLOC_SLOW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    #[cfg(windows)]
+    static ALLOC_SLOW_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(windows)]
+    extern "C" fn alloc_slow_probe(klass: u64, size_bytes: u64) -> u64 {
+        ALLOC_SLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALLOC_SLOW_SIZE.store(size_bytes, std::sync::atomic::Ordering::Relaxed);
+        // Hand back a recognizable "object" so the caller can tell the
+        // slow path's result apart from a fast-path address.
+        klass ^ 0xDEAD_0000
+    }
+
+    /// Inline allocation, executed: the fast path bumps the live eden top,
+    /// stamps `[mark][klass]` plus a nil body, and returns a MEM_TAG-ed
+    /// pointer; when the bump would pass `eden_end` it calls the slow path
+    /// instead.
+    ///
+    /// Both paths matter and neither is checkable from the return value
+    /// alone, so this asserts on the *heap*: the header words, the nil'd
+    /// body, and the published eden top.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_alloc_bumps_eden_and_falls_back() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::compiler::ir::PoolEntry;
+        use crate::oops::layout::{
+            HEADER_WORDS, MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET, WORD_SIZE,
+        };
+        use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::Ordering;
+
+        const MARK: u64 = 0x1111_1111;
+        const KLASS: u64 = 0x2222_2222;
+        const NIL: u64 = 0x3333_3333;
+        const SIZE_WORDS: u32 = 4; // 2 header + 2 body
+
+        // A stand-in eden: `top` is a live word the compiled code bumps.
+        let mut eden = vec![0u64; 64];
+        let eden_base = eden.as_mut_ptr() as u64;
+        let mut eden_top: u64 = eden_base;
+        let eden_end = eden_base + 8 * WORD_SIZE as u64; // room for exactly two objects
+
+        let mut vmreg = [0u64; 8];
+        vmreg[VMREG_EDEN_TOP_ADDR_OFFSET / 8] = &mut eden_top as *mut u64 as u64;
+        vmreg[VMREG_EDEN_END_OFFSET / 8] = eden_end;
+
+        let mut m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Alloc {
+                        dst: VReg(0),
+                        klass: PoolLit(1),
+                        size_words: SIZE_WORDS,
+                    },
+                    Ir::Ret { val: VReg(0) },
+                ],
+            )],
+            oops(1),
+            0,
+        );
+        // Pool: 0 = mark, 1 = klass, 2 = nil.
+        m.pool = vec![
+            PoolEntry {
+                value: MARK,
+                kind: None,
+            },
+            PoolEntry {
+                value: KLASS,
+                kind: Some(RelocKind::Oop),
+            },
+            PoolEntry {
+                value: NIL,
+                kind: Some(RelocKind::Oop),
+            },
+        ];
+        m.mark_slots_lit = PoolLit(0);
+        m.nil_lit = PoolLit(2);
+
+        let rt = RuntimeAddrs {
+            alloc_slow: alloc_slow_probe as usize as u64,
+            ..RuntimeAddrs::default()
+        };
+        let blob = emit_x64(&m, &regalloc(&m), rt).blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let vm = vmreg.as_ptr() as u64;
+
+        let slow_before = ALLOC_SLOW_CALLS.load(Ordering::Relaxed);
+        let size_bytes = SIZE_WORDS as u64 * WORD_SIZE as u64;
+
+        // ── First allocation: the fast path ─────────────────────────────
+        let obj = unsafe { stub_fn(entry, vm, std::ptr::null(), 0) };
+        assert_eq!(
+            ALLOC_SLOW_CALLS.load(Ordering::Relaxed),
+            slow_before,
+            "an allocation that fits must NOT call the slow path"
+        );
+        assert_eq!(obj, eden_base | MEM_TAG, "result is the tagged base");
+        assert_eq!(eden_top, eden_base + size_bytes, "eden top was published");
+        // Header and nil'd body, read back off the heap.
+        let words = unsafe { std::slice::from_raw_parts(eden_base as *const u64, 4) };
+        assert_eq!(words[0], MARK, "mark word stamped");
+        assert_eq!(words[1], KLASS, "klass word stamped");
+        for (i, w) in words[HEADER_WORDS..].iter().enumerate() {
+            assert_eq!(*w, NIL, "body word {i} nil'd");
+        }
+
+        // ── Second allocation: still fits, bumps again ──────────────────
+        let obj2 = unsafe { stub_fn(entry, vm, std::ptr::null(), 0) };
+        assert_eq!(obj2, (eden_base + size_bytes) | MEM_TAG);
+        assert_eq!(eden_top, eden_base + 2 * size_bytes);
+        assert_eq!(
+            ALLOC_SLOW_CALLS.load(Ordering::Relaxed),
+            slow_before,
+            "still no slow-path call"
+        );
+
+        // ── Third: eden is now full, so the slow path must run ──────────
+        let obj3 = unsafe { stub_fn(entry, vm, std::ptr::null(), 0) };
+        assert_eq!(
+            ALLOC_SLOW_CALLS.load(Ordering::Relaxed),
+            slow_before + 1,
+            "an allocation past eden_end must call the slow path exactly once"
+        );
+        assert_eq!(
+            ALLOC_SLOW_SIZE.load(Ordering::Relaxed),
+            size_bytes,
+            "the slow path receives the size in BYTES"
+        );
+        assert_eq!(
+            obj3,
+            KLASS ^ 0xDEAD_0000,
+            "the slow path's result is what the method returns"
+        );
+        assert_eq!(
+            eden_top,
+            eden_base + 2 * size_bytes,
+            "a slow-path allocation must not have bumped eden itself"
+        );
+
+        let _ = &mut eden;
     }
 
     /// An op outside the slice fails loudly and names itself, rather than
