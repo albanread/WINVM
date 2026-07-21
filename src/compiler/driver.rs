@@ -200,6 +200,29 @@ pub fn eligible(vm: &VmState, method: MethodOop) -> bool {
     eligibility_detail(vm, method, None) == Eligibility::Yes
 }
 
+/// Most real arguments a compiled SEND SITE can marshal — the argument
+/// registers minus one for the receiver.
+///
+/// This is an ISA capacity, not a policy: AArch64 marshals into `x0..x7`
+/// (8 registers, so 7 real args), Win64 into `RCX RDX R8 R9` (4, so 3).
+/// The cap was AArch64's `7` on every host until WINVM Phase 5 — which
+/// meant a perfectly legal 4-argument send passed eligibility on x64 and
+/// then hit `emit_x64::marshal_args`' assert, crashing the compiler on a
+/// valid Smalltalk program. `ROOTSPILL_SLOTS` is 8 on both hosts, so the
+/// spill area is oversized rather than short on x64; the shortage is
+/// purely in registers.
+#[cfg(target_arch = "aarch64")]
+const MAX_SEND_ARGC: u8 = 7;
+#[cfg(not(target_arch = "aarch64"))]
+const MAX_SEND_ARGC: u8 = 3;
+
+/// Most arguments a compiled METHOD's own entry convention can accept,
+/// same register budget seen from the callee side.
+#[cfg(target_arch = "aarch64")]
+const MAX_METHOD_ARGC: usize = 5;
+#[cfg(not(target_arch = "aarch64"))]
+const MAX_METHOD_ARGC: usize = 3;
+
 /// D1 point 2 (mono-smi-inline gate): a `Send` site only clears eligibility
 /// when its own IC is already `Mono`, guarded on `SmallInteger`, targeting a
 /// method whose primitive is in [`SMI_INLINE`] — this is deliberately
@@ -230,7 +253,7 @@ fn eligibility_detail(
     // ALL of M's ctx-temps to vregs and elides M's Context. A `has_ctx` method
     // whose block escapes still returns NoPermanent (via the pre-pass).
     if method.is_block()
-        || method.argc() > 5
+        || method.argc() > MAX_METHOD_ARGC
         || (method.primitive() != 0 && !is_shimmable_primitive(method.primitive()))
         || method.bytecode_len() > MAX_BYTECODE_LEN
     {
@@ -263,7 +286,7 @@ fn eligibility_detail(
         while b < method.bytecode_len() {
             let (instr, next) = decode_at(method, b);
             if let Instr::Send { ic, .. } = instr {
-                if crate::interpreter::ic::InterpreterIc::at(method, ic).argc() > 7 {
+                if crate::interpreter::ic::InterpreterIc::at(method, ic).argc() > MAX_SEND_ARGC {
                     if vm.options.trace.is_enabled("jit") {
                         eprintln!(
                             "[jit] NoPermanent reason: send site ic={ic} argc={} > 7 \
