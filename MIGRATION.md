@@ -486,8 +486,24 @@ Surveyed rather than guessed:
 | `codecache/stubs.rs` | ~~14 `build_*` functions~~ | **DONE — 14/14** (`c2i_shared` was missed by the first survey) (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `box_double`, `call_primitive`, `nlr_originate`, `value_dispatch` — all in `stubs_x64.rs`) |
 | `codecache/deopt_trap.rs` | ~~3 trampolines~~ | **DONE** — `uncommon`, `assert`, `probe`. The deopt loop is now closed end to end and tested against the real VEH. |
 | `codecache/pics.rs`, `mega.rs`, `adapters.rs` | ~~PIC/mega/adapter emitters~~ | **DONE** — `pics_x64.rs`, `thunks_x64.rs`. **`codecache` is now fully ported.** |
-| `compiler/driver.rs` | back-end selection | **the only structural piece left.** `emit_x64`'s OUTPUT now matches the contract (block order, `block_pcs`, `verified_entry_off`, safepoints with `position`). What remains is the call site itself: `RuntimeAddrs` must grow the remaining stub addresses (`box_double`, the three SIMD boxers, `call_primitive`, `nlr_originate`), and `prim_shim`/OSR are unsupported — so `eligibility_detail` must REFUSE those methods on x64 rather than mis-compile them, leaving them interpreted |
+| `codecache/stubs.rs` — `install` | stub-table selection | **DONE (Phase 3u).** `install` ran the A64 builders on *every* host, so an x86-64 build published A64 encodings into the code cache and handed their addresses to the compiler. Nothing detected it: the addresses are real and the bounds checks pass. Now arch-dispatched; the three SIMD boxers are `ud2` (no `FBox`/`VecArith` lowering exists, so nothing can call them) |
+| `compiler/driver.rs` | back-end selection | **DONE (Phase 3v).** Declines what the back end cannot lower — unsupported IR ops (checked against `SUPPORTED_OPS` itself, turning a compiler panic into an interpreted method), `prim_shim`, and OSR — rather than approximating. `RuntimeAddrs` deliberately stayed at three fields: the other six addresses all belong to declined ops, so they would be fields no emitted instruction reads |
 | `compiler/disasm_a64.rs` | trace/debug disassembly | replace with `iced-x86` (already a dev-dependency) |
+
+### Status: the back end is wired, and the first real program crashes
+
+`MACVM_JIT=threshold=1` on a hot-loop program now compiles one nmethod
+(240 bytes) and then **segfaults**. This is not a regression — before
+Phase 3v the same program died with a stack overflow, because the JIT
+was executing AArch64 encodings as x86-64. The failure has moved from
+*guaranteed* garbage to a specific bug in real x64 code.
+
+That is the next task, and it is the one that matters: every figure in
+this document so far comes from the interpreter or a hand-built IR/stub
+harness. Until this crash is fixed, **no Smalltalk program has executed
+a single instruction of the x64 back end.** The seam is exactly where
+the separately-tested components first have to agree on live data, and
+one of them does not.
 
 So the honest position: **the hard, novel work is done and tested; what
 remains is a substantial amount of mechanical-but-careful stub porting**,
