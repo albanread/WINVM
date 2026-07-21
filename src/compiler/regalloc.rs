@@ -734,6 +734,14 @@ const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
 #[cfg(not(target_arch = "aarch64"))]
 const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4];
 
+/// The FP allocatable pool, for cross-module invariant checks — the x64
+/// call stub asserts against it that it is not required to save any
+/// callee-saved XMM (`codecache::stubs_x64`). An accessor rather than a
+/// `pub` const so the pool stays this module's business to define.
+pub fn fp_allocatable_regs() -> &'static [u8] {
+    FP_ALLOCATABLE_REGS
+}
+
 /// Allocatable registers the residency tier may claim when the main scan
 /// leaves them globally unused. Excludes the ABI argument/result registers
 /// (written mid-body by call marshalling and the allocation slow path):
