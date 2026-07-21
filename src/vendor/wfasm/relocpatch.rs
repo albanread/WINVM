@@ -128,6 +128,81 @@ pub fn patch_relocs(
     Ok(next_free)
 }
 
+// ── WINVM: x86-64 relocation patching (Phase 2, MIGRATION.md §2.2) ─────────
+//
+// The x64 sibling of [`patch_relocs`], with the same pure-buffer contract —
+// no OS calls, caller owns W^X. Logic lifted from JASM's
+// `NativeJit::finalize` (rust/src/native.rs): rel32 fields patched directly
+// when in ±2 GB range; a far `BranchRel32` routes through a 12-byte
+// `movabs rax, target ; jmp rax` stub appended at `next_free` (deduplicated
+// by target — the x86 analogue of [`abs_veneer`]); `RipRel32` cannot be
+// stubbed (it's a data reference, not a branch) and errors when out of
+// range; `Abs64` writes 8 little-endian bytes.
+
+/// `movabs rax, addr ; jmp rax` — the x86-64 absolute-branch veneer.
+pub fn abs_stub_x64(addr: u64) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    s[0] = 0x48; // REX.W
+    s[1] = 0xB8; // movabs rax, imm64
+    s[2..10].copy_from_slice(&addr.to_le_bytes());
+    s[10] = 0xFF; // jmp rax
+    s[11] = 0xE0;
+    s
+}
+pub const STUB_LEN_X64: usize = 12;
+
+/// Patch every x86-64 relocation in `relocs` into `code`. Same contract as
+/// [`patch_relocs`]: `code_base` is `code[0]`'s eventual runtime address,
+/// `next_free` the first byte available for far-branch stubs; returns the
+/// new `next_free`. The caller sizes `code` with [`STUB_LEN_X64`] per
+/// potentially-far target, the way `WinJit::build_if_needed` does.
+pub fn patch_relocs_x64(
+    code: &mut [u8],
+    code_base: u64,
+    mut next_free: usize,
+    relocs: &[ResolvedReloc],
+) -> Result<usize> {
+    let mut stubs: HashMap<u64, u64> = HashMap::new();
+    for r in relocs {
+        let field = code_base + r.field_offset as u64;
+        match r.kind {
+            RelocKind::BranchRel32 | RelocKind::RipRel32 => {
+                let mut rel = r.target as i64 - (field as i64 + 4);
+                if i32::try_from(rel).is_err() {
+                    if r.kind == RelocKind::RipRel32 {
+                        bail!("RIP-rel disp32 out of ±2 GB range (no stub possible for data refs)");
+                    }
+                    let s = match stubs.get(&r.target) {
+                        Some(&s) => s,
+                        None => {
+                            if next_free + STUB_LEN_X64 > code.len() {
+                                bail!("far-branch stub space exhausted");
+                            }
+                            let s_addr = code_base + next_free as u64;
+                            code[next_free..next_free + STUB_LEN_X64]
+                                .copy_from_slice(&abs_stub_x64(r.target));
+                            next_free += STUB_LEN_X64;
+                            stubs.insert(r.target, s_addr);
+                            s_addr
+                        }
+                    };
+                    rel = s as i64 - (field as i64 + 4);
+                }
+                let rel32 = i32::try_from(rel)
+                    .map_err(|_| anyhow::anyhow!("rel32 still out of range via stub"))?;
+                code[r.field_offset..r.field_offset + 4].copy_from_slice(&rel32.to_le_bytes());
+            }
+            RelocKind::Abs64 => {
+                code[r.field_offset..r.field_offset + 8].copy_from_slice(&r.target.to_le_bytes());
+            }
+            RelocKind::Branch26 | RelocKind::AdrpPage21 | RelocKind::AddPageOff12 => {
+                bail!("AArch64 relocation kind {:?} in an x86-64 module", r.kind);
+            }
+        }
+    }
+    Ok(next_free)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +231,73 @@ mod tests {
         assert_eq!(next_free, len, "no veneer should have been used");
         let w = u32::from_le_bytes(code[0..4].try_into().unwrap());
         assert_eq!(w & 0x03FF_FFFF, (8i64 >> 2) as u32 & 0x03FF_FFFF);
+    }
+
+    /// WINVM: a near x64 BranchRel32 patches the rel32 field in place, no
+    /// stub consumed.
+    #[test]
+    fn x64_branch_rel32_near_no_stub() {
+        let mut code = vec![0u8; 16];
+        code[0] = 0xE8; // call rel32 at field offset 1
+        let code_base = 0x2_0000_0000u64;
+        let target = code_base + 9; // just past the call
+        let relocs = [ResolvedReloc {
+            field_offset: 1,
+            kind: RelocKind::BranchRel32,
+            target,
+        }];
+        let len = code.len();
+        let next_free = patch_relocs_x64(&mut code, code_base, len, &relocs).unwrap();
+        assert_eq!(next_free, len, "no stub should have been used");
+        let rel = i32::from_le_bytes(code[1..5].try_into().unwrap());
+        // field ends at base+5; rel = target - (field_addr + 4) = 9 - 5 = 4
+        assert_eq!(rel, 4);
+    }
+
+    /// WINVM: a far x64 BranchRel32 routes through one deduplicated
+    /// `movabs rax ; jmp rax` stub.
+    #[test]
+    fn x64_branch_rel32_far_uses_stub() {
+        let mut code = vec![0u8; 5 + STUB_LEN_X64 * 2];
+        code[0] = 0xE8;
+        let code_base = 0x2_0000_0000u64;
+        let target = code_base + (1u64 << 40); // far beyond ±2 GB
+        let relocs = [
+            ResolvedReloc {
+                field_offset: 1,
+                kind: RelocKind::BranchRel32,
+                target,
+            },
+            // Second reloc to the SAME target — must reuse the stub.
+            ResolvedReloc {
+                field_offset: 1,
+                kind: RelocKind::BranchRel32,
+                target,
+            },
+        ];
+        let next_free = patch_relocs_x64(&mut code, code_base, 5, &relocs).unwrap();
+        assert_eq!(next_free, 5 + STUB_LEN_X64, "exactly one stub, deduplicated");
+        assert_eq!(code[5..5 + STUB_LEN_X64], abs_stub_x64(target));
+        let rel = i32::from_le_bytes(code[1..5].try_into().unwrap());
+        assert_eq!(rel, 0, "stub sits at base+5 = field_addr+4, so rel32 is 0");
+    }
+
+    /// WINVM: mixing architectures is a hard error both ways.
+    #[test]
+    fn cross_arch_reloc_kinds_error() {
+        let mut code = vec![0u8; 8];
+        let r = [ResolvedReloc {
+            field_offset: 0,
+            kind: RelocKind::BranchRel32,
+            target: 0x1000,
+        }];
+        assert!(patch_relocs(&mut code, 0, 8, &r).is_err());
+        let r = [ResolvedReloc {
+            field_offset: 0,
+            kind: RelocKind::Branch26,
+            target: 0x1000,
+        }];
+        assert!(patch_relocs_x64(&mut code, 0, 8, &r).is_err());
     }
 
     /// A far Branch26 (beyond ±128MB) gets routed through a deduplicated

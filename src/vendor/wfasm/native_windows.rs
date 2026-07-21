@@ -15,11 +15,11 @@
 // * x86 has coherent I/D caches; `FlushInstructionCache` is called anyway
 //   (pro forma, and it is the documented contract for cross-modifying code).
 //
-// NOTE (Phase 0/1): the encoder behind `build_if_needed` is still the
-// vendored *AArch64* one — placed code is not executable on x64 and nothing
-// may jump to it until the Phase-3 x64 backend replaces the encoder. The
-// interpreter-only tier never does; publishing/patching are plain memory
-// writes and remain valid to exercise.
+// Phase 2 (MIGRATION.md §4): the builder path assembles with the vendored
+// native x86-64 encoder (`rasm`) and patches with `relocpatch::
+// patch_relocs_x64` — placed code EXECUTES on this machine (proven by this
+// file's own tests). The compiler's tier-1 `emit.rs` still produces A64
+// until Phase 3; nothing routes those blobs here for execution.
 
 #![cfg(windows)]
 
@@ -30,7 +30,7 @@ use std::ptr;
 use anyhow::{bail, Context, Result};
 
 use crate::vendor::wfasm::backend::{EncodedModule, Reloc};
-use crate::vendor::wfasm::relocpatch::{self, ResolvedReloc, VENEER_LEN};
+use crate::vendor::wfasm::relocpatch::{self, ResolvedReloc, STUB_LEN_X64};
 
 // ── kernel32 FFI ────────────────────────────────────────────────────────────
 
@@ -194,7 +194,7 @@ impl WinJit {
         // SAFETY: the region is one live RWX allocation of exactly `cap`
         // bytes owned by `self`.
         let code = unsafe { std::slice::from_raw_parts_mut(self.region, self.cap) };
-        self.used = relocpatch::patch_relocs(code, region_base, self.used, &resolved)?;
+        self.used = relocpatch::patch_relocs_x64(code, region_base, self.used, &resolved)?;
 
         icache_invalidate(self.region as *const u8, self.cap);
         self.writable = false;
@@ -202,18 +202,17 @@ impl WinJit {
         Ok(())
     }
 
-    /// Builder path: assemble accumulated text, reserve a region, place +
-    /// relocate. Idempotent. (Still the vendored AArch64 encoder — see the
-    /// module header; nothing may execute the result until Phase 3.)
+    /// Builder path: assemble accumulated text with the native x86-64
+    /// encoder (`rasm`), reserve a region, place + relocate. Idempotent.
     fn build_if_needed(&mut self) -> Result<()> {
         if self.finalized {
             return Ok(());
         }
         if self.region.is_null() {
-            let module = crate::vendor::wfasm::a64::assemble(&self.pending_text)
-                .context("A64Encoder: assemble kernel text")?;
-            // code + one veneer per extern + slack.
-            let cap = module.code.len() + module.externs.len() * VENEER_LEN + PAGE;
+            let module = crate::vendor::wfasm::rasm::assemble(&self.pending_text)
+                .context("RasmEncoder: assemble text")?;
+            // code + one far-branch stub per extern + slack.
+            let cap = module.code.len() + module.externs.len() * STUB_LEN_X64 + PAGE;
             let externs = std::mem::take(&mut self.externs);
             *self = WinJit::with_capacity(cap)?;
             self.externs = externs;
@@ -367,25 +366,70 @@ impl Drop for WinJit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::wfasm::backend::Loader;
 
-    /// The Windows region + symbol/reloc bookkeeping round-trips: place a
-    /// module, finalize, and read the placed bytes back. (No execution — the
-    /// vendored encoder is still AArch64; execution tests arrive with the
-    /// Phase-3 x64 backend.)
+    /// End-to-end: encode `42`, JIT it, run it. Proves the whole pipe —
+    /// rasm → VirtualAlloc region → reloc patch → execute. The x64 twin of
+    /// the macOS loader's own `leaf_executes`.
     #[test]
-    fn place_and_readback() {
-        use crate::vendor::wfasm::backend::Encoder;
-        let m = crate::vendor::wfasm::a64::A64Encoder
-            .encode(".globl entry\nentry:\nret\n")
-            .expect("encode");
-        let mut jit = WinJit::with_capacity(m.code.len() + PAGE).expect("VirtualAlloc");
-        let base = jit.load_module(&m).expect("load");
-        jit.finalize().expect("finalize");
-        let sym = jit.lookup("entry").expect("symbol");
-        assert_eq!(sym, base);
-        // The placed bytes are exactly the encoded module's bytes.
-        let placed = unsafe { std::slice::from_raw_parts(base as *const u8, m.code.len()) };
-        assert_eq!(placed, &m.code[..]);
+    fn leaf_executes() {
+        let mut jit = WinJit::new();
+        jit.add_asm(".globl entry\nentry:\n  mov rax, 42\n  ret\n")
+            .expect("add_asm");
+        let f: extern "C" fn() -> u64 =
+            unsafe { jit.lookup_fn("entry").expect("lookup entry") };
+        assert_eq!(f(), 42);
+    }
+
+    /// Internal `call` (BranchRel32 to a local label, patched in place):
+    /// entry doubles via a leaf helper. Win64 ABI: arg in rcx, result rax.
+    #[test]
+    fn internal_call_executes() {
+        let src = "\
+.globl entry
+entry:
+  sub rsp, 40
+  call dbl
+  add rsp, 40
+  ret
+dbl:
+  lea rax, [rcx + rcx]
+  ret
+";
+        let mut jit = WinJit::new();
+        jit.add_asm(src).expect("add_asm");
+        let f: extern "C" fn(u64) -> u64 =
+            unsafe { jit.lookup_fn("entry").expect("lookup entry") };
+        assert_eq!(f(21), 42);
+    }
+
+    extern "C" fn host_inc(x: u64) -> u64 {
+        x + 1
+    }
+
+    /// Host callback: JIT'd code `call`s a Rust `extern "C"` function bound
+    /// as an extern — exercising the far-branch `movabs rax ; jmp rax` stub
+    /// whenever the host lands outside ±2 GB of the region (and the direct
+    /// rel32 when it doesn't; correct either way).
+    #[test]
+    fn host_callback_executes() {
+        let src = "\
+.globl entry
+entry:
+  sub rsp, 40
+  call host_inc
+  add rsp, 40
+  add rax, rax
+  ret
+";
+        let mut jit = WinJit::new();
+        jit.define_extern_fn("host_inc", 1, host_inc as usize as *mut c_void)
+            .expect("define extern");
+        jit.add_asm(src).expect("add_asm");
+        let f: extern "C" fn(u64) -> u64 =
+            unsafe { jit.lookup_fn("entry").expect("lookup entry") };
+        assert_eq!(f(10), 22, "(10+1)*2 via host callback");
+        assert_eq!(f(0), 2);
     }
 
     #[test]

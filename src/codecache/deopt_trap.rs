@@ -2082,6 +2082,7 @@ mod tests {
     /// `cargo test` run (which may execute tests in parallel and must not have
     /// a live deopt handler swallowing unrelated traps) stays stable. Run
     /// explicitly with `cargo test -- --ignored handler_redirect_smoke`.
+    #[cfg(target_os = "macos")] // WINVM: exercises the macOS SIGTRAP handler
     #[test]
     #[ignore = "installs a process-global SIGTRAP handler; run single-threaded with --ignored"]
     fn handler_redirect_smoke() {

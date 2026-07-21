@@ -1,14 +1,14 @@
-[workspace]
+﻿[workspace]
 # WINVM: gui (WKWebView + MacGamePane path dep), cocoa_gui (AppKit), and
-# abc_player (AVFoundation) are macOS-only — dropped from the Windows
-# workspace until their WebView2/Win32 counterparts exist (MIGRATION.md §6).
+# abc_player (AVFoundation) are macOS-only â€” dropped from the Windows
+# workspace until their WebView2/Win32 counterparts exist (MIGRATION.md Â§6).
 members = [".", "image_store", "ffi_gen"]
-# Per gui/PLAN.md §6 (SPEC A18): the repo root is a cargo workspace once GUI
+# Per gui/PLAN.md Â§6 (SPEC A18): the repo root is a cargo workspace once GUI
 # implementation starts, root package included as a member (not just a
 # virtual manifest) so `cargo build`/`test` at the top still builds macvm
 # alone by default.
 #
-# `cocoa_gui` (docs/cocoa_gui_design.md §12, sprint CG2) is the native AppKit
+# `cocoa_gui` (docs/cocoa_gui_design.md Â§12, sprint CG2) is the native AppKit
 # GUI bin (`macvm-cocoa`), a NON-default member: `default-members` lists only
 # the root package, so a bare `cargo build`/`cargo test` at the top builds/tests
 # macvm alone and never links the AppKit glue. Build it explicitly with
@@ -23,8 +23,8 @@ edition = "2021"
 description = "A Self/Strongtalk-lineage adaptive research VM for macOS on Apple Silicon (arm64)."
 license = "BSD-2-Clause"
 publish = false
-# A second [[bin]] (asm_preview, S23) makes a bare `cargo run` ambiguous —
-# every Justfile recipe and doc that says `cargo run -- run …` means the VM.
+# A second [[bin]] (asm_preview, S23) makes a bare `cargo run` ambiguous â€”
+# every Justfile recipe and doc that says `cargo run -- run â€¦` means the VM.
 default-run = "macvm"
 
 [[bin]]
@@ -33,7 +33,7 @@ path = "src/main.rs"
 
 # S23 (docs/ASM.md) preview tool: extracts a `<asm: '...'>` method body and
 # runs it through the vendored JASM assembler (src/vendor/wfasm), standing
-# alone from the real compiler pipeline — see docs/ASM.md §7.
+# alone from the real compiler pipeline â€” see docs/ASM.md Â§7.
 [[bin]]
 name = "asm_preview"
 path = "src/bin/asm_preview.rs"
@@ -44,24 +44,29 @@ path = "src/lib.rs"
 
 [build-dependencies]
 # Compiles the one Objective-C file the Cocoa bridge needs (the @try/@catch
-# exception shim, src/runtime/objc_shim.m) — "the one new build dependency
-# this design admits" (docs/cocoa_bridge_design.md §5).
+# exception shim, src/runtime/objc_shim.m) â€” "the one new build dependency
+# this design admits" (docs/cocoa_bridge_design.md Â§5).
 cc = "1"
 
 [dependencies]
 libc = "0.2"
 # Vendored wfasm (S9, src/vendor/wfasm/) uses anyhow for its own error
-# plumbing (Result/Context/bail!) — kept as-is per the vendoring procedure's
+# plumbing (Result/Context/bail!) â€” kept as-is per the vendoring procedure's
 # "minimal diff against upstream" rule rather than re-threaded onto MACVM's
 # own error types.
 anyhow = "1"
 # codecache::guard::JitWriteGuard's flush-range list (sprint_s09_detail.md
-# D2.4) — almost always 1-2 entries per publish/patch, so the inline
+# D2.4) â€” almost always 1-2 entries per publish/patch, so the inline
 # capacity avoids a heap allocation on the common path.
 smallvec = "1"
 
-# Codegen backend is an OPEN DECISION (see docs/DESIGN.md §4). Backends are
+# Codegen backend is an OPEN DECISION (see docs/DESIGN.md Â§4). Backends are
 # selected by feature so the compiler front end never hard-depends on one.
+[dev-dependencies]
+# WINVM: the vendored rasm encoder's own difftest suite decodes its output
+# with iced-x86 (same shape as JASM upstream); also the Phase-3 x64 disasm.
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+
 [features]
 default = []
 # backend-jasm = []   # reuse the JASM AArch64 encoder
@@ -76,7 +81,7 @@ name = "cocoa_main_hop"
 harness = false
 
 # Cocoa C6 reverse-dispatch gate (CG3): harness = false so main() is the real
-# main thread — the UI worker boots in place on main (the CG2 arrangement),
+# main thread â€” the UI worker boots in place on main (the CG2 arrangement),
 # publishes its *mut VmHandle, and delegate IMPs dispatch as top-level entries
 # there; a forced SIGSEGV in a handler recovers via that thread's sigsetjmp,
 # which isolating the test to its own process keeps from taking other tests down.

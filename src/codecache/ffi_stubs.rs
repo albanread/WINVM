@@ -1,33 +1,33 @@
-//! S20 FFI (docs/FFI.md §5) — the shape-keyed native-call trampolines.
+﻿//! S20 FFI (docs/FFI.md Â§5) â€” the shape-keyed native-call trampolines.
 //!
 //! One hand-assembled, Rust-callable trampoline PER RETURN CLASS (`g`
-//! integer/pointer, `f` float/double, `v` void — docs/FFI.md §1's token
+//! integer/pointer, `f` float/double, `v` void â€” docs/FFI.md Â§1's token
 //! vocabulary), not one per call site and not one per exact argument-class
 //! sequence: each trampoline unconditionally loads a FIXED 8 GPR argument
 //! slots (`x0..x7`) and 8 FPR argument slots (`d0..d7`), and SPILLS a
 //! further fixed 8 integer-class slots to the stack (`[sp, #0..56]`,
-//! AAPCS64's home for integer args 9+ — the A3 stack-spill tier,
+//! AAPCS64's home for integer args 9+ â€” the A3 stack-spill tier,
 //! docs/accelerate_design.md U2, which is what makes `vDSP_mmulD` and
 //! `cblas_dgemm` callable), all from two marshaled buffers before the
 //! call. This is sound under AAPCS64 regardless of how many of those slots
-//! the real callee's own C signature actually declares — a function reads
+//! the real callee's own C signature actually declares â€” a function reads
 //! only the registers and stack words its own prototype names, so
 //! supplying extra (unread) argument words in unused slots is always
 //! harmless, the same reasoning any general-purpose FFI (libffi, `ctypes`)
 //! relies on internally. This collapses what would otherwise be a
 //! combinatorial "one trampoline per (g-count, f-count, interleaving)"
 //! problem down to exactly 3 fixed blobs, covering every real POSIX
-//! function (≤6 `g` args), every plain-numeric Cocoa method, and BLAS/
+//! function (â‰¤6 `g` args), every plain-numeric Cocoa method, and BLAS/
 //! LAPACK drivers up to `METHOD_ARGC_MAX` total args (HFA/struct-by-value
-//! shapes — `h2` `h3` `h4` `i1` `i2` `b` `s` — remain Tier 2's problem,
-//! deferred: S20 step 7 / docs/FFI.md §3).
+//! shapes â€” `h2` `h3` `h4` `i1` `i2` `b` `s` â€” remain Tier 2's problem,
+//! deferred: S20 step 7 / docs/FFI.md Â§3).
 //!
 //! Deliberately NOT anchored the way `codecache::stubs`'s runtime-stub
 //! table is (`VMREG_LAST_COMPILED_FP_OFFSET` etc.): those trampolines are
 //! reached FROM compiled Smalltalk code via a `bl`, exposing a live
 //! compiled frame a GC must be able to walk mid-call. This trampoline runs
-//! the OPPOSITE direction — Rust calls it directly (like `stubs::call_stub`,
-//! its closest existing precedent) — with every Smalltalk oop already
+//! the OPPOSITE direction â€” Rust calls it directly (like `stubs::call_stub`,
+//! its closest existing precedent) â€” with every Smalltalk oop already
 //! converted to a plain native word by the caller BEFORE this trampoline
 //! ever runs, so no MACVM heap object is reachable only through a register
 //! this code touches. No `VmState` involved at all.
@@ -39,15 +39,15 @@ use super::{CodeCache, CodeHandle};
 
 /// Every FFI trampoline's own Rust-side signature: `target` is the resolved
 /// native function address (S20 step 1's `dlsym_resolve`); `argv_g` points
-/// at exactly [`ARGV_G_WORDS`] (16) `u64` words and `argv_f` at exactly 8 —
+/// at exactly [`ARGV_G_WORDS`] (16) `u64` words and `argv_f` at exactly 8 â€”
 /// `argv_g[i]` is the `i`th integer-class argument's raw bits (an integer,
-/// a pointer, or a `bool`/`char` widened to 64 bits — all `g`-class per
-/// docs/FFI.md §1), `argv_f[i]` is the `i`th FPR argument's
-/// `f64::to_bits()` (an `f32` is widened to `f64` bits by the caller —
+/// a pointer, or a `bool`/`char` widened to 64 bits â€” all `g`-class per
+/// docs/FFI.md Â§1), `argv_f[i]` is the `i`th FPR argument's
+/// `f64::to_bits()` (an `f32` is widened to `f64` bits by the caller â€”
 /// AAPCS64 passes it in the LOW 32 bits of the SAME `d`-register a double
 /// would use, so this one shape covers both). g-args 0..8 load into
 /// `x0..x7`; g-args 8..16 SPILL TO THE STACK per AAPCS64 (`[sp, #0..56]`
-/// at call time) — the A3 unlock (docs/accelerate_design.md U2) that makes
+/// at call time) â€” the A3 unlock (docs/accelerate_design.md U2) that makes
 /// `vDSP_mmulD` (9 g) and `cblas_dgemm` (12 g + 2 f) callable. The
 /// returned `u64` is the raw result: `ret_g` callers use it directly (or
 /// narrow/widen per the real return type), `ret_f` callers apply
@@ -72,12 +72,12 @@ pub struct FfiStubs {
     ret_v: CodeHandle,
 }
 
-/// Which register class an FFI call's OWN return value uses — the only
+/// Which register class an FFI call's OWN return value uses â€” the only
 /// per-call dimension left once argument marshaling is uniform (both
 /// argument buffers are always exactly 8 words, real arity or not).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FfiRetClass {
-    /// `g` — integer/pointer/id (docs/FFI.md §1); also covers `v` (void):
+    /// `g` â€” integer/pointer/id (docs/FFI.md Â§1); also covers `v` (void):
     /// the caller simply discards the result, so `ret_g`'s trampoline
     /// (which always leaves SOMETHING valid in `x0`) serves both without a
     /// separate `ret_v` call path being load-bearing. `ret_v` still exists
@@ -86,18 +86,18 @@ pub enum FfiRetClass {
     /// discarding `G`'s result is safe (it always is, but a dedicated `V`
     /// variant makes that a non-question).
     G,
-    /// `f` — float/double; the raw `u64` result is `d0`'s bits, moved into
+    /// `f` â€” float/double; the raw `u64` result is `d0`'s bits, moved into
     /// `x0` by the trampoline itself (`fmov x0, d0`) so every trampoline
     /// shares ONE Rust-side return type regardless of class.
     F,
-    /// `v` — void; the callee's own C return type. This trampoline never
-    /// reads `x0`/`d0` after the call at all — no register-shuffling to
+    /// `v` â€” void; the callee's own C return type. This trampoline never
+    /// reads `x0`/`d0` after the call at all â€” no register-shuffling to
     /// mis-order, since there is nothing to mis-order.
     V,
 }
 
 impl FfiStubs {
-    /// Resolved trampoline entry address for `ret_class` — pair with
+    /// Resolved trampoline entry address for `ret_class` â€” pair with
     /// [`FfiCallFn`]'s `transmute`, exactly [`crate::codecache::stubs::
     /// Stubs::invoke`]'s own calling pattern for `call_stub`.
     pub fn addr_for(&self, ret_class: FfiRetClass) -> u64 {
@@ -108,11 +108,11 @@ impl FfiStubs {
         }
     }
 
-    /// Convenience wrapper mirroring `Stubs::invoke` — resolves the right
+    /// Convenience wrapper mirroring `Stubs::invoke` â€” resolves the right
     /// trampoline for `ret_class` and calls through it. `argv_g` is always
     /// exactly [`ARGV_G_WORDS`] words and `argv_f` exactly 8 (unused
     /// trailing slots may hold any value at all, per this module's own doc
-    /// — never read by a callee whose own C signature doesn't declare that
+    /// â€” never read by a callee whose own C signature doesn't declare that
     /// many arguments).
     pub fn invoke(
         &self,
@@ -129,13 +129,13 @@ impl FfiStubs {
 
 /// Shared prologue every trampoline below starts with: stash the 3
 /// incoming Rust-side args into scratch registers (x9-x11, all
-/// caller-saved — safe to clobber, and clobbered again immediately by the
+/// caller-saved â€” safe to clobber, and clobbered again immediately by the
 /// argument loads that follow) BEFORE x0-x2 get overwritten by the real
 /// marshaled arguments, then load all 8 GPR + 8 FPR argument slots. x12 is
 /// a second scratch used only to round-trip an `f64`'s raw bits through a
 /// GPR before `fmov`ing them into their real FPR home (there is no direct
 /// `ldr d0, [mem]` form exercised anywhere in this codebase's own
-/// corpus — `fmov` GPR<->FPR bit moves are, so the FP argument path reuses
+/// corpus â€” `fmov` GPR<->FPR bit moves are, so the FP argument path reuses
 /// the SAME plain `ldr x_, [...]` this whole codebase already trusts, just
 /// followed by one bit-preserving move into the real FP register).
 fn emit_ffi_prologue(a: &mut JasmAssembler) {
@@ -147,7 +147,7 @@ fn emit_ffi_prologue(a: &mut JasmAssembler) {
     a.emit("mov", &[x(11), x(2)]); // argv_f
 
     // Stack-spilled g args (A3/U2): AAPCS64 places integer args 9+ at
-    // `[sp, #0], [sp, #8], …` at call time — carve 64 bytes (16-byte
+    // `[sp, #0], [sp, #8], â€¦` at call time â€” carve 64 bytes (16-byte
     // aligned already) and copy argv_g[8..16] down. Unconditional for
     // every call, same reasoning as the fixed 8-register loads below: a
     // callee only reads the stack words its own prototype names, so
@@ -180,7 +180,7 @@ fn emit_ffi_epilogue(a: &mut JasmAssembler) {
     a.emit("ret", &[]);
 }
 
-/// `ret_class = g` (and `v`, which shares this shape — see [`FfiRetClass::G`]'s
+/// `ret_class = g` (and `v`, which shares this shape â€” see [`FfiRetClass::G`]'s
 /// own doc): the callee's result is already exactly where the Rust caller
 /// wants it, `x0`, the instant `blr` returns. Nothing to do after the call.
 fn build_ffi_call_ret_g() -> CodeBlob {
@@ -192,7 +192,7 @@ fn build_ffi_call_ret_g() -> CodeBlob {
 
 /// `ret_class = f`: the callee's real return value comes back in `d0`
 /// (AAPCS64), but every trampoline shares ONE Rust-side `-> u64` shape
-/// (this module's own doc) — move `d0`'s raw bits into `x0` before
+/// (this module's own doc) â€” move `d0`'s raw bits into `x0` before
 /// returning, so the Rust caller's `f64::from_bits(result)` recovers the
 /// exact value with no precision loss (a bit move, not a numeric convert).
 fn build_ffi_call_ret_f() -> CodeBlob {
@@ -203,7 +203,7 @@ fn build_ffi_call_ret_f() -> CodeBlob {
     a.finish()
 }
 
-/// `ret_class = v`: the callee's C return type is void — `x0`/`d0` are
+/// `ret_class = v`: the callee's C return type is void â€” `x0`/`d0` are
 /// whatever the callee left them as (uninitialized from THIS call's own
 /// point of view), so this trampoline deliberately never reads either
 /// after `blr`, unlike `ret_g`/`ret_f` which read exactly one of them.
@@ -242,7 +242,9 @@ pub fn install(cache: &mut CodeCache) -> FfiStubs {
     }
 }
 
-#[cfg(test)]
+// WINVM: these tests EXECUTE the A64 trampolines — macOS-only until the
+// Phase-3 x64 stubs exist.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
@@ -267,7 +269,7 @@ mod tests {
     }
 
     /// All 8 GPR argument slots, in order, arrive in the exact registers
-    /// AAPCS64 promises — a test function that returns which SLOT holds a
+    /// AAPCS64 promises â€” a test function that returns which SLOT holds a
     /// sentinel value proves the trampoline's own `ldr x_, [argv_g, #8*i]`
     /// loop is neither off-by-one nor reversed.
     #[test]
@@ -288,7 +290,7 @@ mod tests {
 
     /// The A3 stack-spill tier (docs/accelerate_design.md U2): args 9+
     /// pass on the STACK per AAPCS64. A real 12-integer-arg callee proves
-    /// both halves land — distinct positional weights make any swapped,
+    /// both halves land â€” distinct positional weights make any swapped,
     /// dropped, or mis-offset slot (register OR stack) change the sum. A
     /// mixed g/f callee below it proves the spill leaves the FPR path and
     /// the 16-byte stack alignment intact (a misaligned sp would fault or
@@ -332,9 +334,9 @@ mod tests {
     /// FPR args: the `fmov`-via-GPR path (this module's own doc rationale)
     /// must deliver bit-exact doubles into `d0..d7`, mixed with a couple of
     /// GPR args to prove the two register files are independently indexed
-    /// (AAPCS64's own rule — a `g` arg never consumes an FPR slot or vice
+    /// (AAPCS64's own rule â€” a `g` arg never consumes an FPR slot or vice
     /// versa), matching `NSColor colorWithRed:green:blue:alpha:`'s real
-    /// shape (docs/FFI.md §1) at a plain-C proxy scale.
+    /// shape (docs/FFI.md Â§1) at a plain-C proxy scale.
     #[test]
     fn ret_f_marshals_fpr_args_and_returns_a_double() {
         extern "C" fn combine(a: u64, x: f64, y: f64, b: u64, z: f64) -> f64 {
@@ -362,7 +364,7 @@ mod tests {
     /// `ret_v`: a real side-effecting void call (writes through a pointer
     /// passed as a `g` arg) proves the callee actually ran with the right
     /// arguments even though this trampoline never inspects its return
-    /// registers — the OBSERVABLE proof is the side effect, not `x0`.
+    /// registers â€” the OBSERVABLE proof is the side effect, not `x0`.
     #[test]
     fn ret_v_calls_a_real_void_function_with_side_effects() {
         extern "C" fn set_via_ptr(ptr: *mut u64, value: u64) {
@@ -384,9 +386,9 @@ mod tests {
     }
 
     /// A function that only reads its first two args must ignore whatever
-    /// garbage sits in slots 2-7 — the "always load all 8, harmless if
+    /// garbage sits in slots 2-7 â€” the "always load all 8, harmless if
     /// unread" invariant this whole design leans on (this module's own doc)
-    /// — proven with a deliberately noisy remainder, not zeros, so a latent
+    /// â€” proven with a deliberately noisy remainder, not zeros, so a latent
     /// bug reading past arity couldn't hide behind an all-zero buffer.
     #[test]
     fn unused_trailing_slots_are_never_read_by_a_narrower_callee() {

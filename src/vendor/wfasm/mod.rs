@@ -24,6 +24,10 @@
 )]
 pub mod a64;
 pub mod backend;
+// WINVM (Phase 2, MIGRATION.md §4): the native x86-64 encoder — JASM's
+// `rasm`, the sibling of `a64`. Vendored whole; compiles on every platform
+// (pure Rust emitting bytes), used by `native_windows::WinJit`.
+pub mod rasm;
 #[cfg(test)]
 mod corpus_replay;
 #[cfg(target_os = "macos")]

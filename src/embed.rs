@@ -1,27 +1,27 @@
-//! The embedding API (`docs/SPEC.md` §16.2, amendment A17): boot a
+﻿//! The embedding API (`docs/SPEC.md` Â§16.2, amendment A17): boot a
 //! `VmState`, evaluate Smalltalk source, and route guest output through a
-//! caller-supplied sink — the one library-consumable entry point besides
-//! the CLI (`main.rs`). `gui/`'s worker thread (SPEC §16.1) is the first
+//! caller-supplied sink â€” the one library-consumable entry point besides
+//! the CLI (`main.rs`). `gui/`'s worker thread (SPEC Â§16.1) is the first
 //! real caller (S21 step 3).
 //!
 //! # Safety model (S21)
 //!
 //! A `VmHandle` MUST be driven from a dedicated thread the caller is
-//! prepared to see disappear out from under it — `boot` arms
+//! prepared to see disappear out from under it â€” `boot` arms
 //! `FatalMode::ExitThread` (`runtime::vm_state`), so every guest-fatal
 //! condition (`error:`, DNU, stack overflow, heap exhaustion, a genesis-time
 //! mmap failure...) terminates only the calling thread
-//! (`libc::pthread_exit`, which does not unwind — safe regardless of any
+//! (`libc::pthread_exit`, which does not unwind â€” safe regardless of any
 //! JIT-compiled frames on the native stack, sidestepping the
 //! panic-through-hand-assembled-code hazard entirely rather than working
 //! around it) instead of the whole process. `eval` additionally recovers a
 //! genuine native fault outside the JIT code cache (`Alien`'s raw pointer
 //! accessors, S20) as an ordinary `Err`, via `codecache::deopt_trap`'s
-//! `sigsetjmp`/`siglongjmp` registry — see `eval`'s own doc for why that one
+//! `sigsetjmp`/`siglongjmp` registry â€” see `eval`'s own doc for why that one
 //! case does NOT terminate the thread.
 //!
 //! The caller must never call `.join()`/`.is_finished()` on that thread's
-//! `JoinHandle` — a thread that exits via `pthread_exit` never completes
+//! `JoinHandle` â€” a thread that exits via `pthread_exit` never completes
 //! `JoinHandle`'s own bookkeeping (`std::thread`'s `Arc<Packet>` handshake
 //! requires the spawned thread's normal-or-panicking completion path, which
 //! `pthread_exit` skips), so `join`/`is_finished` panics/hangs. Detect death
@@ -44,29 +44,29 @@ pub use crate::runtime::vm_state::FatalMode;
 /// [`VmHandle::boot_without_world`] set [`FatalMode::ExitThread`] (the GUI's
 /// "kill the language thread, not the process" model, module doc). An
 /// embedder that would rather a guest-fatal condition abort the whole
-/// process — e.g. a test or a batch CLI runner, where a silently-dying
-/// thread would just hang the harness — calls this with
+/// process â€” e.g. a test or a batch CLI runner, where a silently-dying
+/// thread would just hang the harness â€” calls this with
 /// [`FatalMode::ExitProcess`] AFTER booting (both settings are thread-local,
 /// so this affects every `VmHandle` driven from this thread).
 ///
 /// **A VM booted on the process's main thread MUST set `ExitProcess` (CG0).**
 /// `boot` unconditionally arms `ExitThread`, whose terminal is
-/// `pthread_exit` — sound for a background worker thread a supervisor can
+/// `pthread_exit` â€” sound for a background worker thread a supervisor can
 /// respawn, but on the *main* thread a true fatal (heap exhaustion, stack
 /// overflow) would `pthread_exit` the UI thread and leave a headless zombie:
 /// the AppKit run loop's thread gone, the window frozen, the process neither
 /// alive nor dead. This is the post-boot flip the Cocoa GUI's UI worker uses
-/// (`cocoa_gui_design.md` §3 step 4, §5): boot (arms `ExitThread`) then
+/// (`cocoa_gui_design.md` Â§3 step 4, Â§5): boot (arms `ExitThread`) then
 /// immediately `set_fatal_mode(FatalMode::ExitProcess)`, so a true fatal
 /// exits the process (a nonzero `std::process::exit`) instead of zombifying
-/// the UI thread. No new boot option is needed — this setter is the
+/// the UI thread. No new boot option is needed â€” this setter is the
 /// mechanism.
 pub fn set_fatal_mode(mode: FatalMode) {
     crate::runtime::vm_state::set_fatal_mode(mode);
 }
 
 /// Register a hook fired on THIS thread the instant before an `ExitThread`
-/// fatal `pthread_exit` — the one exact signal a supervisor can use to learn
+/// fatal `pthread_exit` â€” the one exact signal a supervisor can use to learn
 /// its `VmHandle` thread has died (`pthread_exit` runs no `Drop`, so a dropped
 /// channel/`join` cannot report it). Thread-scoped like [`set_fatal_mode`];
 /// call it once on the VM's own thread after boot. The Cocoa GUI's primary
@@ -77,11 +77,11 @@ pub fn set_thread_fatal_hook(hook: Box<dyn Fn()>) {
     crate::runtime::vm_state::set_fatal_hook(hook);
 }
 
-// ── The UI worker's thread-local `*mut VmHandle` + VM generation (CG3) ────────
+// â”€â”€ The UI worker's thread-local `*mut VmHandle` + VM generation (CG3) â”€â”€â”€â”€â”€â”€â”€â”€
 //
-// design (`cocoa_gui_design.md` §3 step 4, §4.3): the UI worker — pinned to the
-// process's main thread by AppKit — publishes a raw pointer to its own
-// `VmHandle` here, so an AppKit→Smalltalk callback trampoline (C6 reverse
+// design (`cocoa_gui_design.md` Â§3 step 4, Â§4.3): the UI worker â€” pinned to the
+// process's main thread by AppKit â€” publishes a raw pointer to its own
+// `VmHandle` here, so an AppKitâ†’Smalltalk callback trampoline (C6 reverse
 // dispatch, `runtime::objc_delegate`) can read it and dispatch as a *top-level*
 // `eval`/`perform`-style entry (through [`VmHandle::dispatch_callback`]). It is a
 // raw pointer (not an `Arc`/reference) precisely because the trampolines are
@@ -99,19 +99,19 @@ thread_local! {
 }
 
 /// Monotonic UI-VM generation, bumped every time a non-null `VmHandle` is
-/// published (design §4.3): a delegate records the generation live at its mint,
+/// published (design Â§4.3): a delegate records the generation live at its mint,
 /// and a callback trampoline refuses to dispatch a delegate whose recorded
-/// generation is stale — one minted against a UI worker that has since been
+/// generation is stale â€” one minted against a UI worker that has since been
 /// restarted (CG7). Process-wide because delegate instances (ObjC objects) and
 /// the trampolines that fire them are process-wide; the fail-*closed* stale
 /// check never dispatches into a dead VM.
 static UI_VM_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Publish this thread's UI worker `VmHandle` for the CG3 callback trampolines
-/// (design §3 step 4). Call on the main thread after the boot handshake, before
+/// (design Â§3 step 4). Call on the main thread after the boot handshake, before
 /// running `CocoaUI startup` / entering `[NSApp run]`. Publishing a **non-null**
 /// pointer BUMPS the UI-VM generation, so any delegate minted against a prior
-/// (now-replaced) UI worker fails closed at its next callback (design §4.3);
+/// (now-replaced) UI worker fails closed at its next callback (design Â§4.3);
 /// publishing null (teardown) only clears the door and does NOT bump.
 pub fn publish_ui_vm(p: *mut VmHandle) {
     UI_VM.with(|c| c.set(p));
@@ -121,12 +121,12 @@ pub fn publish_ui_vm(p: *mut VmHandle) {
 }
 
 /// The calling thread's published UI worker `VmHandle` pointer, or null if none
-/// — the door a CG3 callback trampoline reads before dispatching. Null-safe.
+/// â€” the door a CG3 callback trampoline reads before dispatching. Null-safe.
 pub fn ui_vm() -> *mut VmHandle {
     UI_VM.with(|c| c.get())
 }
 
-/// The current UI-VM generation (design §4.3). A delegate mint records this
+/// The current UI-VM generation (design Â§4.3). A delegate mint records this
 /// value; a callback trampoline compares the delegate's recorded generation to
 /// this and fails closed on a mismatch (a stale delegate from a restarted UI
 /// worker). Zero before the first [`publish_ui_vm`], so a delegate can never be
@@ -144,14 +144,14 @@ thread_local! {
 /// Is a C6 delegate callback currently executing on this thread? (CG3 review.)
 ///
 /// A delegate callback is a **top-level** VM entry, sound precisely because the
-/// UI worker is quiescent when AppKit calls back. A *nested* callback — an
+/// UI worker is quiescent when AppKit calls back. A *nested* callback â€” an
 /// AppKit modal / menu-tracking / live-resize run loop pumped from INSIDE a
-/// handler (which CG5+ introduces) — would re-borrow the same `&mut VmState`,
+/// handler (which CG5+ introduces) â€” would re-borrow the same `&mut VmState`,
 /// clobber the single per-thread `sigsetjmp` recovery slot, and overwrite the
 /// one idle-baseline watermark, so a later fault would `siglongjmp` into a
 /// returned frame and rewind to the wrong baseline. The delegate dispatch
 /// trampoline reads this flag BEFORE it re-borrows the `VmHandle` and, if a
-/// callback is already active, fails **closed** (returns the shape default —
+/// callback is already active, fails **closed** (returns the shape default â€”
 /// the same safe answer a stale/unknown delegate gets) instead. No such nesting
 /// path exists in CG3, but failing closed keeps the door sound in advance.
 pub fn callback_active() -> bool {
@@ -160,7 +160,7 @@ pub fn callback_active() -> bool {
 
 /// Set/clear the [`callback_active`] flag. Private: only [`VmHandle::
 /// dispatch_callback`] owns the flag's lifecycle, and it must clear it on EVERY
-/// exit arm — including the `siglongjmp` recovery arms, which skip `Drop`, so an
+/// exit arm â€” including the `siglongjmp` recovery arms, which skip `Drop`, so an
 /// RAII guard cannot be used here.
 fn set_callback_active(v: bool) {
     IN_CALLBACK.with(|c| c.set(v));
@@ -173,27 +173,27 @@ pub(crate) fn set_callback_active_for_test(v: bool) {
     set_callback_active(v);
 }
 
-/// A running, embedded VM instance — owns its `VmState` (and, through it,
+/// A running, embedded VM instance â€” owns its `VmState` (and, through it,
 /// the whole heap, code cache, and loaded world) outright. See the module
 /// doc for the thread-lifetime contract every method here assumes.
 pub struct VmHandle {
     vm: VmState,
     /// The clean idle watermark captured at the top of each `eval`/`exec`/
-    /// `render_fragment`, so a guest-fatal `siglongjmp` — which skips every
-    /// RAII `Drop` between the fault and the recovery point — can restore the
+    /// `render_fragment`, so a guest-fatal `siglongjmp` â€” which skips every
+    /// RAII `Drop` between the fault and the recovery point â€” can restore the
     /// VM to exactly its pre-doit state. Without it, the aborted doit's frames
     /// stay on `vm.stack` and its open `HandleScope`s stay in the handle arena,
     /// and both LEAK AND ACCUMULATE across errors (a workspace of typos slowly
-    /// bloats the stack toward overflow and pins dead objects as GC roots) —
+    /// bloats the stack toward overflow and pins dead objects as GC roots) â€”
     /// the "recover into some other state, worse than useless" failure. See
     /// [`VmHandle::restore_after_guest_fatal`].
     idle_baseline: IdleBaseline,
-    /// What to do when guest code raises an unhandled error — see
+    /// What to do when guest code raises an unhandled error â€” see
     /// [`ErrorPolicy`]. Default [`ErrorPolicy::Resume`].
     error_policy: ErrorPolicy,
 }
 
-/// A snapshot of the VM's clean, between-doits state — see
+/// A snapshot of the VM's clean, between-doits state â€” see
 /// [`VmHandle::idle_baseline`].
 #[derive(Clone, Copy, Default)]
 struct IdleBaseline {
@@ -206,15 +206,15 @@ struct IdleBaseline {
 /// Releases this thread's `sigsetjmp` recovery slot when the handle is
 /// dropped. `eval`/`exec` claim one via `deopt_trap::claim_jmp_slot`
 /// (idempotent per thread); in the embedded model the worker thread owns its
-/// `VmHandle` and drops it on its own way out — a clean `worker_loop` return,
+/// `VmHandle` and drops it on its own way out â€” a clean `worker_loop` return,
 /// the common restart-on-death path where an idle worker exits as its request
-/// channel is dropped — so `deregister_setjmp` runs on the very thread that
+/// channel is dropped â€” so `deregister_setjmp` runs on the very thread that
 /// claimed the slot and frees it. Without this, every respawn would strand a
 /// slot owned by a now-dead `pthread_t`, overflowing the fixed-size registry
 /// after `JMP_REGISTRY_CAP` restarts. `deregister_setjmp` is keyed by
 /// `pthread_self()`, so a `VmHandle` dropped on a thread that never claimed a
-/// slot is simply a no-op there — safe on any thread. (A worker torn down via
-/// `pthread_exit` — a genuinely fatal, unrecovered condition — skips `Drop`
+/// slot is simply a no-op there â€” safe on any thread. (A worker torn down via
+/// `pthread_exit` â€” a genuinely fatal, unrecovered condition â€” skips `Drop`
 /// by design; that path is rare now that DNU/`error:` recover in-thread, and
 /// its slot is reclaimed if that `pthread_t` value is ever reused.)
 impl Drop for VmHandle {
@@ -223,20 +223,20 @@ impl Drop for VmHandle {
     }
 }
 
-/// A guest-visible evaluation failure — never a Rust panic (module doc's
+/// A guest-visible evaluation failure â€” never a Rust panic (module doc's
 /// safety model). `Compile` covers lex/parse/codegen errors (`eval`'s
 /// source didn't compile). `RuntimeError` is an unhandled DNU or explicit
-/// `self error:` — genuinely terminal for the CURRENT computation in
+/// `self error:` â€” genuinely terminal for the CURRENT computation in
 /// Smalltalk's own terms (no proceed semantics in v1), but NOT a sign the
 /// VM itself is broken, so it's recovered at this same boundary rather than
 /// tearing down the whole worker thread the way it did before this existed
 /// (`runtime::error::dnu_fallback`/`primitives::prim_error`, via
-/// `codecache::deopt_trap::raise_guest_fatal`) — this is what makes an
+/// `codecache::deopt_trap::raise_guest_fatal`) â€” this is what makes an
 /// everyday Workspace typo an ordinary recoverable error instead of a full
 /// VM respawn, matching real Smalltalk's own recoverable
 /// `doesNotUnderstand:`. `NativeFault` is a genuinely recovered SIGSEGV/
-/// SIGBUS in ordinary (non-JIT) native code — reachable today only through
-/// `Alien`'s raw pointer accessors (S20) — turned into an ordinary `Err`
+/// SIGBUS in ordinary (non-JIT) native code â€” reachable today only through
+/// `Alien`'s raw pointer accessors (S20) â€” turned into an ordinary `Err`
 /// rather than terminating the thread, because `eval`'s own call frame is
 /// the recovery point (see `eval`'s body).
 #[derive(Debug)]
@@ -253,7 +253,7 @@ impl std::fmt::Display for GuestError {
             GuestError::RuntimeError(msg) => write!(f, "{msg}"),
             GuestError::NativeFault { sig, pc, far } => write!(
                 f,
-                "native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} — recovered, this eval aborted"
+                "native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} â€” recovered, this eval aborted"
             ),
         }
     }
@@ -261,7 +261,7 @@ impl std::fmt::Display for GuestError {
 
 impl std::error::Error for GuestError {}
 
-/// What a VM does when guest code raises an unhandled error — an unhandled DNU
+/// What a VM does when guest code raises an unhandled error â€” an unhandled DNU
 /// or an explicit `self error:` (NOT a compile error, and NOT a VM-fatal
 /// condition like heap exhaustion, which always terminates via `fatal_exit`).
 /// Set per-VM with [`VmHandle::set_error_policy`]; the default is [`Resume`].
@@ -273,13 +273,13 @@ pub enum ErrorPolicy {
     /// baseline ([`VmHandle::restore_after_guest_fatal`]), and hand the error
     /// back as `Err(GuestError::RuntimeError)`. The VM stays alive and ready
     /// for the next doit. The right choice for anything interactive and
-    /// long-lived — a REPL, the GUI Workspace, the editor — where a typo must
+    /// long-lived â€” a REPL, the GUI Workspace, the editor â€” where a typo must
     /// never restart the VM. This is what a plain `doesNotUnderstand:` is in
     /// real Smalltalk: recoverable.
     #[default]
     Resume,
     /// Terminate the worker on any unhandled guest error, exactly as a VM-fatal
-    /// condition does: [`crate::runtime::vm_state::fatal_exit`] — a
+    /// condition does: [`crate::runtime::vm_state::fatal_exit`] â€” a
     /// `pthread_exit` under [`FatalMode::ExitThread`], so a supervisor
     /// (`gui::vm_host`) respawns a fresh VM, or a `process::exit` under
     /// `ExitProcess`. For **throwaway / pooled compute workers**, where a
@@ -292,7 +292,7 @@ pub enum ErrorPolicy {
     Die,
 }
 
-/// Where `Transcript show:`/`printOnStdout:` output goes (SPEC §16.2).
+/// Where `Transcript show:`/`printOnStdout:` output goes (SPEC Â§16.2).
 /// `Send` because the GUI's sink hands output across the worker-to-main-
 /// thread channel.
 pub trait TranscriptSink: Send {
@@ -303,7 +303,7 @@ pub trait TranscriptSink: Send {
 /// (`docs/gamepane_design.md`). The core VM defines only this vocabulary; the
 /// GUI applies each to the real Metal pane (`gui/src/game_pane.rs`). Drawing
 /// commands mutate the pane's CPU buffer only; `Present` uploads and shows the
-/// frame — so a whole frame's drawing costs one present, not one per op.
+/// frame â€” so a whole frame's drawing costs one present, not one per op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameCommand {
     /// Set palette entry `index` (16..=255) to an opaque RGB colour.
@@ -333,7 +333,7 @@ pub enum GameCommand {
     /// Fill a disc of radius `r` centred at `(cx, cy)` in palette `index`.
     Disc { cx: i64, cy: i64, r: i64, index: u8 },
     /// Overwrite the whole active buffer from a row-major slice of palette
-    /// indices (`GamePane>>blit:`). The bulk path for CPU-generated frames — one
+    /// indices (`GamePane>>blit:`). The bulk path for CPU-generated frames â€” one
     /// command instead of one `Pset` per pixel.
     Blit { data: Vec<u8> },
     /// Upload the CPU buffer and present the frame.
@@ -369,7 +369,7 @@ pub enum GameCommand {
     PlayTune { abc: String },
 }
 
-/// Where game-primitive commands go — the game analogue of [`TranscriptSink`].
+/// Where game-primitive commands go â€” the game analogue of [`TranscriptSink`].
 /// `Send` because the GUI's sink hands commands across the worker-to-main
 /// thread channel, exactly like the transcript sink hands text.
 pub trait GameSink: Send {
@@ -377,45 +377,45 @@ pub trait GameSink: Send {
 }
 
 /// Per-VM, lock-free live signals a monitor (e.g. the GUI metrics dashboard)
-/// samples at high frequency WITHOUT going through the VM's request queue — so
+/// samples at high frequency WITHOUT going through the VM's request queue â€” so
 /// they stay live even while the VM is busy inside a long doit. One block per
 /// `VmState`, shared out by `Arc`; deliberately NOT a process global, so
 /// several VMs in one process each keep their own signals (a global would blend
-/// them). Sampling is a plain relaxed atomic load — no lock, no worker round-trip.
+/// them). Sampling is a plain relaxed atomic load â€” no lock, no worker round-trip.
 #[derive(Debug, Default)]
 pub struct VmLiveStats {
-    /// Mirror of `VmState::compiled_depth` — the number of nested compiled
+    /// Mirror of `VmState::compiled_depth` â€” the number of nested compiled
     /// activations currently on the native stack. A sampler reads `> 0` as
     /// "executing compiled code right now", which (sampled over time while the
     /// VM is busy) gives the interpreter/compiler execution ratio.
     pub compiled_depth: std::sync::atomic::AtomicU32,
 }
 
-/// A snapshot of a VM's slower runtime counters for the metrics dashboard —
+/// A snapshot of a VM's slower runtime counters for the metrics dashboard â€”
 /// read on the worker thread by [`VmHandle::metrics`] (a cheap field read, no
 /// allocation, no GC) and shipped to the GUI. Bytes are raw; the GUI diffs
 /// successive snapshots for rates (e.g. allocation/sec) and keeps a ring of
-/// them for graphs. The interpreter/compiler ratio is NOT here — it is sampled
+/// them for graphs. The interpreter/compiler ratio is NOT here â€” it is sampled
 /// live from [`VmLiveStats`], because at the moment the worker services a
 /// metrics request its Smalltalk stack is empty.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VmMetrics {
-    // ── memory (bytes) ──
+    // â”€â”€ memory (bytes) â”€â”€
     pub eden_used: u64,
     pub eden_capacity: u64,
     pub old_used: u64,
     pub old_committed: u64,
     pub old_reserved: u64,
-    // ── GC ──
+    // â”€â”€ GC â”€â”€
     pub scavenges: u64,
     pub full_gcs: u64,
     pub bytes_allocated: u64,
     pub last_reclaimed: u64,
-    // ── compiled code ──
+    // â”€â”€ compiled code â”€â”€
     pub nmethods: u64,
     pub code_used: u64,
     pub code_capacity: u64,
-    // ── JIT activity ──
+    // â”€â”€ JIT activity â”€â”€
     pub compilations: u64,
     pub deopts: u64,
     pub osr_entries: u64,
@@ -423,11 +423,11 @@ pub struct VmMetrics {
 }
 
 /// Adapts a `TranscriptSink` into the plain `std::io::Write` that
-/// `VmState::out` already expects — SPEC §16.2's sink trait is
+/// `VmState::out` already expects â€” SPEC Â§16.2's sink trait is
 /// guest-output-shaped (whole strings), `Write` is byte-shaped; this is the
 /// one place that gap is bridged. Guest output is always valid UTF-8
 /// (Smalltalk `String`s produced by `printString`/`displayString`), so a
-/// lossy conversion here would only ever mask a pre-existing bug elsewhere —
+/// lossy conversion here would only ever mask a pre-existing bug elsewhere â€”
 /// hence `from_utf8` + `expect` rather than `from_utf8_lossy`.
 struct SinkWriter(Box<dyn TranscriptSink>);
 
@@ -449,29 +449,29 @@ impl std::io::Write for SinkWriter {
 impl VmHandle {
     /// Boots a fresh VM: arms `FatalMode::ExitThread` and this thread's
     /// foreign-fault handler (module doc), runs genesis, and loads
-    /// `world_dir/world.list` — the same base image the CLI's `run`/`repl`
+    /// `world_dir/world.list` â€” the same base image the CLI's `run`/`repl`
     /// subcommands load via `--world` (default `"world"`, `main.rs`'s
     /// `load_world_with_warning`). A missing `world.list` is not an error
-    /// (matches `load_world_with_warning`'s own `Ok(false)` handling — the
+    /// (matches `load_world_with_warning`'s own `Ok(false)` handling â€” the
     /// VM boots successfully with just genesis's built-in classes); a
     /// `world.list` that exists but fails to load (a real compile error)
     /// surfaces as `Err(VmError)`.
     ///
     /// Takes `world_dir` explicitly rather than hardcoding `"world"`
-    /// internally (`docs/SPEC.md` §16.2's sketch shows `boot(opts)` alone) —
+    /// internally (`docs/SPEC.md` Â§16.2's sketch shows `boot(opts)` alone) â€”
     /// deliberate: a hardcoded relative path would be untestable (exercising
     /// the `Err` path would need mutating the whole test process's cwd, a
     /// global, unsynchronized change unsafe under a parallel test runner)
     /// and would silently assume a launch-directory convention no embedder
     /// has actually agreed to. A future Browser bridge may need a different
     /// world source entirely (the `image_store` SQLite image, not a `.mst`
-    /// file tree) — deferred, per `shiny-snacking-pine.md`'s own Deferred
+    /// file tree) â€” deferred, per `shiny-snacking-pine.md`'s own Deferred
     /// section; `gui/`'s Workspace-only caller (S21 step 3) just always
     /// passes `Path::new("world")`, the same effective default as today's
     /// CLI.
     ///
     /// MUST be called on the dedicated thread the caller is prepared to see
-    /// terminate out from under it (module doc) — `set_fatal_mode` and the
+    /// terminate out from under it (module doc) â€” `set_fatal_mode` and the
     /// foreign-fault handler's sigaltstack are both thread-scoped, so
     /// calling `boot` on the wrong thread arms the wrong one.
     pub fn boot(opts: VmOptions, world_dir: &Path) -> Result<VmHandle, VmError> {
@@ -479,7 +479,7 @@ impl VmHandle {
         // Regardless of `opts.jit`: `VmState::with_options` only arms
         // PROBE's SIGSEGV/SIGBUS handler when the JIT is enabled (a pure
         // interpreter never emits a deopt trap), but an embedded VM needs
-        // foreign-fault recovery either way — `docs/SPEC.md` §16.5 itself
+        // foreign-fault recovery either way â€” `docs/SPEC.md` Â§16.5 itself
         // requires the GUI's Browser accept path to run with
         // `MACVM_JIT=off`. See `arm_foreign_fault_handler`'s own doc.
         deopt_trap::arm_foreign_fault_handler();
@@ -494,10 +494,10 @@ impl VmHandle {
         })
     }
 
-    /// Boots a bare, genesis-only VM — the built-in classes exist (`Object`,
-    /// `Behavior`, the immediates, …) but no `world/` library is loaded. Same
+    /// Boots a bare, genesis-only VM â€” the built-in classes exist (`Object`,
+    /// `Behavior`, the immediates, â€¦) but no `world/` library is loaded. Same
     /// thread-safety arming as [`boot`] (module doc). For an embedder that
-    /// supplies the library some other way than a `.mst` file tree — notably
+    /// supplies the library some other way than a `.mst` file tree â€” notably
     /// loading it from the versioned image database class-by-class via
     /// `eval` (the GUI's "load the world from the database" path, S22): boot
     /// genesis-only, then replay each stored class definition in load order.
@@ -513,7 +513,7 @@ impl VmHandle {
         }
     }
 
-    /// Snapshot the VM's clean, between-doits watermark — call on the
+    /// Snapshot the VM's clean, between-doits watermark â€” call on the
     /// initial (`rc == 0`) pass of every `sigsetjmp`-guarded entry, before any
     /// guest code runs. Its partner [`restore_after_guest_fatal`] rewinds to it
     /// if the doit aborts. Stored in `self` (not a `sigsetjmp`-frame local), so
@@ -528,7 +528,7 @@ impl VmHandle {
         };
     }
 
-    /// Set this VM's [`ErrorPolicy`] — how it responds when guest code raises
+    /// Set this VM's [`ErrorPolicy`] â€” how it responds when guest code raises
     /// an unhandled error (a DNU or `self error:`). Default
     /// [`ErrorPolicy::Resume`]. Call after boot, before serving requests; a
     /// throwaway/pooled compute worker sets [`ErrorPolicy::Die`] so a failed
@@ -547,7 +547,7 @@ impl VmHandle {
     /// Under [`ErrorPolicy::Resume`] it rewinds to the clean idle baseline and
     /// yields the error to return as `Err`. Under [`ErrorPolicy::Die`] it never
     /// returns: the error is already on the transcript (written before the
-    /// unwind), so it terminates the worker via `fatal_exit` — `pthread_exit`
+    /// unwind), so it terminates the worker via `fatal_exit` â€” `pthread_exit`
     /// under `FatalMode::ExitThread`, letting the supervisor respawn a fresh
     /// VM. The `siglongjmp` that landed us here already did the hard part
     /// (unwinding safely out of deep JIT/guest frames to this Rust frame), so
@@ -564,10 +564,10 @@ impl VmHandle {
     }
 
     /// The decision at a native-fault recovery point (a recovered SIGSEGV/
-    /// SIGBUS — e.g. a bad `Alien` deref, S20), applying [`ErrorPolicy`]
+    /// SIGBUS â€” e.g. a bad `Alien` deref, S20), applying [`ErrorPolicy`]
     /// exactly like [`handle_guest_fatal`]: the `siglongjmp` that landed us
     /// here skipped every `Drop` just as a guest fatal's does, so Resume must
-    /// rewind to the clean idle baseline before returning the error — leaving
+    /// rewind to the clean idle baseline before returning the error â€” leaving
     /// the aborted doit's frames/handle scopes/tier journal in place would
     /// not merely leak, it would be captured as the new "clean" state by the
     /// NEXT entry point's `snapshot_idle_baseline`, and a stale tier link or
@@ -598,7 +598,7 @@ impl VmHandle {
             .stack
             .restore_baseline(b.stack_sp, b.stack_fp, b.stack_has_frame);
         self.vm.handle_arena.reset_to(b.arena_len);
-        // A `poolDo:` that died left its mint-list scope open — from then on
+        // A `poolDo:` that died left its mint-list scope open â€” from then on
         // every wrapper minted anywhere would append to a stale rooted list
         // forever (the C4 review's poisoned-machinery finding). A pool scope is
         // lexical and can never legitimately span doits.
@@ -609,7 +609,7 @@ impl VmHandle {
         // compiled frames skips every one of those pops, exactly like the
         // skipped `Drop`s above. At the idle baseline nothing compiled is
         // active by definition, so the clean state is empty/zero across the
-        // board — a stale `IntoCompiled` left on top would make the NEXT
+        // board â€” a stale `IntoCompiled` left on top would make the NEXT
         // doit's first GC walk panic (`found IntoCompiled instead`) or, with
         // a stale anchor, walk freed native stack memory. Same for a parked
         // NLR whose frames are gone and `pending_deopts` entries keyed by
@@ -627,24 +627,24 @@ impl VmHandle {
         self.vm.pending_deopts.clear();
     }
 
-    /// Compiles `source` as a single top-level item (SPEC §16.2: "compile as
+    /// Compiles `source` as a single top-level item (SPEC Â§16.2: "compile as
     /// a doit, S5 REPL machinery, run, answer printString") and, for a doit,
-    /// evaluates it and answers its `printString` — the same logic
+    /// evaluates it and answers its `printString` â€” the same logic
     /// `main.rs`'s REPL uses (`print_result`). A class definition has no
     /// result value; answers `""`, same as an empty/whitespace-only
     /// `source`.
     ///
     /// Never panics or exits the process/thread on a GUEST failure (a
     /// compile error, an unhandled DNU/`error:`, or a recovered native
-    /// fault) — all three become `Err`, per the module doc's safety model.
-    /// A truly VM-fatal condition (stack overflow, heap exhaustion — the
+    /// fault) â€” all three become `Err`, per the module doc's safety model.
+    /// A truly VM-fatal condition (stack overflow, heap exhaustion â€” the
     /// VM's OWN invariants/resources, not the guest program's correctness)
     /// still terminates the calling thread via `fatal_exit`: there is no
-    /// Rust-level `Result` for those, and shouldn't be — a full worker
+    /// Rust-level `Result` for those, and shouldn't be â€” a full worker
     /// respawn is the right response when the VM itself may be compromised,
     /// unlike an ordinary DNU (`shiny-snacking-pine.md`'s Context section:
     /// panic/`catch_unwind` was rejected as the *general* unwind mechanism
-    /// here because it cannot safely cross a JIT-compiled frame — DNU/
+    /// here because it cannot safely cross a JIT-compiled frame â€” DNU/
     /// `error:` recovery below reuses `sigsetjmp`/`siglongjmp` instead,
     /// precisely because that mechanism doesn't do Rust-style unwinding at
     /// all and is already trusted through JIT frames for the native-fault
@@ -655,7 +655,7 @@ impl VmHandle {
     pub fn eval(&mut self, source: &str) -> Result<String, GuestError> {
         let slot = deopt_trap::claim_jmp_slot();
         // SAFETY: `sigsetjmp` is called directly, inline, at this exact call
-        // site — its frame (this `eval` invocation) stays live for the whole
+        // site â€” its frame (this `eval` invocation) stays live for the whole
         // recovery window: control does not return to the caller until
         // either the guest code below completes (normally, with a compile
         // error, or with an unhandled DNU/`error:` recovered via
@@ -663,7 +663,7 @@ impl VmHandle {
         // straight back to here. Calling `sigsetjmp` through an intervening
         // wrapper function that itself returns before the fault happens is
         // unsound (the S21 setjmp-into-a-returned-frame bug found and fixed
-        // in `codecache::deopt_trap`) — see `deopt_trap::sigsetjmp`'s own
+        // in `codecache::deopt_trap`) â€” see `deopt_trap::sigsetjmp`'s own
         // doc.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
@@ -702,16 +702,16 @@ impl VmHandle {
     /// can itself invoke guest code that isn't ready yet during a boot (e.g.
     /// `Character value:` before `Character initTable` has populated its
     /// table), and a load doesn't want the printed value anyway. A `.mst`
-    /// file load has the same property — it executes each top item and
+    /// file load has the same property â€” it executes each top item and
     /// discards the value.
     #[allow(unsafe_code)]
     pub fn exec(&mut self, source: &str) -> Result<(), GuestError> {
         let slot = deopt_trap::claim_jmp_slot();
-        // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose
+        // SAFETY: as `eval` â€” `sigsetjmp` inline at this call site, whose
         // frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
-            // Guest fatal (error:, DNU, …) mid-exec — the same recovery arm
+            // Guest fatal (error:, DNU, â€¦) mid-exec â€” the same recovery arm
             // `eval` has. (Missing here until the worker M1 tests ran the
             // first-ever `error:` through `exec`: the fall-through hit the
             // native-fault expect below and panicked instead of Err-ing.)
@@ -740,25 +740,25 @@ impl VmHandle {
         Ok(())
     }
 
-    /// The C6 reverse-dispatch callback door (`cocoa_gui_design.md` §4, §5
-    /// Layer 1): run `body` — an AppKit→Smalltalk delegate dispatch that marshals
+    /// The C6 reverse-dispatch callback door (`cocoa_gui_design.md` Â§4, Â§5
+    /// Layer 1): run `body` â€” an AppKitâ†’Smalltalk delegate dispatch that marshals
     /// its native arguments, performs the handler, and marshals the native return
-    /// — as a **top-level VM entry**, inside the very same per-entry `sigsetjmp`
+    /// â€” as a **top-level VM entry**, inside the very same per-entry `sigsetjmp`
     /// recovery window `eval`/`exec` install. The UI worker is quiescent whenever
-    /// AppKit calls back (the run loop is Rust's, the VM at rest — design §3), so
+    /// AppKit calls back (the run loop is Rust's, the VM at rest â€” design Â§3), so
     /// a callback is never a re-entrant `&mut VmState`; it is this fresh entry.
     ///
     /// Recovery is Layer 1: a handler that `error:`s or DNUs (a guest fatal), or
     /// a genuine native fault (`SIGSEGV`/`SIGBUS`) in our marshalling or a bad
     /// `Alien` inside the handler, unwinds via `siglongjmp` back to HERE; the VM
     /// is rewound to its clean idle baseline and `body`'s `default` (the return
-    /// shape's defined default — `0`/`NO`/`nil`, all zero) is answered to AppKit,
+    /// shape's defined default â€” `0`/`NO`/`nil`, all zero) is answered to AppKit,
     /// so the delegate return slot is never left undefined and the run loop pumps
-    /// on. Unlike [`eval`](Self::eval) this **always resumes** — it never consults
+    /// on. Unlike [`eval`](Self::eval) this **always resumes** â€” it never consults
     /// [`ErrorPolicy`] and never `Die`s: a delegate typo mid-run-loop must not
     /// kill the UI worker out from under AppKit (that is the design's whole
     /// point). A genuinely VM-fatal condition (heap exhaustion, stack overflow)
-    /// still terminates via `fatal_exit` — on the main-thread UI worker that is
+    /// still terminates via `fatal_exit` â€” on the main-thread UI worker that is
     /// `ExitProcess` (CG0), the honest outcome, not a recoverable callback error.
     #[allow(unsafe_code)]
     pub fn dispatch_callback(
@@ -769,8 +769,8 @@ impl VmHandle {
         use std::io::Write as _;
         // Re-entrancy guard (CG3 review): a delegate callback is a TOP-LEVEL
         // entry, sound only because the VM is quiescent. If one is already active
-        // on this thread — a nested AppKit callback pumped from a modal/tracking
-        // run loop inside a handler (CG5+) — fail CLOSED with the shape default
+        // on this thread â€” a nested AppKit callback pumped from a modal/tracking
+        // run loop inside a handler (CG5+) â€” fail CLOSED with the shape default
         // rather than clobber the shared `sigsetjmp` slot + idle baseline (a
         // later fault would `siglongjmp` into a returned frame) and alias
         // `&mut VmState`. The delegate trampoline (`objc_delegate::dispatch`)
@@ -781,7 +781,7 @@ impl VmHandle {
             return default;
         }
         let slot = deopt_trap::claim_jmp_slot();
-        // SAFETY: as `eval` — `sigsetjmp` inline at this exact call site, whose
+        // SAFETY: as `eval` â€” `sigsetjmp` inline at this exact call site, whose
         // frame (this `dispatch_callback` invocation) stays live for the whole
         // recovery window; `body` runs deeper on the stack and any fault
         // `siglongjmp`s straight back here.
@@ -789,7 +789,7 @@ impl VmHandle {
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
             // A delegate handler raised (`error:`/DNU). The error was already
             // written to the transcript before the unwind; rewind to the clean
-            // idle baseline (never `Die` — the run loop must keep pumping) and
+            // idle baseline (never `Die` â€” the run loop must keep pumping) and
             // answer the shape default. Clear the guard: the unwind skipped the
             // normal-return clear below, and the run loop must be able to
             // dispatch the NEXT callback.
@@ -809,7 +809,7 @@ impl VmHandle {
             if let Some((sig, pc, far)) = info {
                 let _ = writeln!(
                     self.vm.out,
-                    "[cocoa-delegate] native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} — recovered, delegate answered its default"
+                    "[cocoa-delegate] native fault (signal {sig}) at pc=0x{pc:x} far=0x{far:x} â€” recovered, delegate answered its default"
                 );
             }
             return default;
@@ -819,7 +819,7 @@ impl VmHandle {
         self.snapshot_idle_baseline();
         // Mark the callback active across `body` ONLY (after the `sigsetjmp`
         // landing arms, so a fault unwinds through the arms above which clear
-        // it). Cleared explicitly on the normal-return path — an RAII guard
+        // it). Cleared explicitly on the normal-return path â€” an RAII guard
         // can't be used, since a `siglongjmp` skips `Drop`.
         set_callback_active(true);
         let out = body(&mut self.vm);
@@ -828,18 +828,18 @@ impl VmHandle {
     }
 
     /// Evaluates a `<smappl visual="...">` expression and returns the HTML
-    /// fragment the image renders for it (GUI D-G5 / `docs/APPS.md` §6: the
+    /// fragment the image renders for it (GUI D-G5 / `docs/APPS.md` Â§6: the
     /// Visual renders *itself* to HTML; Rust only transports the string).
     /// `code` is the raw `visual=` source; this wraps it as
-    /// `(Visual coerce: ([<code>] value)) htmlFragment` — the
-    /// `ElementSMAPPL.dlt` shape (`gui/smappl.md` §2) with the body run through
-    /// a block — and hands back the resulting `String`'s raw bytes.
+    /// `(Visual coerce: ([<code>] value)) htmlFragment` â€” the
+    /// `ElementSMAPPL.dlt` shape (`gui/smappl.md` Â§2) with the body run through
+    /// a block â€” and hands back the resulting `String`'s raw bytes.
     ///
-    /// The `[…] value` wrapper is load-bearing: several corpus visuals are
+    /// The `[â€¦] value` wrapper is load-bearing: several corpus visuals are
     /// multi-statement with temp declarations (`progenv2.html`'s
-    /// `| h v | h := (ClassHierarchyOutliner for: …) filterOn…; orSubclasses.
-    /// v := … . v`). Those can't be spliced straight into `(Visual coerce:
-    /// (…))` — `(| h v | …)` is a parse error — but a block accepts temps and
+    /// `| h v | h := (ClassHierarchyOutliner for: â€¦) filterOnâ€¦; orSubclasses.
+    /// v := â€¦ . v`). Those can't be spliced straight into `(Visual coerce:
+    /// (â€¦))` â€” `(| h v | â€¦)` is a parse error â€” but a block accepts temps and
     /// statements and answers its last expression, so wrapping evaluates both
     /// single-expression and multi-statement bodies uniformly.
     ///
@@ -848,13 +848,13 @@ impl VmHandle {
     /// would re-quote it. A non-`String` result (a widget shape whose
     /// `htmlFragment` isn't built yet, so the send DNUs, or `coerce:` let a
     /// non-Visual through) surfaces as `Err` and the caller shows the G0
-    /// placeholder box — errors are swallowed to a fallback, never a broken
+    /// placeholder box â€” errors are swallowed to a fallback, never a broken
     /// page, matching `ElementSMAPPL`'s own `ifError:` discipline.
     #[allow(unsafe_code)]
     pub fn render_fragment(&mut self, code: &str) -> Result<String, GuestError> {
         let source = format!("(Visual coerce: ([{code}] value)) htmlFragment.");
         let slot = deopt_trap::claim_jmp_slot();
-        // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose frame
+        // SAFETY: as `eval` â€” `sigsetjmp` inline at this call site, whose frame
         // stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
@@ -882,7 +882,7 @@ impl VmHandle {
         match frontend::classdef::execute_top_item(&mut self.vm, item) {
             Ok(Some(result)) => match fragment_bytes(result) {
                 Some(html) => Ok(html),
-                // The fragment method answered a non-String — treat as a
+                // The fragment method answered a non-String â€” treat as a
                 // render failure so the caller falls back to the placeholder.
                 None => Err(GuestError::RuntimeError(
                     "smappl visual did not render to a String".to_string(),
@@ -895,10 +895,10 @@ impl VmHandle {
 
     /// Fires a live widget's stored action closure (`SmapplRegistry fire:
     /// '<id>'`) and, if that closure answers a `String`, hands back its raw
-    /// bytes — the HTML overlay a dialog action produces (`Visual>>promptOk:…`,
+    /// bytes â€” the HTML overlay a dialog action produces (`Visual>>promptOk:â€¦`,
     /// the differences2.html "Press Me!" demo). A non-`String` answer is a
-    /// pure side-effect action (an icon button's `[:b | …]`) and yields
-    /// `Ok(None)` — no overlay. Any `Transcript` output the action makes still
+    /// pure side-effect action (an icon button's `[:b | â€¦]`) and yields
+    /// `Ok(None)` â€” no overlay. Any `Transcript` output the action makes still
     /// flows separately via the transcript sink.
     ///
     /// This is [`render_fragment`](Self::render_fragment)'s sibling: same
@@ -908,11 +908,11 @@ impl VmHandle {
     #[allow(unsafe_code)]
     pub fn fire_widget_action(&mut self, action_id: &str) -> Result<Option<String>, GuestError> {
         // action_id is a worker-minted 'wN' id (SmapplRegistry), never user
-        // text, so it needs no quoting — but guard the assumption cheaply.
+        // text, so it needs no quoting â€” but guard the assumption cheaply.
         debug_assert!(action_id.bytes().all(|b| b.is_ascii_alphanumeric()));
         let source = format!("SmapplRegistry fire: '{action_id}'.");
         let slot = deopt_trap::claim_jmp_slot();
-        // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
+        // SAFETY: as `render_fragment` â€” `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
@@ -947,17 +947,17 @@ impl VmHandle {
     }
 
     /// Evaluates `code` (wrapped `[<code>] value`, so multi-statement bodies
-    /// with temps are fine — see [`render_fragment`](Self::render_fragment))
+    /// with temps are fine â€” see [`render_fragment`](Self::render_fragment))
     /// and returns the answered `String`'s raw bytes. Used for image-side code
-    /// that builds a plain string payload rather than a widget fragment — e.g.
+    /// that builds a plain string payload rather than a widget fragment â€” e.g.
     /// `Mandelbrot new commandsForWidth:height:` answering a Canvas
-    /// draw-command batch (`docs/CANVAS.md` §5.2). A non-`String` answer is an
+    /// draw-command batch (`docs/CANVAS.md` Â§5.2). A non-`String` answer is an
     /// `Err`, like `render_fragment`'s own non-`String` case.
     #[allow(unsafe_code)]
     pub fn eval_to_string(&mut self, code: &str) -> Result<String, GuestError> {
         let source = format!("([{code}] value).");
         let slot = deopt_trap::claim_jmp_slot();
-        // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
+        // SAFETY: as `render_fragment` â€” `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
@@ -993,7 +993,7 @@ impl VmHandle {
 
     /// Evaluates `code` (wrapped `[<code>] value`, like
     /// [`eval_to_string`](Self::eval_to_string)) and returns the answered
-    /// `ByteArray`/`String`'s bytes RAW — no UTF-8 conversion, so arbitrary
+    /// `ByteArray`/`String`'s bytes RAW â€” no UTF-8 conversion, so arbitrary
     /// binary is preserved. Used for bulk pixel data: `Mandelbrot new
     /// pixelsForWidth:height:` answers a `w*h*4` RGBA `ByteArray`
     /// (`world/36_pixmap.mst`, `docs/CANVAS.md` pixel path). A non-byte-indexable
@@ -1002,7 +1002,7 @@ impl VmHandle {
     pub fn eval_to_bytes(&mut self, code: &str) -> Result<Vec<u8>, GuestError> {
         let source = format!("([{code}] value).");
         let slot = deopt_trap::claim_jmp_slot();
-        // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
+        // SAFETY: as `render_fragment` â€” `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
         if rc == deopt_trap::GUEST_FATAL_JMP_VAL {
@@ -1043,14 +1043,14 @@ impl VmHandle {
 
     /// Installs `sink` as where guest output (`Transcript show:`,
     /// `printOnStdout:`) goes from now on. Default is stdout
-    /// (`VmState::with_options`) — an embedder calls this once, right after
+    /// (`VmState::with_options`) â€” an embedder calls this once, right after
     /// `boot`, before the first `eval`.
     pub fn set_transcript(&mut self, sink: Box<dyn TranscriptSink>) {
         self.vm.out = Box::new(SinkWriter(sink));
     }
 
     /// Installs `sink` as where game-primitive commands go
-    /// (`docs/gamepane_design.md` M3) — the game analogue of `set_transcript`.
+    /// (`docs/gamepane_design.md` M3) â€” the game analogue of `set_transcript`.
     /// Default is `None` (a headless VM silently drops game commands); the GUI
     /// installs a channel-backed sink once, right after `boot`.
     pub fn set_game_sink(&mut self, sink: Box<dyn GameSink>) {
@@ -1058,11 +1058,11 @@ impl VmHandle {
     }
 
     /// DBG4 (docs/gui_debugger_design.md): install the GUI debugger frontend
-    /// on THIS vm — the halt loop then publishes reports to it and reads
+    /// on THIS vm â€” the halt loop then publishes reports to it and reads
     /// commands from it instead of the stdin `(halt)` REPL. Also arms
     /// `debug.active` (the halt primitive / breakpoints / stepping master
     /// switch) and defaults halt-on-error ON. The Cocoa supervisor installs
-    /// this on the PRIMARY only — a UI-worker halt would park the main thread.
+    /// this on the PRIMARY only â€” a UI-worker halt would park the main thread.
     pub fn set_debug_frontend(
         &mut self,
         frontend: std::sync::Arc<dyn crate::runtime::debug::DebugFrontend>,
@@ -1072,7 +1072,7 @@ impl VmHandle {
         self.vm.debug.halt_on_error = true;
     }
 
-    /// The Debug ▸ Halt on Error toggle (only meaningful with a frontend).
+    /// The Debug â–¸ Halt on Error toggle (only meaningful with a frontend).
     pub fn set_halt_on_error(&mut self, on: bool) {
         self.vm.debug.halt_on_error = on;
     }
@@ -1092,7 +1092,7 @@ impl VmHandle {
     }
 
     /// Registers how THIS vm spawns worker VMs (docs/multi-smalltalk-worker.md
-    /// §3, workers M1) — the `GameSink` pattern: the CLI/tests pass a
+    /// Â§3, workers M1) â€” the `GameSink` pattern: the CLI/tests pass a
     /// `VmHandle::boot(opts, world_dir)` closure, the GUI its image-boot path,
     /// so a worker's world matches the primary's. Installing the boot fn is
     /// what makes this VM the PRIMARY (creates its inbox + registry); without
@@ -1104,7 +1104,7 @@ impl VmHandle {
         )));
     }
 
-    /// Registers the router's wake hook (§3.1): fired — coalesced — whenever
+    /// Registers the router's wake hook (Â§3.1): fired â€” coalesced â€” whenever
     /// a worker envelope lands in this (primary) VM's inbox, so a sleeping
     /// host can submit a `Worker dispatchInbox.` doit. Headless embeddings
     /// skip this and sleep in `Worker runLoopWhile:` instead (the channel
@@ -1115,13 +1115,13 @@ impl VmHandle {
         }
     }
 
-    /// Register an *externally-hosted* worker (CG1, `cocoa_gui_design.md` §3
-    /// step 3) on THIS primary VM — the surface the Cocoa GUI's boot handshake
+    /// Register an *externally-hosted* worker (CG1, `cocoa_gui_design.md` Â§3
+    /// step 3) on THIS primary VM â€” the surface the Cocoa GUI's boot handshake
     /// needs from outside the crate. Delegates to
     /// [`crate::runtime::workers::register_hosted_worker`]: mints the same
     /// registry entry `Worker spawn` does (a normal-numbered link so
     /// `send:`/`alive`/`terminate` target it with no special-casing) but hands
-    /// back the receiving side — `(id, HostedInbox, InboxSender)` — so the
+    /// back the receiving side â€” `(id, HostedInbox, InboxSender)` â€” so the
     /// caller can drive its own drain loop instead of a spawned thread's
     /// recv-loop. `wake` is the caller's run-loop poke, fired (coalesced) on
     /// every `send` to this worker. `None` if this VM is not a primary (call
@@ -1140,8 +1140,8 @@ impl VmHandle {
 
     /// Send `bytes` (a MOP pickle, or empty for a bare connectivity poke) to
     /// worker `id` from THIS primary VM, correlated by `corr` (0 =
-    /// uncorrelated) — the public face of [`crate::runtime::workers::send`], so
-    /// the Cocoa GUI's watchdog thread can drive the primary→UI-worker link
+    /// uncorrelated) â€” the public face of [`crate::runtime::workers::send`], so
+    /// the Cocoa GUI's watchdog thread can drive the primaryâ†’UI-worker link
     /// (initial snapshot blasts, CG4). Fires the worker's (coalesced) run-loop
     /// wake. `false` if there is no such live worker.
     pub fn send_to_worker(&mut self, id: u32, corr: u64, bytes: Vec<u8>) -> bool {
@@ -1153,7 +1153,7 @@ impl VmHandle {
     /// the primary through `to_primary`. Also called from OUTSIDE the crate by
     /// the Cocoa GUI's boot handshake (CG2): the UI worker is booted in place
     /// on main, then takes on its Worker role so its future `reply:`/`send:`
-    /// reach the primary — the same wiring a spawned `worker_main` does, driven
+    /// reach the primary â€” the same wiring a spawned `worker_main` does, driven
     /// by the run loop instead of a recv loop.
     pub fn install_worker_role(
         &mut self,
@@ -1179,7 +1179,7 @@ impl VmHandle {
     }
 
     /// Load an EXTRA world list on top of the already-booted base world (CG1,
-    /// `cocoa_gui_design.md` §12.3) — the public face of
+    /// `cocoa_gui_design.md` Â§12.3) â€” the public face of
     /// [`crate::frontend::world::load_list`]. The Cocoa GUI's UI worker calls
     /// this once after [`boot`](Self::boot) to layer `world/cocoaui.list` (the
     /// `CocoaUI` view classes, files 63+) that the CLI, the WKWebView GUI, and
@@ -1192,7 +1192,7 @@ impl VmHandle {
         frontend::world::load_list(&mut self.vm, path).map_err(|e| VmError { msg: e.to_string() })
     }
 
-    /// Run a `.mst` program file to completion — every top-level item in
+    /// Run a `.mst` program file to completion â€” every top-level item in
     /// order, exactly as the bare `macvm run <file>` CLI does
     /// (`frontend::world::load_file`). The file-run analog of [`load_list`]
     /// (which loads a *world*); an embedder that wants CLI-style "boot, then
@@ -1204,7 +1204,7 @@ impl VmHandle {
     }
 
     /// The process exit code a program requested (`Smalltalk exit:` / the
-    /// SPEC exit primitive), or `None` if it never set one — the caller
+    /// SPEC exit primitive), or `None` if it never set one â€” the caller
     /// (a CLI `run`) propagates it, matching bare `macvm run`'s
     /// `std::process::exit(vm.exit_code.unwrap_or(0))`.
     pub fn exit_code(&self) -> Option<i32> {
@@ -1213,13 +1213,13 @@ impl VmHandle {
 
     /// Flip THIS (primary) VM's transcript so its output is forwarded to the UI
     /// worker's inbox as `{#workerTranscript. 0. text}` envelopes (Cocoa GUI
-    /// CG4, `cocoa_gui_design.md` §7.4) — the exact `ForwardTranscript` machinery
-    /// M2 uses worker→primary, direction-flipped and UNtagged (the primary is
+    /// CG4, `cocoa_gui_design.md` Â§7.4) â€” the exact `ForwardTranscript` machinery
+    /// M2 uses workerâ†’primary, direction-flipped and UNtagged (the primary is
     /// the environment's own console, not a sub-worker). The UI worker's
     /// `dispatchOne:` shows each line on its Transcript view. `ui_id` is the UI
     /// worker's id in this primary's registry (from [`register_hosted_worker`]);
     /// a no-op if there is no such live worker. Call after registering the UI
-    /// worker, re-called on each respawn (§5.1).
+    /// worker, re-called on each respawn (Â§5.1).
     pub fn forward_transcript_to_ui(&mut self, ui_id: u32) {
         if let Some(dest) = crate::runtime::workers::worker_inbox_sender(&self.vm, ui_id) {
             self.set_transcript(Box::new(crate::runtime::workers::ForwardTranscript::to(
@@ -1228,11 +1228,11 @@ impl VmHandle {
         }
     }
 
-    /// Drain one inbound envelope into THIS (hosted UI worker) VM and route it —
+    /// Drain one inbound envelope into THIS (hosted UI worker) VM and route it â€”
     /// the public face of the `stage_pending` + `exec("Worker dispatchInbox.")`
     /// pair (Cocoa GUI CG4): the main-thread run-loop drain source calls this per
     /// envelope it pulls off the [`crate::runtime::workers::HostedInbox`]. The UI
-    /// worker routes via `dispatchInbox` → `dispatchOne:` (NOT `dispatchPending`)
+    /// worker routes via `dispatchInbox` â†’ `dispatchOne:` (NOT `dispatchPending`)
     /// so a `#uiReply` fires its pending continuation and a `{#workerTranscript.
     /// 0. text}` reaches the Transcript view. Errors surface as [`GuestError`]
     /// (the caller reports; the UI worker's `ErrorPolicy::Resume` keeps it alive).
@@ -1247,7 +1247,7 @@ impl VmHandle {
     /// Park an inbound envelope in the Worker-role staging slot (the
     /// `GameStep` pattern): the host loop calls this, then execs
     /// `Worker dispatchPending.`, whose `primPoll` takes it. Rust bytes only
-    /// — nothing here is visible to the GC.
+    /// â€” nothing here is visible to the GC.
     pub(crate) fn stage_pending(&mut self, env: crate::runtime::workers::Envelope) {
         if let Some(ws) = self.vm.workers.as_mut() {
             if let crate::runtime::workers::WorkerState::Worker { pending, .. } = &mut **ws {
@@ -1258,14 +1258,14 @@ impl VmHandle {
 
     /// Hand a monitor a clone of THIS VM's live-signal block (a per-VM `Arc`, no
     /// global) so it can sample `compiled_depth` at high frequency off-thread,
-    /// without a request round-trip — the basis of the interpreter/compiler
+    /// without a request round-trip â€” the basis of the interpreter/compiler
     /// ratio. Safe to call once at boot and keep.
     pub fn live_stats(&self) -> std::sync::Arc<VmLiveStats> {
         self.vm.live_stats.clone()
     }
 
     /// Snapshot this VM's slower runtime counters for the metrics dashboard.
-    /// A cheap read of existing fields — no allocation, no GC. Runs on the
+    /// A cheap read of existing fields â€” no allocation, no GC. Runs on the
     /// worker thread (the VM's owner).
     pub fn metrics(&self) -> VmMetrics {
         let vm = &self.vm;
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     /// A bare Do-it (no terminating period) must evaluate, not fail with
-    /// "expected '.' after statement". This is how every GUI doit arrives —
+    /// "expected '.' after statement". This is how every GUI doit arrives â€”
     /// the tour's `doit="Mandelbrot new launch"` and a Workspace "Do it" on a
     /// selected expression both lack a trailing period.
     #[test]
@@ -1370,7 +1370,7 @@ mod tests {
     }
 
     /// "the JIT MUST be supported" (the S21 directive this whole module
-    /// exists to satisfy) — `boot`/`eval` place no restriction on
+    /// exists to satisfy) â€” `boot`/`eval` place no restriction on
     /// `opts.jit` at all. `Threshold(1)` compiles on the very first call,
     /// exercising the compiled path immediately rather than needing a hot
     /// loop to cross a higher threshold.
@@ -1425,7 +1425,7 @@ mod tests {
 
     /// The differences2.html "Press Me!" demo: a labeled button whose action
     /// is `b promptOk:title:type:action:`. Firing it must answer the modal
-    /// dialog's HTML (a String) — `fire_widget_action` surfaces that as the
+    /// dialog's HTML (a String) â€” `fire_widget_action` surfaces that as the
     /// overlay to float; a pure side-effect action instead answers `None`.
     #[test]
     fn firing_a_promptok_action_yields_the_dialog_overlay_html() {
@@ -1478,7 +1478,7 @@ mod tests {
     /// computes the set in real Smalltalk `Double` arithmetic and fills a
     /// `Pixmap`, answering its raw `w*h*4` RGBA `ByteArray`. The buffer must be
     /// exactly the right size, fully opaque, and contain both interior (black)
-    /// and escaped (coloured) pixels — i.e. the float compute really
+    /// and escaped (coloured) pixels â€” i.e. the float compute really
     /// discriminated points, not painted one flat colour.
     #[test]
     fn mandelbrot_fills_an_rgba_pixmap() {
@@ -1507,7 +1507,7 @@ mod tests {
     /// Float fast-path deopt-sunk boxing (`docs/float_fastpath_design.md`):
     /// an intermediate `FBox` pinned only by a later fused op's reexecute
     /// stack moves into that op's fail block. If the later op deopts (a
-    /// non-Double ARG — the IC only guards receivers), the interpreter
+    /// non-Double ARG â€” the IC only guards receivers), the interpreter
     /// re-executes the send and must see the CORRECT boxed intermediate,
     /// built by the sunk box on the cold path. Wrong bits here would be a
     /// silent wrong answer, so this pins the exact fallback values.
@@ -1532,7 +1532,7 @@ mod tests {
             "8.0"
         );
         // Mid-chain deopt: the second * fails; its reexec stack holds the
-        // sunk box of 2.0*1.5 = 3.0 → 3.0*2 = 6.0 (int fallback) + 0.5.
+        // sunk box of 2.0*1.5 = 3.0 â†’ 3.0*2 = 6.0 (int fallback) + 0.5.
         assert_eq!(
             vm.eval("FSinkT new chain: 1.5 with: 2").expect("chained"),
             "6.5"
@@ -1578,7 +1578,7 @@ mod tests {
             .unwrap_or_default();
         let deopts_before = vm.vm.stats.deopt_count;
         // Poison element 501: iteration 500's fused `+ 2.0` receiver is an
-        // integer → trap mid-loop with promoted a/b live.
+        // integer â†’ trap mid-loop with promoted a/b live.
         let poisoned = vm
             .eval(
                 "[ | bad | bad := Array new: 1000. \
@@ -1593,9 +1593,9 @@ mod tests {
              is not exercising DoubleSlot materialization)"
         );
         // Interpreter truth for the poisoned input: 0.5+2.0 everywhere except
-        // element 501 (7 + 2.0 = 9.0 — but x is overwritten each iteration,
+        // element 501 (7 + 2.0 = 9.0 â€” but x is overwritten each iteration,
         // so only the LAST element's x survives; the sum differs from `clean`
-        // only through the b accumulation being identical and x identical) —
+        // only through the b accumulation being identical and x identical) â€”
         // compare against the same expression run fully interpreted instead
         // of hand-computing.
         let mut interp = boot_test_vm(JitMode::Off);
@@ -1626,7 +1626,7 @@ mod tests {
     }
 
     /// A `visual=` that returns a `Glue` spacer (the side-effecting shape,
-    /// gui/smappl.md §3 shape 6) renders to an invisible fixed-width span.
+    /// gui/smappl.md Â§3 shape 6) renders to an invisible fixed-width span.
     #[test]
     fn render_fragment_glue_is_an_invisible_spacer() {
         let mut vm = boot_test_vm(JitMode::Off);
@@ -1641,8 +1641,8 @@ mod tests {
 
     /// Phase-W first tool: the start page's own smappl
     /// (`ClassHierarchyOutliner imbeddedVisualForClass: Object`) renders to a
-    /// real class-hierarchy tree — the `allClasses` reflection primitive →
-    /// `ClassMirror` subclass sweep → `HtmlWriter` fragment path, end to end.
+    /// real class-hierarchy tree â€” the `allClasses` reflection primitive â†’
+    /// `ClassMirror` subclass sweep â†’ `HtmlWriter` fragment path, end to end.
     #[test]
     fn render_fragment_class_hierarchy_outliner() {
         let mut vm = boot_test_vm(JitMode::Off);
@@ -1653,7 +1653,7 @@ mod tests {
             html.contains("st-outliner") && html.contains("Object"),
             "must be an outliner tree rooted at Object, got {html:?}"
         );
-        // Real subclasses computed from the allClasses sweep must appear —
+        // Real subclasses computed from the allClasses sweep must appear â€”
         // Behavior and Magnitude are both direct or indirect subclasses of
         // Object in the seed world.
         assert!(
@@ -1673,9 +1673,9 @@ mod tests {
     }
 
     /// progenv2.html's filtered-hierarchy visual is multi-statement with temp
-    /// declarations (`| h v | h := (ClassHierarchyOutliner for: …) filterOn…;
-    /// orSubclasses. v := (h topVisualWithHRule: false) withBorder: …. v`).
-    /// The `[…] value` wrapper must let it render (a live, unfiltered outliner)
+    /// declarations (`| h v | h := (ClassHierarchyOutliner for: â€¦) filterOnâ€¦;
+    /// orSubclasses. v := (h topVisualWithHRule: false) withBorder: â€¦. v`).
+    /// The `[â€¦] value` wrapper must let it render (a live, unfiltered outliner)
     /// rather than trip a parse error on the leading `| h v |`.
     #[test]
     fn render_fragment_handles_a_multi_statement_visual_with_temps() {
@@ -1698,14 +1698,14 @@ mod tests {
 
     /// Phase-W method nodes: `ClassOutliner for: (ClassMirror on: Point)`
     /// renders the class's own instance- and class-side selectors (the
-    /// `selectorsOf:` R2 primitive → sorted selector leaves), including the
+    /// `selectorsOf:` R2 primitive â†’ sorted selector leaves), including the
     /// full corpus decoration chain (`topVisualWithHRule:`/`withBorder:`/
     /// `Border standard3DRaised:`, all identity for HTML).
     #[test]
     fn render_fragment_class_outliner_lists_selectors() {
         let mut vm = boot_test_vm(JitMode::Off);
         // The corpus decoration chain is two sends (note the inner parens):
-        // `(x topVisualWithHRule: false) withBorder: (...)` — gui/smappl.md §3.4.
+        // `(x topVisualWithHRule: false) withBorder: (...)` â€” gui/smappl.md Â§3.4.
         let html = vm
             .render_fragment(
                 "((ClassOutliner for: (ClassMirror on: Point)) topVisualWithHRule: false) \
@@ -1752,7 +1752,7 @@ mod tests {
     }
 
     /// `primitiveOf:selector:` (R2) distinguishes a primitive method (VM code,
-    /// shown read-only in the browser) from an ordinary Smalltalk one — and
+    /// shown read-only in the browser) from an ordinary Smalltalk one â€” and
     /// the ClassOutliner renders the two differently.
     #[test]
     fn primitive_methods_render_read_only() {
@@ -1791,7 +1791,7 @@ mod tests {
     /// A `visual=` shape that doesn't resolve to a real widget class surfaces
     /// as `Err`, so the GUI falls back to the G0 placeholder box rather than
     /// breaking the page. (Originally probed `CodeView`, which was since built
-    /// — the contract is graceful failure for ANY unbuildable shape, so this
+    /// â€” the contract is graceful failure for ANY unbuildable shape, so this
     /// now names a class that will never exist, keeping the test independent of
     /// which widgets happen to be implemented.)
     #[test]
@@ -1824,7 +1824,7 @@ mod tests {
     /// primitive. Masked in the interpreter (the calling method's return
     /// truncates them), but a COMPILED caller tracks the stack statically, so
     /// the divergence tripped `enter_compiled`'s sp assert
-    /// (`compiled_call.rs`) — `Time millisecondClockValue` twice under the JIT
+    /// (`compiled_call.rs`) â€” `Time millisecondClockValue` twice under the JIT
     /// aborted the process. Under `Threshold(1)` the second call runs the
     /// compiled `millisecondClockValue` (which calls an FFI primitive), so a
     /// clean return proves the stack is balanced.
@@ -1844,7 +1844,7 @@ mod tests {
     fn eval_compile_error_surfaces_as_err_not_panic() {
         let mut vm = boot_test_vm(JitMode::Off);
         // Same "two consecutive binary operators" shape as tests/it_cli.rs's
-        // own run_compile_err ("a + + b.") — a proven-broken source in this
+        // own run_compile_err ("a + + b.") â€” a proven-broken source in this
         // codebase's own conventions.
         let err = vm
             .eval("3 + + 4")
@@ -1855,7 +1855,7 @@ mod tests {
         }
     }
 
-    /// `ensure:`/`ifCurtailed:` must fire when the protected block ERRORS —
+    /// `ensure:`/`ifCurtailed:` must fire when the protected block ERRORS â€”
     /// not only on normal completion and non-local return. Before
     /// `unwind::run_curtailment_blocks_on_error`, an unhandled error did not
     /// unwind at all (it `siglongjmp`ed past every frame from inside
@@ -1886,7 +1886,7 @@ mod tests {
         )
         .expect("class definition");
 
-        // 1. explicit `self error:` — the cleanup runs, and the error still
+        // 1. explicit `self error:` â€” the cleanup runs, and the error still
         //    surfaces as an ordinary recoverable Err (the VM stays alive).
         vm.eval("CurtailProbe reset").expect("reset");
         let err = vm.eval("CurtailProbe new boom").expect_err("must error");
@@ -1930,7 +1930,7 @@ mod tests {
     fn set_game_sink_routes_game_commands_from_a_smalltalk_doit() {
         // The M3 vertical slice end to end: a Smalltalk doit -> GamePane
         // primitive (id 200) -> GameCommand -> the installed sink. Headless,
-        // deterministic, no GPU/window — this is the real proof of the VM->GUI
+        // deterministic, no GPU/window â€” this is the real proof of the VM->GUI
         // game channel (docs/gamepane_design.md M3).
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
@@ -1961,8 +1961,8 @@ mod tests {
         // Mandelbrot set through the VM->GUI game channel: drive its per-frame
         // draw commands into a 320x240 palette-indexed buffer (exactly as the
         // native pane's CPU buffer would receive them) and assert the rendered
-        // structure — a filled interior plus a many-banded exterior. Headless,
-        // no GPU/window — same proof style as the sink test above.
+        // structure â€” a filled interior plus a many-banded exterior. Headless,
+        // no GPU/window â€” same proof style as the sink test above.
         const W: usize = 320;
         const H: usize = 240;
         struct Raster(Arc<Mutex<Vec<u8>>>);
@@ -2043,7 +2043,7 @@ mod tests {
     #[test]
     fn mandelvm_dives_once_then_stops_itself() {
         // MandelVM (world/46_mandelvm.mst) is MandelZoom that dives ONCE and then
-        // ends — the standalone-window demo's "run, then exit" contract. Drive it
+        // ends â€” the standalone-window demo's "run, then exit" contract. Drive it
         // past one full dive and assert it (a) rendered real frames and (b) told
         // the host to stop (StopLoop, from `pane stop`), which is what makes the
         // `macvm-gui mandelvm` window quit itself. Also proves subclassing works
@@ -2061,7 +2061,7 @@ mod tests {
         vm.exec("MandelVM launch.")
             .expect("MandelVM launch must run cleanly");
         // One dive is ~106 frames (scale 3.5 * 0.9^n < 0.00005); drive well past
-        // it. Once stopped, later steps keep re-stopping — harmless.
+        // it. Once stopped, later steps keep re-stopping â€” harmless.
         let mut stopped_at = None;
         for frame in 0..140 {
             vm.exec("GamePane stepWithKeys: 0.")
@@ -2092,7 +2092,7 @@ mod tests {
     fn gamepane_reset_stops_the_running_demo() {
         // Escape's close path submits `GamePane reset.` (gui close_game_pane).
         // Prove the VM-side contract it relies on: reset nils the registered
-        // step block, so a later frame tick runs nothing and draws nothing —
+        // step block, so a later frame tick runs nothing and draws nothing â€”
         // the demo leaves no state behind.
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
         impl GameSink for VecGameSink {
@@ -2194,7 +2194,7 @@ mod tests {
                 }
             })
         };
-        // A long compiled run — the sampler thread should catch compiled_depth>0.
+        // A long compiled run â€” the sampler thread should catch compiled_depth>0.
         vm.exec("MetricProbe new loop: 40000000.")
             .expect("long compiled run");
         stop.store(true, Ordering::Relaxed);
@@ -2209,7 +2209,7 @@ mod tests {
     fn class_mirror_reflects_instance_and_class_variable_names() {
         // The dynamic half of the dual placement: live VM reflection (the new
         // primitives 157/158, surfaced through ClassMirror) reports a class's
-        // OWN variable names — what the Smalltalk outliner draws its variables
+        // OWN variable names â€” what the Smalltalk outliner draws its variables
         // section from, the Rust browser drawing the same names from the image.
         let mut vm = boot_test_vm(JitMode::Off);
         let iv = vm
@@ -2237,7 +2237,7 @@ mod tests {
     #[test]
     fn game_primitive_fails_on_out_of_range_colour_and_emits_nothing() {
         // r=300 is out of 0..=255, so `smi_byte` fails, the primitive fails,
-        // and the method falls through to `^self` — no command emitted. This
+        // and the method falls through to `^self` â€” no command emitted. This
         // is the design's rule: validate at the primitive boundary before a
         // value can reach an assert!-panicking engine setter.
         struct VecGameSink(Arc<Mutex<Vec<GameCommand>>>);
@@ -2251,7 +2251,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
         vm.eval("GamePane new clearR: 300 g: 0 b: 0.")
-            .expect("an out-of-range colour must not crash — the primitive just fails");
+            .expect("an out-of-range colour must not crash â€” the primitive just fails");
         assert!(
             captured.lock().unwrap().is_empty(),
             "an out-of-range colour must emit no game command"
@@ -2270,7 +2270,7 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Off);
         let captured = Arc::new(Mutex::new(Vec::new()));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
-        // A cascade (all messages to one `GamePane new`) — top-level `| temp |`
+        // A cascade (all messages to one `GamePane new`) â€” top-level `| temp |`
         // declarations aren't valid in the doit dialect.
         vm.eval(
             "GamePane new \
@@ -2344,7 +2344,7 @@ mod tests {
         assert_eq!(*captured.lock().unwrap(), vec![GameCommand::StartLoop]);
 
         // A GUI frame tick (`GamePane stepWithKeys:`) runs the step block, so
-        // its drawing reaches the sink — the pull the GUI timer performs.
+        // its drawing reaches the sink â€” the pull the GUI timer performs.
         captured.lock().unwrap().clear();
         vm.eval("GamePane stepWithKeys: 0.")
             .expect("stepWithKeys: must run the step block");
@@ -2369,7 +2369,7 @@ mod tests {
 
         // The step block draws cls:7 only when Left is held, cls:8 only when
         // Right is. A tick with mask 5 (bits 0=Left and 2=Up) must run cls:7
-        // and not cls:8 — proving keyHeld: reads the mask stepWithKeys: set.
+        // and not cls:8 â€” proving keyHeld: reads the mask stepWithKeys: set.
         vm.eval(
             "GamePane new onStep: [ \
                (GamePane keyHeld: GamePane keyLeft)  ifTrue: [ GamePane new cls: 7 ]. \
@@ -2443,7 +2443,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(Vec::new()));
         vm.set_game_sink(Box::new(VecGameSink(captured.clone())));
 
-        // `Sound <preset> play` reaches the sink as PlaySound{preset} — the
+        // `Sound <preset> play` reaches the sink as PlaySound{preset} â€” the
         // named presets map to 0..9. (Headless: the command, not actual audio.)
         vm.eval("Sound coin play.")
             .expect("Sound coin play must evaluate cleanly");
@@ -2486,7 +2486,7 @@ mod tests {
         // The whole engine end to end in one Smalltalk class: launch the game,
         // then drive 120 frames with no keys held. The ball starts at y=200
         // heading up at 3px/frame, so it reaches the brick wall (y<110) within
-        // ~32 frames and hitBricks fires — knocking out a brick and playing a
+        // ~32 frames and hitBricks fires â€” knocking out a brick and playing a
         // blip. Driving well past that exercises the wall/paddle/brick physics
         // (all integer SmallInteger sends), so any missing world method (`//`,
         // `abs`, `min:`, `max:`, `and:`) surfaces as a DNU here, not a hang.
@@ -2538,7 +2538,7 @@ mod tests {
         // A long soak that would catch the two ways this physics could go wrong:
         // (1) the ball tunneling out of the field or an integer going haywire
         //     (assert every drawn ball centre stays in bounds), and (2) a
-        //     soft-lock — the ball trapped in a cycle that clears no more bricks
+        //     soft-lock â€” the ball trapped in a cycle that clears no more bricks
         //     (assert brick-clear blips keep coming across the whole run, not
         //     just at the start). The paddle sweeps left/right in a triangle
         //     wave to simulate real play, so the board clears and resets repeat.
@@ -2572,7 +2572,7 @@ mod tests {
                 if let GameCommand::Disc { cx, cy, .. } = c {
                     assert!(
                         (0..=320).contains(cx) && (0..=240).contains(cy),
-                        "frame {f}: ball centre ({cx},{cy}) left the field — a physics escape"
+                        "frame {f}: ball centre ({cx},{cy}) left the field â€” a physics escape"
                     );
                 }
                 if matches!(c, GameCommand::PlaySound { .. }) {
@@ -2585,7 +2585,7 @@ mod tests {
             }
         }
 
-        // Progress must continue throughout — a soft-lock would fall silent
+        // Progress must continue throughout â€” a soft-lock would fall silent
         // after the ball got stuck, so the second half must also clear bricks.
         assert!(
             sounds_in_first_half > 5,
@@ -2593,16 +2593,16 @@ mod tests {
         );
         assert!(
             sounds_in_second_half > 5,
-            "the game must keep making progress in the second half — no soft-lock \
+            "the game must keep making progress in the second half â€” no soft-lock \
              ({sounds_in_second_half} sounds in frames {}..{FRAMES})",
             FRAMES / 2
         );
     }
 
-    // ── multi-Smalltalk workers, M1 (docs/multi-smalltalk-worker.md §10) ──
+    // â”€â”€ multi-Smalltalk workers, M1 (docs/multi-smalltalk-worker.md Â§10) â”€â”€
 
     /// The standard test primary: boots the real world and registers the
-    /// worker boot closure (same world, same options) — the CLI shape.
+    /// worker boot closure (same world, same options) â€” the CLI shape.
     fn boot_worker_primary() -> VmHandle {
         let mut vm = boot_test_vm(JitMode::Off);
         vm.set_worker_boot(Arc::new(|| {
@@ -2647,7 +2647,7 @@ mod tests {
     fn worker_echo_ping_pong_with_correlated_continuations() {
         // The M1 gate: a spawned worker VM echoes 200 correlated requests;
         // every reply routes to ITS OWN continuation (r = i * 2, checked
-        // in-language); the primary never polls — it sleeps in runLoopWhile:
+        // in-language); the primary never polls â€” it sleeps in runLoopWhile:
         // (primAwaitInbox: recv_timeout) and is woken by the sends.
         let mut vm = boot_worker_primary();
         // NB: `exec` runs ONE top item per call, so each statement is its own
@@ -2676,10 +2676,10 @@ mod tests {
 
     /// Async I/O end to end (docs/asyncio_design.md slice B): the primary spawns
     /// a dedicated IoWorker VM, watches a pipe's read end on it, writes bytes
-    /// from the primary, and the data comes back as a message — the IoWorker did
+    /// from the primary, and the data comes back as a message â€” the IoWorker did
     /// the kqueue poll + read on ITS thread while the primary only ever slept in
     /// its inbox. Proves the whole stack: FFI syscalls, cross-VM fd sharing (one
-    /// process → the pipe made in the primary is valid in the IoWorker), the
+    /// process â†’ the pipe made in the primary is valid in the IoWorker), the
     /// kqueue readiness engine, and the message-driven pump loop.
     #[test]
     fn ioworker_multiplexes_a_pipe_read_back_to_the_primary() {
@@ -2722,15 +2722,15 @@ mod tests {
     }
 
     /// The cadence (docs/asyncio_design.md): the IoWorker's pump sleeps in an
-    /// INFINITE kevent — zero idle CPU, no heartbeat — and the primary wakes it
+    /// INFINITE kevent â€” zero idle CPU, no heartbeat â€” and the primary wakes it
     /// by poking the kqueue's EVFILT_USER event after every non-pump send.
     /// This test starts the infinite pump FIRST (the worker goes to sleep with
     /// nothing watched) and only THEN registers the watch and writes: the watch
     /// request can only be serviced if the poke ends the sleep. If the wake
     /// were broken, the first pump would sleep forever, the watchRead envelope
-    /// would never be dispatched, and this test would time out red at its cap —
+    /// would never be dispatched, and this test would time out red at its cap â€”
     /// the poke is load-bearing, not an optimization. (The trigger LATCHES, so
-    /// every send/sleep interleaving passes — no timing sleeps needed here.)
+    /// every send/sleep interleaving passes â€” no timing sleeps needed here.)
     #[test]
     fn ioworker_infinite_pump_is_woken_by_a_mid_sleep_watch() {
         let mut vm = boot_worker_primary();
@@ -2767,10 +2767,10 @@ mod tests {
     }
 
     /// The sockets capstone (docs/asyncio_design.md): a TCP echo server whose
-    /// event loop is the IoWorker. One IoWorker multiplexes THREE fds at once —
+    /// event loop is the IoWorker. One IoWorker multiplexes THREE fds at once â€”
     /// the listener (accept, bounded by the kevent backlog count), the
     /// server-side connection (read the request), and the client socket (read
-    /// the echo) — all on infinite kevent sleeps, while the primary supplies
+    /// the echo) â€” all on infinite kevent sleeps, while the primary supplies
     /// the logic: its onConnection: continuation registers the data watch
     /// (a mid-sleep add, so the poke is load-bearing here too) and its onData:
     /// continuation writes the echo back DIRECTLY on the fd (legal because fds
@@ -2829,25 +2829,25 @@ mod tests {
 
     /// The slice-C capstone (docs/asyncio_design.md): the STREAM library end
     /// to end. A line-echo TCP server built entirely from the ergonomic
-    /// surface — `TcpListener onConnection:` hands the accepted fd over as a
+    /// surface â€” `TcpListener onConnection:` hands the accepted fd over as a
     /// ready-made `IoStream`, the server logic is one `eachLineDo:` +
     /// `writeLine:`, and the client reads replies with chained
     /// `nextLineDo:`s. The proof of FRAMING (the whole point of slice C over
     /// slice B's raw batches): the client sends `PING\nPONG\n` split
     /// MID-LINE across two separate writes, so the server's kevent batches
-    /// cannot align with line boundaries — both sides must reassemble. Two
-    /// intact `ECHO:`-prefixed lines back means: accept → per-connection
-    /// stream → server-side line reassembly → echo → client-side line
+    /// cannot align with line boundaries â€” both sides must reassemble. Two
+    /// intact `ECHO:`-prefixed lines back means: accept â†’ per-connection
+    /// stream â†’ server-side line reassembly â†’ echo â†’ client-side line
     /// reassembly, all multiplexed by one IoWorker on infinite sleeps.
     ///
     /// The split must be DETERMINISTIC to test anything: two back-to-back
     /// client writes coalesce in the loopback socket buffer and arrive as
-    /// one kevent batch (verified live — a broken buffer still passed).
+    /// one kevent batch (verified live â€” a broken buffer still passed).
     /// So the second write is sequenced behind a marker pipe: the marker
-    /// is written inside `onConnection:` (accept time — the conn was not
+    /// is written inside `onConnection:` (accept time â€” the conn was not
     /// yet watched, so its data can't be in that batch), which puts 'PIN'
     /// (bounded read, kevent data=3) and the marker in the NEXT batch,
-    /// and the marker's continuation issues the second write only then —
+    /// and the marker's continuation issues the second write only then â€”
     /// strictly after 'PIN' was already drained alone.
     #[test]
     fn iostream_line_echo_server_reassembles_split_lines() {
@@ -2905,7 +2905,7 @@ mod tests {
         );
         // Teardown gates the accept-side lifecycle: IoStream close
         // (unwatchRead tombstone) and TcpListener close (the new
-        // unwatchAccept round-trip clearing the worker's Accepting mark —
+        // unwatchAccept round-trip clearing the worker's Accepting mark â€”
         // without it a reused fd number would route into dead accepts).
         vm.exec("LineProbe teardown.")
             .expect("close the client stream and the listener cleanly");
@@ -2917,7 +2917,7 @@ mod tests {
     #[test]
     fn perform_calls_a_method_by_name() {
         // `perform:withArguments:` (prim 64) + its arity sugar: a Symbol
-        // names a method and the real method body runs — a primitive, an
+        // names a method and the real method body runs â€” a primitive, an
         // interpreted, or (JIT on) a compiled one, uniformly.
         let mut vm = boot_test_vm(JitMode::Off);
         assert_eq!(vm.eval("3 perform: #+ with: 4").unwrap().trim(), "7");
@@ -2955,11 +2955,11 @@ mod tests {
 
     #[test]
     fn worker_rpc_calls_a_method_by_name() {
-        // The multi-VM RPC (§5): a worker booted with NO onMessage: handler
+        // The multi-VM RPC (Â§5): a worker booted with NO onMessage: handler
         // still serves RPCs from the shared world. The primary names a
         // class + selector + args; the worker resolves the class, performs
         // the method, and the (deep-copied) result returns to the
-        // continuation. Target Array class>>with:with:with: — a shared-world
+        // continuation. Target Array class>>with:with:with: â€” a shared-world
         // class-side method, so the worker (its own fresh VM/heap) has it.
         let mut vm = boot_worker_primary();
         vm.exec("WkTest w1: (Worker spawn: '').")
@@ -2983,7 +2983,7 @@ mod tests {
     fn worker_rpc_unknown_class_reports_an_error() {
         // A named class the worker doesn't have: the worker replies an
         // error envelope (not a value), so the onError: branch fires and
-        // the onReply: block does not — no crash, no hang.
+        // the onReply: block does not â€” no crash, no hang.
         let mut vm = boot_worker_primary();
         vm.exec("WkTest w1: (Worker spawn: '').").expect("spawn");
         vm.exec(
@@ -3008,7 +3008,7 @@ mod tests {
 
     #[test]
     fn worker_crash_is_isolated_and_reported_as_a_message() {
-        // §8: a worker whose handler errors dies ALONE — the primary gets a
+        // Â§8: a worker whose handler errors dies ALONE â€” the primary gets a
         // {#workerDied. id} message through the ordinary inbox, the process
         // survives, and a sibling worker keeps answering afterwards.
         let mut vm = boot_worker_primary();
@@ -3061,8 +3061,8 @@ mod tests {
     fn parallel_mandel_computes_a_full_frame_across_worker_vms() {
         // The M4 capstone, headless: ParallelMandel fans one frame out to 4
         // worker VMs (a band each), the continuations assemble `buf`, and the
-        // completed round blits. Drive the two doit streams a GUI would run —
-        // frame ticks + inbox dispatches — until the blit lands, then assert
+        // completed round blits. Drive the two doit streams a GUI would run â€”
+        // frame ticks + inbox dispatches â€” until the blit lands, then assert
         // EVERY band really computed (no band left zero) and the image is a
         // recognizable set (filled interior + many-banded exterior), i.e. the
         // work genuinely happened in the workers.
@@ -3074,7 +3074,7 @@ mod tests {
                 }
             }
         }
-        // JIT ON both sides: a band is ~19k escape-time iterations — the
+        // JIT ON both sides: a band is ~19k escape-time iterations â€” the
         // debug INTERPRETER needs ~8s+ per band (the MandelZoom test compiles
         // for the same reason); each worker's own tier-1 JIT makes it seconds.
         let mut vm = boot_test_vm(JitMode::Threshold(10));
@@ -3104,7 +3104,7 @@ mod tests {
         }
         let got = frame.lock().unwrap().clone();
         let Some(pixels) = got else {
-            panic!("no frame blitted — the parallel round never completed");
+            panic!("no frame blitted â€” the parallel round never completed");
         };
         assert_eq!(pixels.len(), 320 * 240);
         // Every band computed: an unanswered band would still be all zeros
@@ -3114,7 +3114,7 @@ mod tests {
             let zeros = rows.iter().filter(|&&p| p == 0).count();
             assert!(
                 zeros == 0,
-                "band {band} has {zeros} unwritten pixels — its worker never answered"
+                "band {band} has {zeros} unwritten pixels â€” its worker never answered"
             );
         }
         // And it is really the set (same shape checks as the MandelZoom test).
@@ -3135,7 +3135,7 @@ mod tests {
     #[test]
     fn worker_transcript_forwards_to_the_primary() {
         // M2: a worker's `Transcript show:` (its vm.out) arrives on the
-        // PRIMARY's transcript, [w<id>]-tagged, through the ordinary inbox —
+        // PRIMARY's transcript, [w<id>]-tagged, through the ordinary inbox â€”
         // a worker never owns a console of its own.
         struct VecSink(Arc<Mutex<Vec<String>>>);
         impl TranscriptSink for VecSink {
@@ -3177,7 +3177,7 @@ mod tests {
     #[test]
     fn worker_spawn_without_boot_fn_fails_cleanly() {
         // The GamePane posture: with no registered boot closure the world
-        // class is harmless — spawn raises a clean error, nothing hangs.
+        // class is harmless â€” spawn raises a clean error, nothing hangs.
         let mut vm = boot_test_vm(JitMode::Off);
         assert!(
             vm.exec("Worker spawn.").is_err(),
@@ -3187,7 +3187,7 @@ mod tests {
 
     #[test]
     fn worker_inbox_wake_fires_and_coalesces() {
-        // §3.1: the send itself is the wake, coalesced by the pending flag —
+        // Â§3.1: the send itself is the wake, coalesced by the pending flag â€”
         // a burst of N replies produces at least one wake and at most N.
         let mut vm = boot_worker_primary();
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3209,17 +3209,17 @@ mod tests {
         );
     }
 
-    // ── Cocoa GUI CG1: externally-hosted worker + run-loop wake + load_list ──
+    // â”€â”€ Cocoa GUI CG1: externally-hosted worker + run-loop wake + load_list â”€â”€
 
     #[test]
     fn hosted_worker_registered_on_this_thread_round_trips() {
-        // The CG1 gate (docs/cocoa_gui_design.md §3, sprint_cocoa_gui.md CG1):
-        // register a worker on the CURRENT thread with NO thread::spawn — the
+        // The CG1 gate (docs/cocoa_gui_design.md Â§3, sprint_cocoa_gui.md CG1):
+        // register a worker on the CURRENT thread with NO thread::spawn â€” the
         // arrangement the UI worker needs (its thread is main, blocked in
         // [NSApp run], not recv()). The primary `send:`s it, the caller-supplied
         // wake fires, THIS thread drains the staged envelope + execs
         // `Worker dispatchPending.`, the handler `reply:`s, and the reply routes
-        // to the primary's `send:onReply:` continuation — the whole no-spawn +
+        // to the primary's `send:onReply:` continuation â€” the whole no-spawn +
         // wake path end to end, one process, two logical VMs.
         let mut primary = boot_worker_primary();
 
@@ -3229,7 +3229,7 @@ mod tests {
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let wakes_hook = wakes.clone();
 
-        // Register on THIS thread — no spawn. `id` shares the spawned id-space;
+        // Register on THIS thread â€” no spawn. `id` shares the spawned id-space;
         // `inbox` is what this thread drains; `to_primary` lets the hosted VM
         // reply back to the primary (the `to_primary` a spawned worker_main
         // gets).
@@ -3242,7 +3242,7 @@ mod tests {
         .expect("registering a hosted worker on a primary must succeed");
 
         // Boot the hosted worker VM IN PLACE (no spawn), take on the Worker
-        // role replying through `to_primary`, install its echo handler —
+        // role replying through `to_primary`, install its echo handler â€”
         // exactly what a spawned worker_main does, but driven by this thread.
         let mut hosted = VmHandle::boot(
             VmOptions {
@@ -3259,7 +3259,7 @@ mod tests {
             .expect("install the hosted worker's echo handler");
 
         // The primary needs a Worker handle for this externally-registered id
-        // (no `spawn:` returned one) — build one over the id, the same
+        // (no `spawn:` returned one) â€” build one over the id, the same
         // `self new setId:` spawn: uses.
         primary
             .exec(&format!("WkTest w1: (Worker new setId: {id})."))
@@ -3268,7 +3268,7 @@ mod tests {
         // No wake yet, no drain yet.
         assert_eq!(wakes.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        // The primary `send:`s the hosted worker — this is the wake trigger.
+        // The primary `send:`s the hosted worker â€” this is the wake trigger.
         primary
             .exec("WkTest w1 send: 21 onReply: [:r | WkTest bump: r = 42].")
             .expect("send a correlated request to the hosted worker");
@@ -3280,7 +3280,7 @@ mod tests {
         );
 
         // Drain on THIS thread (what a parked host does once woken): stage each
-        // envelope into the Worker-role VM, exec dispatchPending — that runs
+        // envelope into the Worker-role VM, exec dispatchPending â€” that runs
         // the handler and its reply:.
         while let Some(env) = inbox.poll() {
             hosted.stage_pending(env);
@@ -3307,10 +3307,10 @@ mod tests {
         );
     }
 
-    // ── Cocoa GUI CG4: request protocol + (peer,corr) namespacing + restart ──
+    // â”€â”€ Cocoa GUI CG4: request protocol + (peer,corr) namespacing + restart â”€â”€
 
     /// A UI worker with a tiny result scoreboard, booted in place on this thread
-    /// (base world — the request protocol lives in `47_worker.mst`, so the
+    /// (base world â€” the request protocol lives in `47_worker.mst`, so the
     /// conditional Cocoa layer is not needed to exercise it).
     fn boot_ui_worker(id: u32, to_primary: crate::runtime::workers::InboxSender) -> VmHandle {
         let mut ui = VmHandle::boot(
@@ -3322,7 +3322,7 @@ mod tests {
             Path::new("world"),
         )
         .expect("boot the UI worker VM in place");
-        // The conditional Cocoa layer, exactly as `cocoa_gui`'s boot does —
+        // The conditional Cocoa layer, exactly as `cocoa_gui`'s boot does â€”
         // class definitions only; nothing here touches AppKit until a view is
         // built, so the layer is fully loadable headless (the CG6 pure-rule
         // gates run against the real `CocoaUI`).
@@ -3337,9 +3337,9 @@ mod tests {
         ui
     }
 
-    /// Drive one Workspace ⌘P round-trip end to end: the UI worker ships `src`
+    /// Drive one Workspace âŒ˜P round-trip end to end: the UI worker ships `src`
     /// as a `#doit`, the primary evaluates + replies, the UI worker's inbox is
-    /// drained so the continuation records the result — assert it equals
+    /// drained so the continuation records the result â€” assert it equals
     /// `expect` (a printString).
     fn ui_doit_round_trip(
         primary: &mut VmHandle,
@@ -3352,12 +3352,12 @@ mod tests {
         ui.exec(&format!("Worker uiDoit: '{src}' onReply: [:r | UiT r: r]."))
             .expect("ship the doit request to the primary");
         // The request now sits in the primary's inbox: drain + route + evaluate
-        // + reply — all on the primary, through execute_do_it.
+        // + reply â€” all on the primary, through execute_do_it.
         primary
             .exec("Worker dispatchInbox.")
             .expect("the primary serves the #uiReq and replies");
         // The reply now sits in the UI worker's inbox. The UI worker routes via
-        // dispatchInbox → dispatchOne: (NOT dispatchPending): dispatchOne: fires
+        // dispatchInbox â†’ dispatchOne: (NOT dispatchPending): dispatchOne: fires
         // the pending continuation keyed by (peer 0, corr).
         let mut drained = 0;
         while let Some(env) = inbox.poll() {
@@ -3379,12 +3379,12 @@ mod tests {
 
     #[test]
     fn ui_request_doit_round_trips_through_the_primary() {
-        // CG4 gate (cocoa_gui_design.md §7.3): a UI worker → primary {#uiReq.
+        // CG4 gate (cocoa_gui_design.md Â§7.3): a UI worker â†’ primary {#uiReq.
         // corr. #doit. source} runs the doit ON the primary (where the
         // persistent objects live) through the existing execute_do_it path, and
         // its {#uiReply. corr. result} comes back to the UI worker's
         // continuation. Two logical VMs in one process, drains driven by this
-        // thread — the hosted-worker arrangement now carrying the request
+        // thread â€” the hosted-worker arrangement now carrying the request
         // protocol.
         let mut primary = boot_worker_primary();
         let (id, inbox, to_primary) =
@@ -3402,7 +3402,7 @@ mod tests {
     /// rules, tested in a real UI-worker VM (cocoaui.list loaded, no AppKit).
     /// `evalTargetFor:loc:len:` is the selection-or-everything rule;
     /// `splice:into:at:` is Print It's inline insert with the captured
-    /// insertion point clamped — the async-race case (`pendingPrintInsertAt`)
+    /// insertion point clamped â€” the async-race case (`pendingPrintInsertAt`)
     /// where the buffer shrank before the `#uiReply` landed.
     #[test]
     fn cocoaui_workspace_selection_and_print_splice_rules_are_pure() {
@@ -3412,14 +3412,14 @@ mod tests {
                 .expect("register the hosted UI worker on the primary");
         let mut ui = boot_ui_worker(id, to_primary);
 
-        // Selection rule: a real selection evaluates exactly the substring…
+        // Selection rule: a real selection evaluates exactly the substringâ€¦
         assert_eq!(
             ui.eval("(CocoaUI evalTargetFor: '3 + 4. 6 * 7.' loc: 7 len: 5) at: 1")
                 .expect("selected substring")
                 .trim(),
             "'6 * 7'"
         );
-        // …and a collapsed (len 0) selection falls back to the whole buffer,
+        // â€¦and a collapsed (len 0) selection falls back to the whole buffer,
         // inserting at the end.
         assert_eq!(
             ui.eval("(CocoaUI evalTargetFor: '3 + 4.' loc: 3 len: 0) at: 1")
@@ -3434,7 +3434,7 @@ mod tests {
             "6"
         );
 
-        // Print It splice: the result lands right after the captured point…
+        // Print It splice: the result lands right after the captured pointâ€¦
         assert_eq!(
             ui.eval("(CocoaUI splice: '7' into: '3 + 4. rest' at: 6) at: 1")
                 .expect("spliced text")
@@ -3447,8 +3447,8 @@ mod tests {
                 .trim(),
             "8"
         );
-        // …and a stale insertion point beyond the (shrunk) buffer clamps to the
-        // end instead of raising — the race `pendingPrintInsertAt` exists for.
+        // â€¦and a stale insertion point beyond the (shrunk) buffer clamps to the
+        // end instead of raising â€” the race `pendingPrintInsertAt` exists for.
         assert_eq!(
             ui.eval("(CocoaUI splice: '7' into: '3 + 4.' at: 999) at: 1")
                 .expect("clamped splice")
@@ -3461,7 +3461,7 @@ mod tests {
     /// LIVE hierarchy into a names-only tree that (a) matches the class model's
     /// own answers row for row (the differential vs the same `ClassMirror` calls
     /// the WKWebView outliner renders from), (b) pickles clean (a class oop
-    /// ANYWHERE in the tree would make `Worker pickle:` raise — R3's enforcement),
+    /// ANYWHERE in the tree would make `Worker pickle:` raise â€” R3's enforcement),
     /// and (c) arrives end-to-end through a real `{#uiReq. corr. #refresh.
     /// #browser}` round trip between two VMs.
     #[test]
@@ -3528,7 +3528,7 @@ mod tests {
             "instance-variable names must ride the node (kq, buf)"
         );
 
-        // (b) The whole tree pickles + unpickles — no class oop crossed.
+        // (b) The whole tree pickles + unpickles â€” no class oop crossed.
         assert_eq!(
             primary
                 .eval("(Worker unpickle: (Worker pickle: CGDiff t)) at: 1")
@@ -3569,12 +3569,12 @@ mod tests {
         );
     }
 
-    /// The CG7 UI-side gate: `CocoaBrowser`'s path scheme — the pure model the
-    /// NSOutlineView data-source callbacks answer from — resolved over an
+    /// The CG7 UI-side gate: `CocoaBrowser`'s path scheme â€” the pure model the
+    /// NSOutlineView data-source callbacks answer from â€” resolved over an
     /// installed snapshot, headless. A class node's combined child list is
     /// [instance sels][class sels][subclasses]; paths are 0-based hops; stale
     /// or invalid paths resolve to nil and every consumer fails CLOSED (0
-    /// children / empty label), never raises — the property that makes a
+    /// children / empty label), never raises â€” the property that makes a
     /// callback racing a re-blast safe.
     #[test]
     fn cocoa_browser_resolves_paths_over_a_snapshot_and_fails_closed() {
@@ -3599,7 +3599,7 @@ mod tests {
         )
         .expect("define the snapshot builder");
         ui.exec("CocoaBrowser installSnapshot: CGB7 mk.")
-            .expect("install a small snapshot (no outline built — headless)");
+            .expect("install a small snapshot (no outline built â€” headless)");
 
         // Paths are 0-based SUBCLASS hops: '' = the root class node, '0' its
         // first subclass. (The multi-pane browser: classes in the outline,
@@ -3658,7 +3658,7 @@ mod tests {
                 .trim(),
             "true"
         );
-        // Fail-closed: an out-of-range hop resolves nil → empty selectors.
+        // Fail-closed: an out-of-range hop resolves nil â†’ empty selectors.
         assert_eq!(
             ui.eval("(CocoaBrowser resolvePath: '9') isNil")
                 .expect("out of range resolves nil")
@@ -3667,7 +3667,7 @@ mod tests {
         );
         assert_eq!(
             ui.eval("(CocoaBrowser selectorsForPath: '9' side: #instance) size")
-                .expect("stale path → zero rows")
+                .expect("stale path â†’ zero rows")
                 .trim(),
             "0"
         );
@@ -3675,7 +3675,7 @@ mod tests {
 
     /// The live-compile guarantee the browser's Accept flows rest on: a CLASS
     /// DEFINITION (not just an expression) shipped as an ordinary `#doit`
-    /// compiles into the live primary — the same `vm.exec` semantics the web
+    /// compiles into the live primary â€” the same `vm.exec` semantics the web
     /// GUI's `live_compile` uses, reached over the request channel.
     #[test]
     fn ui_doit_live_compiles_a_class_definition_on_the_primary() {
@@ -3706,14 +3706,14 @@ mod tests {
     }
 
     /// The CG9 soundness gate: booting a UI-worker-style VmHandle, publishing
-    /// it, and dropping it — the exact restart-in-place lifecycle — must return
+    /// it, and dropping it â€” the exact restart-in-place lifecycle â€” must return
     /// the fixed sigsetjmp + PROBE registries to baseline every cycle, so many
     /// rebuilds never climb toward the caps (JMP=64, PROBE=128) the design
     /// warns a leak would exhaust. Runs on THIS thread (so each boot/drop
-    /// claims and releases the SAME `pthread_self()` slot — the tightest case:
+    /// claims and releases the SAME `pthread_self()` slot â€” the tightest case:
     /// a stranded slot would be immediately visible as growth). JIT off keeps
     /// the PROBE registry empty of confounding entries; the point is the
-    /// Drop→deregister→release wiring, not codegen.
+    /// Dropâ†’deregisterâ†’release wiring, not codegen.
     #[test]
     fn ui_worker_restart_lifecycle_leaks_no_registry_slots() {
         use crate::codecache::deopt_trap::current_thread_jmp_slots;
@@ -3735,14 +3735,14 @@ mod tests {
             // Exercise it so it actually claims a slot + runs guest code.
             assert_eq!(ui.eval("3 + 4").expect("eval").trim(), "7");
             // Unpublish before drop (the trampolines must never read a dangling
-            // pointer) — exactly `rebuild_ui`'s order.
+            // pointer) â€” exactly `rebuild_ui`'s order.
             publish_ui_vm(std::ptr::null_mut());
             drop(ui); // Drop = Reservation munmap + deopt deregister + slot release
             // The load-bearing assertion: THIS thread's slot count never grows
-            // across cycles — a stranded slot would climb toward the 64 cap.
+            // across cycles â€” a stranded slot would climb toward the 64 cap.
             assert!(
                 current_thread_jmp_slots() <= baseline,
-                "cycle {cycle}: this thread's jmp slots {} exceeded baseline {baseline} — a restart stranded a recovery slot",
+                "cycle {cycle}: this thread's jmp slots {} exceeded baseline {baseline} â€” a restart stranded a recovery slot",
                 current_thread_jmp_slots()
             );
         }
@@ -3751,11 +3751,11 @@ mod tests {
 
     #[test]
     fn peer_corr_namespacing_prevents_cross_peer_continuation_collision() {
-        // Review R4 (cocoa_gui_design.md §7.3): PendingReplies keyed by corr
+        // Review R4 (cocoa_gui_design.md Â§7.3): PendingReplies keyed by corr
         // ALONE lets peerA's corr=1 reply fire peerB's corr=1 continuation,
         // because each VM runs its OWN NextCorr. Construct BOTH (peerA=1, corr=1)
         // and (peerB=2, corr=1) continuations, land a distinguishable reply from
-        // each (both corr=1), and prove the RIGHT two continuations fire — not
+        // each (both corr=1), and prove the RIGHT two continuations fire â€” not
         // swapped, not lost (keyed by corr alone, the second registration would
         // overwrite the first at key 1 and one continuation would vanish).
         let mut primary = boot_worker_primary();
@@ -3810,14 +3810,14 @@ mod tests {
         assert_eq!(
             primary.eval("R4 b").expect("b").trim(),
             "'fromB'",
-            "peer 2's corr=1 reply fired peer 2's continuation — NOT swapped, NOT lost"
+            "peer 2's corr=1 reply fired peer 2's continuation â€” NOT swapped, NOT lost"
         );
     }
 
     #[test]
     fn primary_respawn_from_source_re_syncs_the_ui_worker() {
-        // CG4 §5/§5.1, the headless slice of the watchdog restart: the primary is
-        // respawned FROM SOURCE and the UI worker re-syncs — a fresh primary
+        // CG4 Â§5/Â§5.1, the headless slice of the watchdog restart: the primary is
+        // respawned FROM SOURCE and the UI worker re-syncs â€” a fresh primary
         // registers the UI worker anew, the UI worker's reply link is re-pointed
         // to it, and the next doit round-trips. Death DETECTION (a fatal doit
         // pthread_exiting the primary thread, caught by the watchdog) is the
@@ -3846,31 +3846,31 @@ mod tests {
         ui_doit_round_trip(&mut gen1, &mut ui, &inbox1, "6 * 7", "'42'");
 
         // Scripted primary death: drop the whole VM generation. Its heap unmaps,
-        // its inbox receiver drops — the honest clean loss the design takes over
+        // its inbox receiver drops â€” the honest clean loss the design takes over
         // a fake rollback (feedback_recover_clean_or_die). Any outstanding
         // continuations to it are orphaned with the dead VM.
         drop(gen1);
         drop(inbox1);
 
         // Respawn FROM SOURCE (the watchdog's boot closure) + re-register the UI
-        // worker, re-pointing its reply link onto the fresh primary — the
-        // §5.1 re-sync.
+        // worker, re-pointing its reply link onto the fresh primary â€” the
+        // Â§5.1 re-sync.
         let mut gen2 = boot_worker_primary();
         let (id2, inbox2, to_primary2) =
             crate::runtime::workers::register_hosted_worker(&mut gen2.vm, Arc::new(|| {}))
                 .expect("register the UI worker on the respawned primary");
         ui.install_worker_role(id2, to_primary2);
 
-        // The next doit works — the environment recovered and the UI re-synced.
+        // The next doit works â€” the environment recovered and the UI re-synced.
         ui_doit_round_trip(&mut gen2, &mut ui, &inbox2, "100 + 1", "'101'");
     }
 
     #[test]
     fn primary_transcript_forwards_to_the_ui_worker() {
-        // CG4 §7.4: the primary's OWN transcript is forwarded to the UI worker's
+        // CG4 Â§7.4: the primary's OWN transcript is forwarded to the UI worker's
         // inbox (ForwardTranscript, direction-flipped, UNtagged) and the UI
-        // worker's dispatchOne: shows each line on ITS Transcript — the "primary
-        // → UI transcript sink" the on-screen Transcript view renders.
+        // worker's dispatchOne: shows each line on ITS Transcript â€” the "primary
+        // â†’ UI transcript sink" the on-screen Transcript view renders.
         struct VecSink(Arc<Mutex<Vec<String>>>);
         impl TranscriptSink for VecSink {
             fn show(&mut self, text: &str) {
@@ -3893,7 +3893,7 @@ mod tests {
             .exec("Transcript showCr: 'hello from the primary'.")
             .expect("primary writes to its (now forwarded) transcript");
 
-        // Drain the UI worker's inbox — dispatchOne: shows the forwarded line.
+        // Drain the UI worker's inbox â€” dispatchOne: shows the forwarded line.
         while let Some(env) = inbox.poll() {
             ui.dispatch_hosted_envelope(env)
                 .expect("UI worker routes the forwarded transcript");
@@ -3912,8 +3912,8 @@ mod tests {
     #[test]
     fn load_list_layers_an_extra_world_on_top_of_the_base() {
         // The CG1 gate for the conditional world layer (docs/cocoa_gui_design.md
-        // §12.3): a class in world/cocoaui.list (63_cocoaui_stub.mst) is ABSENT
-        // from the base world and PRESENT — its method runnable — only after
+        // Â§12.3): a class in world/cocoaui.list (63_cocoaui_stub.mst) is ABSENT
+        // from the base world and PRESENT â€” its method runnable â€” only after
         // load_list. Proves the extra layer loads on top of a booted base world
         // without being in world/world.list.
         let mut vm = boot_test_vm(JitMode::Off);
@@ -3937,10 +3937,10 @@ mod tests {
         );
     }
 
-    // ── Cocoa bridge C0 gates (docs/cocoa_bridge_design.md §8) ──────────
+    // â”€â”€ Cocoa bridge C0 gates (docs/cocoa_bridge_design.md Â§8) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// The wrap/release counters are process-wide and the test harness is
-    /// parallel — every Cocoa test takes this lock so counter deltas (and
+    /// parallel â€” every Cocoa test takes this lock so counter deltas (and
     /// pool traffic) can't interleave.
     fn cocoa_serial() -> std::sync::MutexGuard<'static, ()> {
         static L: Mutex<()> = Mutex::new(());
@@ -3951,7 +3951,7 @@ mod tests {
     fn cocoa_c0_process_name_round_trips() {
         let _serial = cocoa_serial();
         // The canonical C0 gate: a real Foundation object, a real send, a
-        // real NSString copied back — on the VM thread, headless.
+        // real NSString copied back â€” on the VM thread, headless.
         let mut vm = boot_test_vm(JitMode::Off);
         let name = vm
             .eval("((Cocoa classNamed: 'NSProcessInfo') send: 'processInfo') sendString: 'processName'")
@@ -3966,7 +3966,7 @@ mod tests {
     fn cocoa_c0_tagged_pointer_ids_survive_the_byte_tail() {
         let _serial = cocoa_serial();
         // The adversarial-review regression: small NSNumbers and short
-        // NSStrings are TAGGED POINTERS (bit 63 set) — they would have
+        // NSStrings are TAGGED POINTERS (bit 63 set) â€” they would have
         // panicked SmallInt::new under the named-slot idiom and been
         // corrupted by an oop scan as raw words. In the byte tail they are
         // just bytes.
@@ -4006,7 +4006,7 @@ mod tests {
     fn cocoa_c0_nsexception_is_caught_not_fatal() {
         let _serial = cocoa_serial();
         // An unrecognized ObjC selector throws NSInvalidArgumentException;
-        // the shim catches it, the prim fails, Smalltalk raises — and the
+        // the shim catches it, the prim fails, Smalltalk raises â€” and the
         // VM keeps working afterwards.
         let mut vm = boot_test_vm(JitMode::Off);
         assert!(
@@ -4021,6 +4021,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c0_wrap_release_counters_balance() {
         let _serial = cocoa_serial();
         let mut vm = boot_test_vm(JitMode::Off);
@@ -4030,7 +4031,7 @@ mod tests {
         vm.exec("(Cocoa nsString: 'three') release.").expect("3");
         let (w1, r1, _) = crate::runtime::objc_bridge::counters();
         assert_eq!(w1 - w0, 3, "three wraps");
-        assert_eq!(r1 - r0, 3, "three releases — balanced");
+        assert_eq!(r1 - r0, 3, "three releases â€” balanced");
     }
 
     #[test]
@@ -4051,10 +4052,10 @@ mod tests {
         .expect("gc-stress boot");
         vm.exec("Object subclass: CocoaG [ <classVars: K> CocoaG class >> k: x [ K := x ] CocoaG class >> k [ ^K ] ]")
             .expect("holder");
-        // A long-lived wrapper that will be moved by many collections…
+        // A long-lived wrapper that will be moved by many collectionsâ€¦
         vm.exec("CocoaG k: (Cocoa nsString: 'survivor').")
             .expect("keep");
-        // …while churn wraps + releases around it.
+        // â€¦while churn wraps + releases around it.
         for _ in 0..40 {
             vm.exec("(Cocoa nsString: 'churn') release.")
                 .expect("churn");
@@ -4066,13 +4067,13 @@ mod tests {
         vm.exec("CocoaG k release.").expect("tidy");
     }
 
-    // ── Cocoa bridge C1 gates (marshalling breadth + ownership families) ─
+    // â”€â”€ Cocoa bridge C1 gates (marshalling breadth + ownership families) â”€
     //
     // Every ABI shape asserted here was cross-checked against cocoa_data's
-    // register classification (docs/FFI.md §1 tokens) before being pinned:
+    // register classification (docs/FFI.md Â§1 tokens) before being pinned:
     // numberWithDouble: takes `f`; rangeOfString: returns `i2` (x0/x1);
     // valueWithPoint:/pointValue are `h2` (d0/d1); valueWithRect:/rectValue
-    // are `h4` (d0..d3); dateWithEra:…nanosecond: is 8 `g` args — six ride
+    // are `h4` (d0..d3); dateWithEra:â€¦nanosecond: is 8 `g` args â€” six ride
     // x2..x7, the last two cross on the STACK.
 
     #[test]
@@ -4088,7 +4089,7 @@ mod tests {
             )
             .expect("double round-trip");
         assert_eq!(d.trim(), "2.75");
-        // A BOOL result (w0's low byte, masked) — both polarities, with a
+        // A BOOL result (w0's low byte, masked) â€” both polarities, with a
         // String argument auto-bridged to a temp NSString each time.
         let t = vm
             .eval("(Cocoa nsString: 'abc') sendBool: 'isEqualToString:' args: #('abc')")
@@ -4099,7 +4100,7 @@ mod tests {
             .expect("bool false");
         assert_eq!(f.trim(), "false");
         // The adversarial-review regression (#i32): a C `int` return is
-        // w0-only — read as #i64, intValue's -5 would arrive as 2^32-5, a
+        // w0-only â€” read as #i64, intValue's -5 would arrive as 2^32-5, a
         // silently wrong (in-smi-range!) answer. #i32 sign-extends.
         let n = vm
             .eval(
@@ -4121,7 +4122,7 @@ mod tests {
         assert_eq!(vm.eval("CocoaRg r at: 1").unwrap().trim(), "6", "location");
         assert_eq!(vm.eval("CocoaRg r at: 2").unwrap().trim(), "5", "length");
         // An NSException thrown through the NEW general entry point is
-        // still caught — the @try boundary moved with the shim.
+        // still caught â€” the @try boundary moved with the shim.
         assert!(
             vm.exec("(Cocoa nsString: 'x') send: 'noSuchSelectorZyx' args: #() ret: #range.")
                 .is_err(),
@@ -4134,7 +4135,7 @@ mod tests {
     fn cocoa_c1_hfa_point_and_rect_round_trip() {
         let _serial = cocoa_serial();
         // The flat-register model's HFA payoff: a CGPoint argument IS two
-        // Doubles (d0/d1), a CGRect four — and the HFA RESULTS come back
+        // Doubles (d0/d1), a CGRect four â€” and the HFA RESULTS come back
         // out of d0..d3. Headless Foundation round-trip through NSValue.
         let mut vm = boot_test_vm(JitMode::Off);
         vm.exec("Object subclass: CocoaHf [ <classVars: P R> CocoaHf class >> p: x [ P := x ] CocoaHf class >> p [ ^P ] CocoaHf class >> r: x [ R := x ] CocoaHf class >> r [ ^R ] ]")
@@ -4158,7 +4159,7 @@ mod tests {
         // GPR-class arguments: era..minute ride x2..x7, SECOND and
         // nanosecond cross on the stack words. Reading the second back
         // (45) proves the stack path end-to-end against a real Foundation
-        // method — the FFI arc's argv-overflow bug, re-gated as a
+        // method â€” the FFI arc's argv-overflow bug, re-gated as a
         // wired-through feature instead of a crash.
         let mut vm = boot_test_vm(JitMode::Off);
         vm.exec("Object subclass: CocoaCal [ <classVars: C D> CocoaCal class >> c: x [ C := x ] CocoaCal class >> c [ ^C ] CocoaCal class >> d: x [ D := x ] CocoaCal class >> d [ ^D ] ]")
@@ -4177,11 +4178,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c1_alloc_init_transfers_ownership_and_balances() {
         let _serial = cocoa_serial();
-        // The +1-family classifier live (design §3.2): alloc's result is
+        // The +1-family classifier live (design Â§3.2): alloc's result is
         // already owned (no double retain), init CONSUMES the alloc
-        // receiver (its wrapper poisons — class clusters may swap the
+        // receiver (its wrapper poisons â€” class clusters may swap the
         // object) and answers a +1 result. The counters must balance as
         // wraps == releases + consumed.
         let mut vm = boot_test_vm(JitMode::Off);
@@ -4197,7 +4199,7 @@ mod tests {
         assert_eq!(
             vm.eval("CocoaOwn a isValid").unwrap().trim(),
             "false",
-            "init consumed the alloc receiver — its wrapper must be poisoned"
+            "init consumed the alloc receiver â€” its wrapper must be poisoned"
         );
         assert_eq!(vm.eval("CocoaOwn b isValid").unwrap().trim(), "true");
         // The initialized object actually works (append via the temp-
@@ -4251,8 +4253,8 @@ mod tests {
         let _serial = cocoa_serial();
         // The write-barrier regression (C1 review finding 1): the
         // point/rect result arm allocates the array THEN each Double, so a
-        // mid-loop scavenge can promote the array — the subsequent stores
-        // must go through the barrier door or an old→new slot goes
+        // mid-loop scavenge can promote the array â€” the subsequent stores
+        // must go through the barrier door or an oldâ†’new slot goes
         // invisible and dangles. Under gc_stress every allocation
         // collects, exercising every promote/store interleaving the
         // adaptive tenuring policy produces.
@@ -4283,13 +4285,14 @@ mod tests {
         }
     }
 
-    // ── Cocoa bridge C2 gates (DNU dispatch + cached shape resolution) ──
+    // â”€â”€ Cocoa bridge C2 gates (DNU dispatch + cached shape resolution) â”€â”€
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c2_keyword_sends_drive_foundation() {
         let _serial = cocoa_serial();
         // The design's own acceptance shape: a Workspace-style doit drives
-        // Foundation with ordinary Smalltalk keyword sends — alloc/init
+        // Foundation with ordinary Smalltalk keyword sends â€” alloc/init
         // (ownership families through DNU), a void append, an NSUInteger
         // read-back. No send:args:ret: anywhere.
         let mut vm = boot_test_vm(JitMode::Off);
@@ -4321,7 +4324,7 @@ mod tests {
         vm.exec("CocoaDnu s release.").expect("tidy");
         let (w1, r1, c1) = crate::runtime::objc_bridge::counters();
         // classNamed: wrap + alloc wrap + init wrap = 3 (the inline class
-        // wrapper leaks by design — leak-side bias, classes are immortal).
+        // wrapper leaks by design â€” leak-side bias, classes are immortal).
         assert_eq!(w1 - w0, 3, "class, alloc, init-result wraps");
         assert_eq!(r1 - r0, 1, "one release (the result)");
         assert_eq!(c1 - c0, 1, "one DNU init-family consume");
@@ -4333,11 +4336,11 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Off);
         // The CALLEE's signature decides the register class now: a
         // SmallInteger 3 passed to numberWithDouble: (encoding `d`)
-        // coerces to d0 — under C1's tag-driven marshal it would have
+        // coerces to d0 â€” under C1's tag-driven marshal it would have
         // ridden a GPR and the callee read garbage.
         let d = vm
             .eval("((Cocoa classNamed: 'NSNumber') numberWithDouble: 3) doubleValue")
-            .expect("int→double coercion");
+            .expect("intâ†’double coercion");
         assert_eq!(d.trim(), "3.0");
         // #i32 via the encoding (`i`), no explicit token needed.
         let n = vm
@@ -4357,12 +4360,12 @@ mod tests {
                 .trim(),
             "false"
         );
-        // float (f32) argument AND return — the s-register path.
+        // float (f32) argument AND return â€” the s-register path.
         let f = vm
             .eval("((Cocoa classNamed: 'NSNumber') numberWithFloat: 2.5) floatValue")
             .expect("f32 round-trip");
         assert_eq!(f.trim(), "2.5");
-        // A `c` return is a signed CHAR, answered as a SmallInteger — on
+        // A `c` return is a signed CHAR, answered as a SmallInteger â€” on
         // arm64 BOOL encodes `B`, so Bool-ifying `c` returned true for
         // charValue 65 (the C2 review's silent-wrong-answer finding).
         let c = vm
@@ -4373,7 +4376,7 @@ mod tests {
             .eval("((Cocoa classNamed: 'NSNumber') numberWithInteger: -5) charValue")
             .expect("negative char return");
         assert_eq!(cn.trim(), "-5", "char sign-extends from 8 bits");
-        // Manual reference counting is refused at EVERY send path —
+        // Manual reference counting is refused at EVERY send path â€”
         // ownership belongs to the bridge, and `dealloc` through DNU
         // would be a use-after-free (C2 review).
         assert!(
@@ -4389,11 +4392,11 @@ mod tests {
 
     #[test]
     fn cocoa_nil_selector_argument_marshals_to_null_sel() {
-        // A nil SEL argument marshals to a NULL SEL, NOT a failed send — the
+        // A nil SEL argument marshals to a NULL SEL, NOT a failed send â€” the
         // on-screen CocoaUI bug: a submenu-holding NSMenuItem is built with
         // `action: nil`, and the auto-marshaller rejected nil for a `:` slot,
         // so the whole menu build (and startup) died. `respondsToSelector: nil`
-        // is `[obj respondsToSelector: NULL]` → NO, and must not raise.
+        // is `[obj respondsToSelector: NULL]` â†’ NO, and must not raise.
         let _serial = cocoa_serial();
         let mut vm = boot_test_vm(JitMode::Off);
         let r = vm
@@ -4415,7 +4418,7 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Off);
         vm.exec("Object subclass: CocoaDnS [ <classVars: R P> CocoaDnS class >> r: x [ R := x ] CocoaDnS class >> r [ ^R ] CocoaDnS class >> p: x [ P := x ] CocoaDnS class >> p [ ^P ] ]")
             .expect("holder");
-        // NSRange return, resolved from the encoding — an Array answer.
+        // NSRange return, resolved from the encoding â€” an Array answer.
         vm.exec("CocoaDnS r: ((Cocoa nsString: 'hello world') rangeOfString: 'world').")
             .expect("rangeOfString: via DNU");
         assert_eq!(vm.eval("CocoaDnS r at: 1").unwrap().trim(), "6");
@@ -4429,6 +4432,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c2_shape_cache_hits_are_visible_in_stats() {
         let _serial = cocoa_serial();
         // The design's "PIC hit-rate visible in stats": repeated DNU sends
@@ -4472,7 +4476,7 @@ mod tests {
             "an unresolvable selector must raise cleanly"
         );
         assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
-        // Object's own doesNotUnderstand: is untouched — a non-Cocoa DNU
+        // Object's own doesNotUnderstand: is untouched â€” a non-Cocoa DNU
         // still errors the classic way (regression guard).
         assert!(
             vm.exec("3 fooBarBazQux.").is_err(),
@@ -4488,11 +4492,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c3_hop_disabled_fails_cleanly() {
         let _serial = cocoa_serial();
         // Headless: nothing drains the main dispatch queue, so the sync
         // hop must FAIL CLEANLY (a Smalltalk error), never hang. Nothing
-        // in the lib-test process ever calls enable_main_hop — the real
+        // in the lib-test process ever calls enable_main_hop â€” the real
         // dispatch hop is proven by the harness=false integration test
         // (tests/cocoa_main_hop.rs), which owns a genuine main thread.
         assert!(
@@ -4513,7 +4518,7 @@ mod tests {
         assert_eq!(vm.eval("3 + 4").unwrap().trim(), "7");
     }
 
-    // ── Cocoa bridge C4 gates (callbacks + the in-heap mint-list) ───────
+    // â”€â”€ Cocoa bridge C4 gates (callbacks + the in-heap mint-list) â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn cocoa_c4_action_fires_and_dead_ticket_drops() {
@@ -4551,6 +4556,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c4_pool_releases_minted_keeps_kept() {
         let _serial = cocoa_serial();
         let mut vm = boot_test_vm(JitMode::Off);
@@ -4569,6 +4575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c4_pool_and_callbacks_survive_gc_stress() {
         let _serial = cocoa_serial();
         // The design's own C4 soak gate: poolDo: scopes with enough mints
@@ -4603,7 +4610,7 @@ mod tests {
             .expect("action");
         let (w0, r0, _) = crate::runtime::objc_bridge::counters();
         for i in 0..10 {
-            // 12 mints per scope: growth from 8 → 16 slots mid-scope.
+            // 12 mints per scope: growth from 8 â†’ 16 slots mid-scope.
             vm.exec("CocoaSk k: (Cocoa poolDo: [:p | 1 to: 11 do: [:j | Cocoa nsString: 'churn' ]. p keep: (Cocoa nsString: 'kept') ]).")
                 .expect("pool scope under stress");
             vm.exec("CocoaSk a macvmFire: nil.").expect("fire");
@@ -4614,19 +4621,20 @@ mod tests {
         }
         assert_eq!(vm.eval("CocoaSk n").unwrap().trim(), "10");
         let (w1, r1, _) = crate::runtime::objc_bridge::counters();
-        assert_eq!(w1 - w0, 120, "12 mints × 10 scopes");
+        assert_eq!(w1 - w0, 120, "12 mints Ã— 10 scopes");
         assert_eq!(
             r1 - r0,
             120,
-            "11 swept per scope + the kept one released after — balanced"
+            "11 swept per scope + the kept one released after â€” balanced"
         );
     }
 
     #[test]
+    #[cfg(target_os = "macos")] // WINVM: drives the real Cocoa bridge
     fn cocoa_c4_error_in_pool_scope_clears_the_stack() {
         let _serial = cocoa_serial();
         // The C4 review's F1: a doit that raises INSIDE poolDo: aborts with
-        // the scope still pushed — the recovery arm must clear the stack,
+        // the scope still pushed â€” the recovery arm must clear the stack,
         // or every future mint (anywhere) appends to a stale rooted list
         // forever.
         let mut vm = boot_test_vm(JitMode::Off);
@@ -4638,10 +4646,10 @@ mod tests {
         vm.exec("Object subclass: CocoaEr [ <classVars: S> CocoaEr class >> s: x [ S := x ] CocoaEr class >> s [ ^S ] ]")
             .expect("holder");
         let (_, r0, _) = crate::runtime::objc_bridge::counters();
-        // A mint OUTSIDE any scope after the abort…
+        // A mint OUTSIDE any scope after the abortâ€¦
         vm.exec("CocoaEr s: (Cocoa nsString: 'free agent').")
             .expect("mint outside any scope");
-        // …must survive a subsequent balanced poolDo: untouched.
+        // â€¦must survive a subsequent balanced poolDo: untouched.
         vm.exec("Cocoa poolDo: [:p | Cocoa nsString: 'swept' ].")
             .expect("a later balanced scope");
         let (_, r1, _) = crate::runtime::objc_bridge::counters();
@@ -4658,11 +4666,11 @@ mod tests {
     fn cocoa_c5_cocoapad_fails_cleanly_headless() {
         let _serial = cocoa_serial();
         // The C5 demo class loads everywhere; headless (no AppKit linked,
-        // no main run loop) its launch must raise cleanly — never hang or
+        // no main run loop) its launch must raise cleanly â€” never hang or
         // crash. On-screen behavior is verified in the GUI (run-gui.sh).
         let mut vm = boot_test_vm(JitMode::Off);
         // The launch's own Smalltalk prerequisites must exist even where
-        // AppKit doesn't — the on-screen run found Array's 4-element
+        // AppKit doesn't â€” the on-screen run found Array's 4-element
         // constructor missing (the frame rectangles), invisible headless
         // because the NSWindow lookup fails first. Pin it directly.
         assert_eq!(
@@ -4683,7 +4691,7 @@ mod tests {
         let _serial = cocoa_serial();
         // DNU sends from COMPILED callers: threshold-1 compiles the loop
         // method immediately, so the ObjcRef sends flow through the
-        // compiled DNU path (S11 step 6's rt_dnu → Message → ObjcRef>>
+        // compiled DNU path (S11 step 6's rt_dnu â†’ Message â†’ ObjcRef>>
         // doesNotUnderstand:) rather than the interpreter's.
         let mut vm = boot_test_vm(JitMode::Threshold(1));
         vm.exec("Object subclass: CocoaJit [ <classVars: N> CocoaJit class >> n: x [ N := x ] CocoaJit class >> n [ ^N ] CocoaJit class >> sum [ | t | t := 0. 1 to: 50 do: [:i | t := t + CocoaJit n length ]. ^t ] ]")
@@ -4693,7 +4701,7 @@ mod tests {
         assert_eq!(
             vm.eval("CocoaJit sum").expect("hot DNU loop").trim(),
             "300",
-            "50 × length('jitted'=6) through compiled DNU sends"
+            "50 Ã— length('jitted'=6) through compiled DNU sends"
         );
         vm.exec("CocoaJit n release.").expect("tidy");
     }
@@ -4703,7 +4711,7 @@ mod tests {
         let _serial = cocoa_serial();
         // 11 GPR-class arguments = 6 registers + 4 stack words + 1 too
         // many: the prim must FAIL (world fallback raises) rather than
-        // overflow any buffer — the FFI arc's argv-overflow lesson,
+        // overflow any buffer â€” the FFI arc's argv-overflow lesson,
         // re-gated at this entry point.
         let mut vm = boot_test_vm(JitMode::Off);
         assert!(
@@ -4763,7 +4771,7 @@ mod tests {
     fn boot_with_no_world_list_at_all_still_succeeds() {
         let dir = std::env::temp_dir().join(format!("macvm_embed_no_world_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Deliberately no world.list written — matches load_world's own
+        // Deliberately no world.list written â€” matches load_world's own
         // Ok(false) "no world.list found" case, not an error.
         let result = VmHandle::boot(
             VmOptions {
@@ -4778,17 +4786,17 @@ mod tests {
     }
 
     /// The test that actually matters for the whole S21 safety model: a
-    /// guest-fatal condition (here, an unhandled DNU — the base world's own
+    /// guest-fatal condition (here, an unhandled DNU â€” the base world's own
     /// `Object>>doesNotUnderstand:` routes to the `error:` primitive, one of
     /// the 8 `fatal_exit`-converted sites, S21 step 1) must terminate ONLY
     /// the worker thread `boot`/`eval` ran on, never the test process
     /// itself. Per Step 1a's validated finding, `.join()`/`.is_finished()`
-    /// on a `pthread_exit`-terminated thread's `JoinHandle` panics/hangs —
+    /// on a `pthread_exit`-terminated thread's `JoinHandle` panics/hangs â€”
     /// so this test (like the real GUI supervisor, S21 step 3) never calls
     /// either. It proves the thread died by a channel message NEVER
     /// arriving within a generous timeout (the sending half, moved into the
-    /// crashing closure, is never dropped either — `pthread_exit` runs no
-    /// `Drop` glue at all — so a real disconnect would never show up as
+    /// crashing closure, is never dropped either â€” `pthread_exit` runs no
+    /// `Drop` glue at all â€” so a real disconnect would never show up as
     /// `RecvTimeoutError::Disconnected`; a plain `Timeout` is the correct,
     /// only-possible signature of "that thread is gone"), then simply keeps
     /// running: the surrounding test binary process surviving to report a
@@ -4798,7 +4806,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<&'static str>();
         let handle = std::thread::spawn(move || {
             let mut vm = boot_test_vm(JitMode::Off);
-            // DNU/`error:` no longer belong here — `raise_guest_fatal`
+            // DNU/`error:` no longer belong here â€” `raise_guest_fatal`
             // recovers those at `eval`'s own boundary now (see
             // `eval_dnu_recovers_as_runtime_error_and_vm_stays_usable`
             // below); this test exists to prove the *actually* fatal path
@@ -4812,7 +4820,7 @@ mod tests {
             tx.send("reached-pre-crash-checkpoint").unwrap();
             // Never returns if FatalMode::ExitThread correctly pthread_exits.
             let _ = vm.eval("MacvmInfiniteRecursionProbe new go.");
-            // Only reachable if the thread survived the "fatal" condition —
+            // Only reachable if the thread survived the "fatal" condition â€”
             // itself exactly the bug this test exists to catch.
             tx.send("UNREACHABLE-thread-survived-a-fatal-condition")
                 .unwrap();
@@ -4826,11 +4834,11 @@ mod tests {
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(2)),
             Err(mpsc::RecvTimeoutError::Timeout),
-            "worker thread must NOT have returned from a fatal eval — \
+            "worker thread must NOT have returned from a fatal eval â€” \
              it should have pthread_exit'd"
         );
 
-        // Deliberately no handle.join()/is_finished() — see this test's own
+        // Deliberately no handle.join()/is_finished() â€” see this test's own
         // doc comment and the module doc for why that would panic/hang on a
         // thread that called pthread_exit.
         drop(handle);
@@ -4841,15 +4849,15 @@ mod tests {
     }
 
     /// The actual fix: an unhandled DNU used to be indistinguishable from a
-    /// genuinely fatal condition (see the previous test's own history) —
+    /// genuinely fatal condition (see the previous test's own history) â€”
     /// every everyday Workspace typo paid a full worker respawn, exactly
     /// the "any mistake kills the VM" experience real Smalltalk's own
     /// recoverable `doesNotUnderstand:` exists to avoid. Proves both
     /// halves: the failure surfaces as an ordinary `Err`, AND the same
-    /// `VmHandle` keeps serving requests afterward — the second half is
+    /// `VmHandle` keeps serving requests afterward â€” the second half is
     /// the one that actually matters; a DNU that merely fails to crash but
     /// leaves the VM unusable wouldn't be a real fix.
-    /// The recovery must return the VM to its CLEAN idle state — not merely
+    /// The recovery must return the VM to its CLEAN idle state â€” not merely
     /// leave it "usable enough" to compute `6 * 7`. A guest-fatal `siglongjmp`
     /// skips every RAII `Drop`, so without `restore_after_guest_fatal` the
     /// aborted doit's frames stay on `vm.stack` and its open `HandleScope`s
@@ -4907,13 +4915,13 @@ mod tests {
 
     /// The same clean-baseline invariant as the previous test, but for a
     /// recovered NATIVE fault (SIGSEGV via a bad `Alien` deref, the S20/S21
-    /// mechanism) arriving through `eval`/`exec` — not through
+    /// mechanism) arriving through `eval`/`exec` â€” not through
     /// `dispatch_callback`, which always had its own restore. The native-fault
     /// arm of the six ordinary entry points used to return
     /// `Err(NativeFault)` WITHOUT `restore_after_guest_fatal`, so the aborted
     /// doit's frames/handle scopes/tier journal survived the `siglongjmp` and
     /// the NEXT eval's `snapshot_idle_baseline` captured the polluted state as
-    /// the new "clean" watermark — baking the leak in and (with a stale tier
+    /// the new "clean" watermark â€” baking the leak in and (with a stale tier
     /// link) arming a GC-walk panic. This pins the fix: after a recovered
     /// native fault the VM is byte-for-byte back at the idle baseline, across
     /// repeated faults, under both JIT modes, through both `eval` and `exec`.
@@ -4965,24 +4973,24 @@ mod tests {
     }
 
     /// FFI hardening (2026-07 review follow-up): every guest-reachable
-    /// mistake in a hand-authored `<primitive: FFI …>` pragma — a typo'd
+    /// mistake in a hand-authored `<primitive: FFI â€¦>` pragma â€” a typo'd
     /// symbol name, an unsupported declared shape token, a Tier-2 selector
-    /// pragma with no runtime yet — used to `panic!` in
+    /// pragma with no runtime yet â€” used to `panic!` in
     /// `dispatch_ffi_primitive`, taking the whole embedding host down for
     /// a Workspace-level error. They now raise GUEST fatals: the eval
     /// answers `Err` with the named cause, and the same VM keeps serving.
-    /// (The old `#[should_panic]` gates in `runtime/ffi.rs` moved here —
+    /// (The old `#[should_panic]` gates in `runtime/ffi.rs` moved here â€”
     /// a bare test VM has no jmp slot and cannot observe the recovery.)
     #[test]
     fn ffi_guest_mistakes_recover_as_errors_not_host_panics() {
         let mut vm = boot_test_vm(JitMode::Off);
 
-        // (1) A typo'd function name — the everyday case.
+        // (1) A typo'd function name â€” the everyday case.
         vm.exec(
             "Object subclass: FfiTypo [ \
                FfiTypo class >> go [ <primitive: FFI function: #noSuchSymbolXyzzyQ ret: #g args: #()> ] ]",
         )
-        .expect("the pragma compiles fine — the typo only surfaces at call time");
+        .expect("the pragma compiles fine â€” the typo only surfaces at call time");
         let err = vm
             .eval("FfiTypo go.")
             .expect_err("a typo'd symbol must Err, not kill the host");
@@ -5004,7 +5012,7 @@ mod tests {
             "must name the token, got: {err}"
         );
 
-        // (3) A Tier-2 (`selector:`) pragma — no runtime support yet.
+        // (3) A Tier-2 (`selector:`) pragma â€” no runtime support yet.
         vm.exec(
             "Object subclass: FfiTier2 [ \
                frame [ <primitive: FFI selector: #frame class: #NSView ret: #h4> ] ]",
@@ -5028,7 +5036,7 @@ mod tests {
             "must name the token, got: {err}"
         );
 
-        // (5) More than 8 same-class register args — once a SILENT no-op
+        // (5) More than 8 same-class register args â€” once a SILENT no-op
         // (pre-A0), then briefly a loud limit error (A0), now genuinely
         // SUPPORTED by the A3 stack-spill tier: args 9+ pass on the stack,
         // and a callee that reads none of them (getpid) simply works. The
@@ -5050,7 +5058,7 @@ mod tests {
             "getpid through a 9-arg binding must answer a real pid, got: {pid}"
         );
 
-        // (6) A token-list/arity mismatch — authored independently, so a
+        // (6) A token-list/arity mismatch â€” authored independently, so a
         // 2-keyword selector over a 3-token list compiles fine and then
         // used to no-op silently (the exact authoring bug that no-opped
         // every vDSP kernel in world/61a's first draft). Must Err naming
@@ -5060,7 +5068,7 @@ mod tests {
                FfiArity class >> a: p1 b: p2 [ \
                  <primitive: FFI function: #getpid ret: #g args: #(g g g)> ] ]",
         )
-        .expect("compiles — the mismatch only surfaces at call time");
+        .expect("compiles â€” the mismatch only surfaces at call time");
         let err = vm
             .eval("FfiArity a: 1 b: 2.")
             .expect_err("a token/arity mismatch must Err");
@@ -5077,7 +5085,7 @@ mod tests {
     /// Mono-SUPER c2i staleness (2026-07 review, formerly filed-unfixed): a
     /// compiled method whose `super sel` target was INTERPRETED-ONLY at
     /// compile time links that site to a c2i adapter baking the ancestor
-    /// MethodOop — and an ancestor reached only via super stays interpreted
+    /// MethodOop â€” and an ancestor reached only via super stays interpreted
     /// forever (the c2i compile escape hatch skips super sites by design),
     /// so the adapter is permanent. Redefining the ancestor installs a
     /// fresh MethodOop that key-selector invalidation never routes to the
@@ -5091,9 +5099,9 @@ mod tests {
         let mut vm = boot_test_vm(JitMode::Threshold(1));
         // Two traps this test's own drafts fell into, kept as documentation:
         // the caller's selector (`probe`) must DIFFER from the super-sent
-        // one (`tag`) — the classic `tag [ ^super tag ]` override shape
+        // one (`tag`) â€” the classic `tag [ ^super tag ]` override shape
         // shares the selector, so selector-keyed invalidation flushes the
-        // caller and heals it by coincidence — AND the ancestor body must
+        // caller and heals it by coincidence â€” AND the ancestor body must
         // be big enough that the inliner declines it (a `^1` leaf gets
         // spliced, its `inline_deps` edge invalidates the caller, healed
         // again). The bug lives only in the NON-inlined, interpreted-only
@@ -5102,18 +5110,18 @@ mod tests {
             "Object subclass: SupRedefA [ \
                tag [ | s | s := 0. 1 to: 3 do: [ :i | s := s + i ]. ^s ] ]",
         )
-        .expect("ancestor (loopy body — non-inlinable, stays interpreted)");
+        .expect("ancestor (loopy body â€” non-inlinable, stays interpreted)");
         vm.exec("SupRedefA subclass: SupRedefB [ probe [ ^super tag + 10 ] ]")
             .expect("subclass with the super send under a different selector");
         // Warm: Threshold(1) compiles SupRedefB>>probe on its first
         // activation; subsequent calls run the COMPILED super site through
-        // the ancestor's c2i adapter (the ancestor never compiles — no
+        // the ancestor's c2i adapter (the ancestor never compiles â€” no
         // ordinary sends ever reach it, and the c2i compile escape hatch
         // skips super sites).
         for _ in 0..3 {
             assert_eq!(vm.eval("SupRedefB new probe.").unwrap(), "16");
         }
-        // Live-redefine the ancestor's method (the browser-Accept shape) —
+        // Live-redefine the ancestor's method (the browser-Accept shape) â€”
         // same shape, different bound, still non-inlinable.
         vm.exec(
             "Object subclass: SupRedefA [ \
@@ -5141,13 +5149,13 @@ mod tests {
     /// `ErrorPolicy::Die`: an unhandled guest error must TERMINATE the worker
     /// (throwaway-worker semantics), not recover it. Run on a dedicated thread
     /// with `FatalMode::ExitThread` so the `fatal_exit` is a `pthread_exit`
-    /// that kills only that thread — never `process::exit`, which would take
+    /// that kills only that thread â€” never `process::exit`, which would take
     /// down the whole test binary. The thread signals "booted" before the
     /// error and "survived" after; under `Die` the second signal must never
     /// arrive (the thread is gone). `pthread_exit` runs no destructors, so the
-    /// `Sender` is not dropped either — hence the follow-up is a TIMEOUT, not a
-    /// disconnect. (`Resume`'s opposite behavior — the worker survives and
-    /// stays usable — is covered by the sibling recovery tests.)
+    /// `Sender` is not dropped either â€” hence the follow-up is a TIMEOUT, not a
+    /// disconnect. (`Resume`'s opposite behavior â€” the worker survives and
+    /// stays usable â€” is covered by the sibling recovery tests.)
     #[test]
     fn error_policy_die_terminates_the_worker_on_an_unhandled_error() {
         use std::sync::mpsc;
@@ -5169,16 +5177,16 @@ mod tests {
         );
         match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(msg) => panic!(
-                "ErrorPolicy::Die did not terminate the worker — it ran past the error and sent {msg:?}"
+                "ErrorPolicy::Die did not terminate the worker â€” it ran past the error and sent {msg:?}"
             ),
             Err(mpsc::RecvTimeoutError::Timeout)
             | Err(mpsc::RecvTimeoutError::Disconnected) => { /* worker died: correct */ }
         }
         // Do NOT join `_thread`: a pthread_exited thread can't be joined
-        // (JoinHandle::join would panic — see fatal_exit's own doc).
+        // (JoinHandle::join would panic â€” see fatal_exit's own doc).
     }
 
-    /// CG0 Deliverable 2 — the post-boot `ExitProcess` flip that a main-thread
+    /// CG0 Deliverable 2 â€” the post-boot `ExitProcess` flip that a main-thread
     /// (UI worker) VM uses. This is the CHILD body: only runs its fatal work
     /// when re-invoked as a subprocess with the env var set; a normal
     /// `cargo test` run reaches it with the var UNSET and it is a harmless
@@ -5204,14 +5212,14 @@ mod tests {
         std::process::exit(0);
     }
 
-    /// CG0 Deliverable 2 — the subprocess harness proving the mechanism. A VM
+    /// CG0 Deliverable 2 â€” the subprocess harness proving the mechanism. A VM
     /// booted then set to `FatalMode::ExitProcess` (the pattern a main-thread
     /// UI worker uses so a true fatal exits the process rather than
     /// `pthread_exit`ing the UI thread into a zombie) must, on a genuine fatal,
     /// exit the WHOLE process with the fatal code (70), not `pthread_exit` a
     /// single thread. Re-invokes this very test binary, filtered to the child
     /// body above, with the env var set, and asserts the child exited exactly
-    /// 70 — precisely the `std::process::exit(70)` `ExitProcess` produces, and
+    /// 70 â€” precisely the `std::process::exit(70)` `ExitProcess` produces, and
     /// distinct from the buggy `ExitThread`-on-a-worker-thread path (a
     /// libtest-join panic / abort with a different code).
     #[test]
@@ -5220,7 +5228,7 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe for the subprocess re-invoke");
         let status = Command::new(exe)
             // A unique substring filter (NOT `--exact`, which would need the
-            // full `embed::tests::…` path) -> libtest runs only this one test.
+            // full `embed::tests::â€¦` path) -> libtest runs only this one test.
             .arg("cg0_exitprocess_child_body_do_not_run_directly")
             .arg("--test-threads=1")
             .env("MACVM_CG0_EXITPROCESS_CHILD", "1")
@@ -5260,7 +5268,7 @@ mod tests {
         assert_eq!(result, "42");
     }
 
-    /// `error:`'s own doc comment: "has no proceed semantics in v1" — this
+    /// `error:`'s own doc comment: "has no proceed semantics in v1" â€” this
     /// only asserts it's recoverable at `eval`'s OWN boundary (abort this
     /// one doIt, VM stays usable for the next), not that the erroring
     /// computation itself can be resumed mid-flight.
@@ -5284,11 +5292,11 @@ mod tests {
     /// analogy to the already-proven native-fault case: `raise_guest_fatal`
     /// reuses `siglongjmp` specifically because it's already trusted to
     /// cross JIT-compiled frames soundly (never `catch_unwind` through
-    /// them — this project's standing rule). This exercises that for real:
+    /// them â€” this project's standing rule). This exercises that for real:
     /// `go` compiles under threshold=1, and its OWN send is what DNUs, so
     /// `go`'s COMPILED frame is still live on the stack when
     /// `dnu_fallback` fires (S11 step 6's "DNU... from compiled code"
-    /// path) — not just an interpreter-only DNU.
+    /// path) â€” not just an interpreter-only DNU.
     #[test]
     fn eval_dnu_from_a_compiled_caller_recovers_cleanly() {
         let mut vm = boot_test_vm(JitMode::Threshold(1));
