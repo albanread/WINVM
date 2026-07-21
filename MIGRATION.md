@@ -406,17 +406,44 @@ relative-to-C ratios.
     exactly once, receives the size in bytes, and provably does not bump
     eden itself.
   - 692 lib tests pass; world interpreter still 5891/0.
-- **Next (rest of Phase 3):** `CallSend` + inline caches (the
-  `call_patchable` site shape is already in place from Phase 3a),
-  `ArrayAt/AtPut`, and `oopmap.rs` register numbering. Then wiring
-  `compiled_call.rs` and `driver.rs` to select the x64 back end so
-  tier-up actually fires, plus `adapters.rs`.
+- **2026-07-21 — Phase 3i: `CallSend`, inline caches, and near-host code
+  placement.**
+  - **`CallSend`** does parallel-move argument marshalling (a source
+    register may be another argument's destination, so safe moves go
+    first and a genuine cycle is broken through a scratch; spilled
+    sources are never in a cycle), emits the patchable 5-byte
+    `call rel32` site, records the safepoint and IC metadata, and checks
+    the NLR sentinel so a non-local return propagates one native frame at
+    a time instead of being read as a result.
+  - **Near-host placement — §2.2 finally honoured.** The first `WinJit`
+    copied the macOS loader's "allocate anywhere" shape, which silently
+    cost every host-runtime call an absolute veneer (`mov r10,[rip+pool];
+    call r10` — a load plus an indirect branch). It now asks
+    `VirtualAlloc2` for the region within ±1.75 GB of this image, so
+    those become direct `call rel32`. Falls back to anywhere when
+    `VirtualAlloc2` is missing or the window is crowded; that path stays
+    correct through `relocpatch`'s stubs, just slower. The test measures
+    the distance from **both ends** of the region, since worst case is
+    what decides whether a veneer is needed.
+  - **A flaky test of my own making, fixed.** The write-barrier test
+    derived `old_start` from two separate stack arrays, so whether they
+    straddled a 512-byte card boundary decided whether a card index came
+    out negative and wrapped when cast to `usize`. It passed in isolation
+    and failed in the full parallel run. Rewritten around one arena with
+    fixed offsets; the suite is now stable across 5 consecutive runs.
+    Worth recording alongside the `LoadField` bias bug: both were caught
+    by running things, neither by reading them.
+  - 696 lib tests pass; world interpreter still 5891/0.
+- **Next (rest of Phase 3):** `ArrayAt/AtPut` and `oopmap.rs` register
+  numbering — both small — then the wiring: `compiled_call.rs` and
+  `driver.rs` selecting the x64 back end so tier-up fires, plus
+  `adapters.rs`.
   **Status to be clear about:** the x64 back end is proven op-by-op by
   execution tests, but no running Smalltalk program reaches it yet —
   every benchmark and world-test number above is still the interpreter.
-  `CallSend` is the last substantial op, and that wiring step is what
-  closes the gap and re-enables the `target_arch = "aarch64"`-gated
-  tier-1 tests.
+  The substantial ops are now all done; the wiring step is what closes
+  the gap and re-enables the `target_arch = "aarch64"`-gated tier-1
+  tests.
 
 ## 7. What deliberately does *not* change
 
