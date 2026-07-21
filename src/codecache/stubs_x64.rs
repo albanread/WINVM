@@ -111,7 +111,7 @@ pub fn build_call_stub_x64() -> CodeBlob {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
-    use crate::compiler::emit_x64::emit_x64;
+    use crate::compiler::emit_x64::{emit_x64, RuntimeAddrs};
     use crate::compiler::ir::{
         BailoutReason, BlockId, Ir, IrBlock, IrMethod, PoolLit, SmiOp, VReg, VRegInfo,
     };
@@ -213,7 +213,7 @@ mod tests {
         use crate::vendor::wfasm::native_windows::WinJit;
 
         let stub = build_call_stub_x64();
-        let method = emit_x64(&add_method(), &regalloc(&add_method())).blob;
+        let method = emit_x64(&add_method(), &regalloc(&add_method()), RuntimeAddrs::default()).blob;
 
         let jit = WinJit::with_capacity(stub.code.len() + method.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -253,7 +253,7 @@ mod tests {
         use crate::vendor::wfasm::native_windows::WinJit;
 
         let stub = build_call_stub_x64();
-        let method = emit_x64(&add_method(), &regalloc(&add_method())).blob;
+        let method = emit_x64(&add_method(), &regalloc(&add_method()), RuntimeAddrs::default()).blob;
 
         // A harness, in machine code, that loads a distinct sentinel into
         // every callee-saved register, calls the stub, then XORs each

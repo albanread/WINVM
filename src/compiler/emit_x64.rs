@@ -47,8 +47,8 @@
 
 use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::assembler_x64::{
-    imm, mem, mem_byte, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP, SCRATCH0,
-    SCRATCH1, VM_STATE,
+    imm, mem, mem_byte, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
+    SCRATCH0, SCRATCH1, SHADOW_SPACE, VM_STATE,
 };
 use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
 use crate::compiler::regalloc::{Assignment, RegallocResult, SpillSlot};
@@ -68,6 +68,8 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "SmiCmpVal",
     "StoreField",
     "BoolBr",
+    "Poll",
+    "CallRuntime",
     "Jump",
     "UncommonTrap",
     "Ret",
@@ -96,6 +98,25 @@ pub struct TrapSite {
 pub struct Emitted {
     pub blob: CodeBlob,
     pub trap_sites: Vec<TrapSite>,
+    /// Return addresses of calls into the runtime — deopt safepoints, by
+    /// the same "safepoint keys on the RETURN address" convention the
+    /// AArch64 emitter uses (contrast [`TrapSite`], which keys on the
+    /// trapping instruction itself).
+    pub safepoints: Vec<TrapSite>,
+}
+
+/// Absolute addresses of the runtime entry points compiled code calls.
+/// Passed in rather than looked up so the emitter stays free of any
+/// dependency on a live `VmState` — the same shape as the AArch64
+/// `emit`'s long parameter list, collected into one struct.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuntimeAddrs {
+    /// `stub_poll` — runs the safepoint action when the poll flag is set.
+    pub stub_poll: u64,
+    /// `must_be_boolean` — coerces or raises on a non-boolean.
+    pub must_be_boolean: u64,
+    /// `rt_alloc_slow` — the allocation slow path.
+    pub alloc_slow: u64,
 }
 
 /// Byte offset of spill slot `i` from the frame pointer: `[rbp − 8·(i+1)]`,
@@ -125,6 +146,12 @@ struct Emitter<'a> {
     epilogue: Label,
     bailout: Label,
     trap_sites: Vec<TrapSite>,
+    safepoints: Vec<TrapSite>,
+    /// Pool entries holding the runtime entry points.
+    stub_poll_lit: LiteralId,
+    must_be_boolean_lit: LiteralId,
+    #[allow(dead_code)] // consumed when Alloc lands
+    alloc_slow_lit: LiteralId,
     current_bci: usize,
     method: &'a IrMethod,
 }
@@ -206,6 +233,43 @@ impl<'a> Emitter<'a> {
         self.asm.emit("test", &[r64(reg), imm(3)]);
         let target = self.labels[fail.0 as usize];
         self.asm.jcc(Cond::Ne, target);
+    }
+
+    /// Call an absolute runtime address, Win64-correctly.
+    ///
+    /// **Why clobbering volatiles is safe here.** A Rust callee may
+    /// destroy every volatile register — `RAX RCX RDX R8–R11` and
+    /// `XMM0–5` — which includes four registers the allocator hands out
+    /// (`RCX RDX R8 R9`). That is sound only because every op that
+    /// reaches this helper is a *safepoint*, and `regalloc`'s spill-all
+    /// policy unconditionally spills any interval live across a
+    /// safepoint before the scan even begins. So nothing live is in a
+    /// volatile register at this point, by construction. The pinned
+    /// registers (`R12–R15`) and the allocatable callee-saved ones
+    /// (`RBX RSI RDI`) survive because Win64 requires the callee to
+    /// preserve them.
+    ///
+    /// **Stack discipline.** The prologue leaves `RSP` 16-byte aligned,
+    /// and 32 is a multiple of 16, so reserving exactly the mandatory
+    /// 32-byte shadow space both satisfies the ABI and keeps the
+    /// alignment the callee requires. (The call *stub* subtracts 40
+    /// instead — it is at a different alignment phase, having pushed an
+    /// odd number of registers. The two numbers are both correct and the
+    /// difference is not an inconsistency.)
+    fn emit_runtime_call(&mut self, target: LiteralId) {
+        self.asm
+            .emit("sub", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+        self.asm.call_far(target);
+        self.asm
+            .emit("add", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+    }
+
+    /// Record a deopt safepoint at the CURRENT offset — used right after
+    /// a runtime call returns, so the recorded pc is the return address.
+    fn record_safepoint(&mut self) {
+        let pc_off = self.asm.offset();
+        let bci = self.current_bci;
+        self.safepoints.push(TrapSite { pc_off, bci });
     }
 
     /// The generational write barrier: dirty the card covering a stored
@@ -307,7 +371,7 @@ fn cmp_cond(op: CmpOp) -> Cond {
 /// is directly callable as an `extern "C" fn(u64, ...) -> u64`. Wiring the
 /// real call stub (which additionally establishes the pinned `&VmState` /
 /// receiver registers) is the next Phase-3 step.
-pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> Emitted {
+pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) -> Emitted {
     let mut asm = X64Assembler::new();
 
     // Intern the method's constant pool first, so `PoolLit(i)` indexes
@@ -324,6 +388,12 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> Emitted {
     for iv in &regalloc.intervals {
         assignment[iv.vreg.0 as usize] = iv.assignment;
     }
+    // Runtime entry points get pool words of their own, kinded
+    // `RuntimeAddr` so the GC leaves them alone (they are not oops).
+    let stub_poll_lit = asm.literal_u64(rt.stub_poll, Some(RelocKind::RuntimeAddr));
+    let must_be_boolean_lit = asm.literal_u64(rt.must_be_boolean, Some(RelocKind::RuntimeAddr));
+    let alloc_slow_lit = asm.literal_u64(rt.alloc_slow, Some(RelocKind::RuntimeAddr));
+
     let labels: Vec<Label> = (0..method.blocks.len()).map(|_| asm.new_label()).collect();
     let epilogue = asm.new_label();
     let bailout = asm.new_label();
@@ -336,6 +406,10 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> Emitted {
         epilogue,
         bailout,
         trap_sites: Vec::new(),
+        safepoints: Vec::new(),
+        stub_poll_lit,
+        must_be_boolean_lit,
+        alloc_slow_lit,
         current_bci: 0,
         method,
     };
@@ -382,9 +456,11 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> Emitted {
     e.asm.emit("ret", &[]);
 
     let trap_sites = std::mem::take(&mut e.trap_sites);
+    let safepoints = std::mem::take(&mut e.safepoints);
     Emitted {
         blob: e.asm.finish(),
         trap_sites,
+        safepoints,
     }
 }
 
@@ -622,6 +698,57 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.jmp(ep);
         }
 
+        Ir::Poll => {
+            // `mov eax, [r15 + POLL]; test eax, eax; jz skip; call stub_poll`
+            // — a 32-bit load, so the flag test costs no REX prefix and
+            // zero-extends for free.
+            let skip = e.asm.new_label();
+            e.asm.emit(
+                "mov",
+                &[
+                    r32(RAX),
+                    mem(VM_STATE, crate::oops::layout::VMREG_POLL_FLAG_OFFSET as i64),
+                ],
+            );
+            e.asm.emit("test", &[r32(RAX), r32(RAX)]);
+            e.asm.jcc(Cond::E, skip);
+            let lit = e.stub_poll_lit;
+            e.emit_runtime_call(lit);
+            // The poll is a deopt safepoint keyed on the RETURN address —
+            // which is exactly where `skip` binds, since a dormant flag
+            // also lands here. Recording before the bind makes that
+            // coincidence explicit rather than accidental.
+            e.record_safepoint();
+            e.asm.bind(skip);
+        }
+
+        Ir::CallRuntime { dst, stub, args } => {
+            assert_eq!(
+                *stub,
+                crate::compiler::ir::StubId::MUST_BE_BOOLEAN,
+                "emit_x64: only MUST_BE_BOOLEAN is wired up, mirroring the AArch64 \
+                 emitter's own restriction"
+            );
+            assert_eq!(
+                args.len(),
+                1,
+                "emit_x64: MUST_BE_BOOLEAN takes exactly one argument"
+            );
+            let a0 = e.read_into(args[0], SCRATCH0);
+            if a0 != ARG_REGS[0] {
+                e.asm.emit("mov", &[r64(ARG_REGS[0]), r64(a0)]);
+            }
+            let lit = e.must_be_boolean_lit;
+            e.emit_runtime_call(lit);
+            e.record_safepoint();
+            let dst = dst.expect("MUST_BE_BOOLEAN always produces a coerced boolean");
+            let d = e.def_reg(dst, RAX);
+            if d != RAX {
+                e.asm.emit("mov", &[r64(d), r64(RAX)]);
+            }
+            e.store_def(dst, d);
+        }
+
         Ir::Jump { target } => {
             let t = e.labels[target.0 as usize];
             e.asm.jmp(t);
@@ -769,7 +896,7 @@ mod tests {
     fn compile_and_run(method: &IrMethod, a: u64, b: u64) -> u64 {
         use crate::vendor::wfasm::native_windows::WinJit;
         let ra = regalloc(method);
-        let blob = emit_x64(method, &ra).blob;
+        let blob = emit_x64(method, &ra, RuntimeAddrs::default()).blob;
         let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX region");
         let (base, _cap) = jit.region_raw();
         // SAFETY: the region was just allocated with room for the blob.
@@ -1070,6 +1197,10 @@ mod tests {
                 epilogue: Label(0),
                 bailout: Label(0),
                 trap_sites: Vec::new(),
+                safepoints: Vec::new(),
+                stub_poll_lit: LiteralId(0),
+                must_be_boolean_lit: LiteralId(0),
+                alloc_slow_lit: LiteralId(0),
                 current_bci: 0,
                 method: &hand_method(Vec::new(), Vec::new(), 0),
             };
@@ -1233,7 +1364,7 @@ mod tests {
             0,
         );
         let ra = regalloc(&m);
-        let out = emit_x64(&m, &ra);
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default());
 
         // The emitter recorded the site, keyed by the trap's own offset.
         assert_eq!(out.trap_sites.len(), 1);
@@ -1400,7 +1531,7 @@ mod tests {
             oops(3),
             2,
         );
-        let blob = emit_x64(&m, &regalloc(&m)).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default()).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -1600,6 +1731,171 @@ mod tests {
         );
     }
 
+    /// A counter the Poll test's stand-in stub bumps, so the test can tell
+    /// "the poll branch was taken" from "the flag was read but ignored".
+    #[cfg(windows)]
+    static POLL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(windows)]
+    extern "C" fn poll_stub_probe() {
+        POLL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `Poll` reads the safepoint flag out of the pinned VM register and
+    /// calls the poll stub only when it is set. Both directions matter: a
+    /// poll that never fired would hang the collector at a safepoint, and
+    /// one that always fired would call into the runtime on every loop
+    /// iteration.
+    ///
+    /// Driven through the call stub, because the flag is read through
+    /// `R15` — which is exactly what the stub establishes.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_poll_calls_the_stub_only_when_the_flag_is_set() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::oops::layout::VMREG_POLL_FLAG_OFFSET;
+        use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::Ordering;
+
+        let mut vmreg = [0u64; 8];
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Poll,
+                    Ir::ConstSmi {
+                        dst: VReg(0),
+                        value: 5,
+                    },
+                    Ir::Ret { val: VReg(0) },
+                ],
+            )],
+            oops(1),
+            0,
+        );
+        let rt = RuntimeAddrs {
+            stub_poll: poll_stub_probe as usize as u64,
+            ..RuntimeAddrs::default()
+        };
+        let blob = emit_x64(&m, &regalloc(&m), rt).blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let vm = vmreg.as_ptr() as u64;
+
+        // Flag clear: the stub must NOT be called.
+        vmreg[VMREG_POLL_FLAG_OFFSET / 8] = 0;
+        let before = POLL_CALLS.load(Ordering::Relaxed);
+        assert_eq!(unsafe { stub_fn(entry, vm, std::ptr::null(), 0) }, smi(5));
+        assert_eq!(
+            POLL_CALLS.load(Ordering::Relaxed),
+            before,
+            "a dormant poll flag must not call into the runtime"
+        );
+
+        // Flag set: the stub must be called exactly once, and the method
+        // must still return its normal result afterwards.
+        vmreg[VMREG_POLL_FLAG_OFFSET / 8] = 1;
+        assert_eq!(unsafe { stub_fn(entry, vm, std::ptr::null(), 0) }, smi(5));
+        assert_eq!(
+            POLL_CALLS.load(Ordering::Relaxed),
+            before + 1,
+            "a set poll flag must call the stub exactly once and resume"
+        );
+    }
+
+    /// The poll's safepoint is recorded at the call's RETURN address —
+    /// the convention deopt metadata keys on — and that address is also
+    /// where the not-taken branch lands.
+    #[test]
+    fn poll_safepoint_is_recorded_at_the_return_address() {
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Poll,
+                    Ir::ConstSmi {
+                        dst: VReg(0),
+                        value: 1,
+                    },
+                    Ir::Ret { val: VReg(0) },
+                ],
+            )],
+            oops(1),
+            0,
+        );
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default());
+        assert_eq!(out.safepoints.len(), 1, "one poll, one safepoint");
+        // It is a return address, so it must be strictly inside the code,
+        // past the call that precedes it.
+        let sp = out.safepoints[0].pc_off;
+        assert!(sp > 0 && (sp as usize) < out.blob.literal_off as usize);
+    }
+
+    /// `CallRuntime{MUST_BE_BOOLEAN}` passes its argument in the first
+    /// Win64 argument register and takes the result from RAX.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_call_runtime_marshals_arg_and_result() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::compiler::ir::StubId;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // Stand-in for `must_be_boolean`: returns its argument doubled, so
+        // the test can tell a correctly-marshalled argument from a stale
+        // register.
+        extern "C" fn double_it(x: u64) -> u64 {
+            x.wrapping_mul(2)
+        }
+
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::CallRuntime {
+                        dst: Some(VReg(1)),
+                        stub: StubId::MUST_BE_BOOLEAN,
+                        args: vec![VReg(0)],
+                    },
+                    Ir::Ret { val: VReg(1) },
+                ],
+            )],
+            oops(2),
+            1,
+        );
+        let rt = RuntimeAddrs {
+            must_be_boolean: double_it as usize as u64,
+            ..RuntimeAddrs::default()
+        };
+        let blob = emit_x64(&m, &regalloc(&m), rt).blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+
+        let argv = [21u64];
+        assert_eq!(unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) }, 42);
+        let argv = [100u64];
+        assert_eq!(unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) }, 200);
+    }
+
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
@@ -1622,6 +1918,10 @@ mod tests {
             epilogue: Label(0),
             bailout: Label(0),
             trap_sites: Vec::new(),
+            safepoints: Vec::new(),
+            stub_poll_lit: LiteralId(0),
+            must_be_boolean_lit: LiteralId(0),
+            alloc_slow_lit: LiteralId(0),
             current_bci: 0,
             method: &m,
         };
