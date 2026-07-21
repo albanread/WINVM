@@ -101,6 +101,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "FCmpBr",
     "FCmpVal",
     "FBox",
+    "NlrReturn",
 ];
 
 /// Byte offset of an object's klass word from its TAGGED pointer:
@@ -160,6 +161,9 @@ pub struct Emitted {
     /// checked the receiver's klass (a monomorphic IC hit) may enter
     /// directly. Equals 0 when no guard was requested.
     pub verified_entry_off: u32,
+    /// Byte offset of the synthetic OSR entry block, when one was asked
+    /// for. `None` for an ordinary compile.
+    pub osr_off: Option<u32>,
 }
 
 /// Emit the per-klass customization guard that precedes a compiled
@@ -237,6 +241,8 @@ pub struct RuntimeAddrs {
     pub stub_poll: u64,
     /// `stub_must_be_boolean` — coerces or raises on a non-boolean.
     pub must_be_boolean: u64,
+    /// `stub_nlr_originate` — parks an escaping non-local return.
+    pub nlr_originate: u64,
     /// `stub_call_primitive` — the primitive shim's entry.
     pub call_primitive: u64,
     /// `stub_alloc_slow` — the allocation slow path.
@@ -282,6 +288,7 @@ struct Emitter<'a> {
     alloc_slow_lit: LiteralId,
     box_double_lit: LiteralId,
     call_primitive_lit: LiteralId,
+    nlr_originate_lit: LiteralId,
     current_bci: usize,
     /// This op's index in regalloc's linear numbering.
     pos: u32,
@@ -750,6 +757,7 @@ pub fn emit_x64(
     rt: RuntimeAddrs,
     guard: Option<&EntryGuard>,
     prim_shim: Option<(i64, u8)>,
+    osr: Option<&crate::compiler::emit::EmitOsr>,
 ) -> Emitted {
     let mut asm = X64Assembler::new();
 
@@ -775,6 +783,8 @@ pub fn emit_x64(
     let box_double_lit = asm.literal_u64(rt.box_double, Some(RelocKind::RuntimeAddr));
     let call_primitive_lit =
         asm.literal_u64(rt.call_primitive, Some(RelocKind::RuntimeAddr));
+    let nlr_originate_lit =
+        asm.literal_u64(rt.nlr_originate, Some(RelocKind::RuntimeAddr));
 
     let labels: Vec<Label> = (0..method.blocks.len()).map(|_| asm.new_label()).collect();
     let epilogue = asm.new_label();
@@ -795,6 +805,7 @@ pub fn emit_x64(
         alloc_slow_lit,
         box_double_lit,
         call_primitive_lit,
+        nlr_originate_lit,
         current_bci: 0,
         pos: 0,
         method,
@@ -927,6 +938,71 @@ pub fn emit_x64(
     e.asm.emit("pop", &[r64(RBP)]);
     e.asm.emit("ret", &[]);
 
+            // ── The synthetic OSR entry ─────────────────────────────────────────
+    //
+    // Emitted AFTER every real block, so ordinary entry can never fall
+    // into it. A loop that is already running enters here instead of at
+    // the method's top: build a frame, populate it from the transfer
+    // buffer the runtime packed from the interpreter frame, and jump
+    // straight to the loop header.
+    //
+    // The buffer pointer arrives in the SECOND argument register, mirroring
+    // the AArch64 entry's `x1`.
+    //
+    // No resident-register reloads, unlike AArch64. `regalloc` does assign
+    // `resident_reg` on x64, but `emit_x64` never reads it — a resident
+    // value is a copy held *in addition to* its canonical spill slot, and
+    // this emitter always reads the slot. That leaves speed on the table
+    // and costs no correctness, so the OSR entry has nothing to reload.
+    let osr_off = osr.map(|req| {
+        let entry_off = e.asm.offset();
+        e.asm.emit("push", &[r64(RBP)]);
+        e.asm.emit("mov", &[r64(RBP), r64(RSP)]);
+        if frame_bytes > 0 {
+            e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
+        }
+
+        // Nil-fill EVERY slot before the buffer copies land on top.
+        //
+        // Ordinary entry nil-inits the unified temps through the entry
+        // block's own IR, but this block BRANCHES PAST that block — so a
+        // slot the OSR map omitted (a temp genuinely dead at the header)
+        // would otherwise hold leftover native stack words from dead
+        // frames at the same SP depth. Those slots are still read: an
+        // in-loop trap's deopt scope records every unified temp, and the
+        // same forcing puts them in the oop maps a GC scans at in-loop
+        // safepoints.
+        //
+        // This is the same reasoning as the prologue's
+        // `deopt_nil_init_slots` fill — and that one was MISSING on x64
+        // until the GC-stress sweep caught it, so the whole-frame version
+        // here is deliberate rather than copied.
+        let nil_lit = e.literal_ids[method.nil_lit.0 as usize];
+        e.asm.load_literal(SCRATCH0, nil_lit);
+        for slot in 0..regalloc.frame_slots {
+            e.asm.emit(
+                "mov",
+                &[
+                    mem(RBP, spill_offset(SpillSlot(slot))),
+                    r64(SCRATCH0),
+                ],
+            );
+        }
+
+        // Buffer word i goes to copies[i]'s spill home, in the order the
+        // runtime packer filled it.
+        for (i, &slot) in req.copies.iter().enumerate() {
+            e.asm
+                .emit("mov", &[r64(SCRATCH0), mem(ARG_REGS[1], 8 * i as i64)]);
+            e.asm
+                .emit("mov", &[mem(RBP, spill_offset(slot)), r64(SCRATCH0)]);
+        }
+
+        let hl = e.labels[req.header.0 as usize];
+        e.asm.jmp(hl);
+        entry_off
+    });
+
     let trap_sites = std::mem::take(&mut e.trap_sites);
     let safepoints = std::mem::take(&mut e.safepoints);
     let ic_sites = std::mem::take(&mut e.ic_sites);
@@ -937,6 +1013,7 @@ pub fn emit_x64(
         ic_sites,
         block_pcs,
         verified_entry_off,
+        osr_off,
     }
 }
 
@@ -1595,6 +1672,37 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.jmp(ep);
         }
 
+        Ir::NlrReturn { closure, value } => {
+            // Park the escaping return via `rt_nlr_originate(vm, closure,
+            // value)`, then carry `NLR_SENTINEL` out through this block's
+            // own epilogue. Every compiled frame above relays it with the
+            // per-send check `emit_nlr_check` already emits, so the escape
+            // propagates one native frame at a time back to
+            // `enter_compiled`.
+            //
+            // The AArch64 emitter shuffles `closure`/`value` through
+            // x16/x17 by hand, because either may already live in x0/x1
+            // and a naive `mov x0, rc; mov x1, rv` would clobber a source
+            // before reading it. `marshal_args` solves that generically
+            // here — it is a parallel move with cycle breaking — so the
+            // hazard needs no special handling on this side.
+            e.marshal_args(&[*closure, *value]);
+            let lit = e.nlr_originate_lit;
+            let ret_pc = e.emit_runtime_call(lit);
+            // A PcDesc at the return address, as at every Rust-reaching
+            // site. `rt_nlr_originate` does not itself allocate, and the
+            // closure/value oops live across it in the stub's RootSpill
+            // (`AdapterKind::NlrOriginate`) rather than in this frame's
+            // oop map.
+            e.record_safepoint_at(ret_pc);
+            e.asm.emit(
+                "mov",
+                &[r64(RAX), imm(crate::oops::layout::NLR_SENTINEL as i64)],
+            );
+            let ep = e.epilogue;
+            e.asm.jmp(ep);
+        }
+
         Ir::Bailout { reason } => {
             let _ = reason;
             let b = e.bailout;
@@ -1747,7 +1855,7 @@ mod tests {
     fn compile_and_run(method: &IrMethod, a: u64, b: u64) -> u64 {
         use crate::vendor::wfasm::native_windows::WinJit;
         let ra = regalloc(method);
-        let blob = emit_x64(method, &ra, RuntimeAddrs::default(), None, None).blob;
+        let blob = emit_x64(method, &ra, RuntimeAddrs::default(), None, None, None).blob;
         let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX region");
         let (base, _cap) = jit.region_raw();
         // SAFETY: the region was just allocated with room for the blob.
@@ -2055,6 +2163,7 @@ mod tests {
                 alloc_slow_lit: LiteralId(0),
                 box_double_lit: LiteralId(0),
             call_primitive_lit: LiteralId(0),
+            nlr_originate_lit: LiteralId(0),
                 current_bci: 0,
                 pos: 0,
                 method: &hand_method(Vec::new(), Vec::new(), 0),
@@ -2062,7 +2171,7 @@ mod tests {
             e.emit_two_address("sub", false, dst, a, b);
             e.asm.emit("mov", &[r64(RAX), r64(dst)]);
             e.asm.emit("ret", &[]);
-            let blob = e.asm.finish();
+    let blob = e.asm.finish();
 
             #[cfg(windows)]
             {
@@ -2219,7 +2328,7 @@ mod tests {
             0,
         );
         let ra = regalloc(&m);
-        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None, None);
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None, None, None);
 
         // The emitter recorded the site, keyed by the trap's own offset.
         assert_eq!(out.trap_sites.len(), 1);
@@ -2351,7 +2460,7 @@ mod tests {
             oops(2),
             1,
         );
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2438,7 +2547,7 @@ mod tests {
             oops(3),
             2,
         );
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2680,7 +2789,7 @@ mod tests {
             stub_poll: poll_stub_probe as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt, None, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2734,7 +2843,7 @@ mod tests {
             oops(1),
             0,
         );
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None, None);
         assert_eq!(out.safepoints.len(), 1, "one poll, one safepoint");
         // It is a return address, so it must be strictly inside the code,
         // past the call that precedes it.
@@ -2781,7 +2890,7 @@ mod tests {
             must_be_boolean: double_it as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt, None, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2885,7 +2994,7 @@ mod tests {
             alloc_slow: alloc_slow_probe as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt, None, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -3069,7 +3178,7 @@ mod tests {
             static_klass: None,
         }];
 
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None, None);
         assert_eq!(out.ic_sites.len(), 1, "one send, one IC site");
         assert_eq!(out.ic_sites[0].site, 0);
         assert_eq!(out.safepoints.len(), 1, "a send is a deopt safepoint");
@@ -3166,7 +3275,7 @@ mod tests {
             static_klass: None,
         }];
 
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None, None);
         let site_off = out.ic_sites[0].off as usize;
         let blob = out.blob;
         let stub = build_call_stub_x64();
@@ -3346,7 +3455,7 @@ mod tests {
         use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
         use crate::vendor::wfasm::native_windows::WinJit;
         let vmreg = [0u64; 8];
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None, None, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -3422,7 +3531,7 @@ mod tests {
             key_klass_bits: KEY_KLASS,
             resolve_addr: resolve_probe as usize as u64,
         };
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), Some(&guard), None);
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), Some(&guard), None, None);
         assert!(
             out.verified_entry_off > 0,
             "a guard was requested, so the verified entry must sit past it"
@@ -3507,7 +3616,7 @@ mod tests {
             0,
         );
         let ra = regalloc(&m);
-        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None, None);
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None, None, None);
         assert_eq!(out.safepoints.len(), 1, "one Poll, one safepoint");
 
         // Recompute the Poll's position by walking regalloc's own order,
@@ -3532,7 +3641,7 @@ mod tests {
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
-    #[should_panic(expected = "NlrReturn is not lowered by the x64 back end")]
+    #[should_panic(expected = "VecArith is not lowered by the x64 back end")]
     fn unsupported_op_panics_by_name() {
         let m = hand_method(
             vec![block(
@@ -3558,22 +3667,27 @@ mod tests {
             alloc_slow_lit: LiteralId(0),
             box_double_lit: LiteralId(0),
             call_primitive_lit: LiteralId(0),
+            nlr_originate_lit: LiteralId(0),
             current_bci: 0,
             pos: 0,
             method: &m,
         };
         let _ = &ra;
-        // `FArith` used to serve as the example here. Phase 5 lowered
-        // it, so the test now names an op that genuinely has no x64
-        // lowering — `NlrReturn`. Whoever implements that must move this
-        // to the next unsupported op rather than delete the test: its
-        // job is to prove an unlowered op fails LOUDLY, by name, instead
-        // of falling through and emitting nothing.
+        // This has named `FArith`, then `NlrReturn`, as each was
+        // lowered in turn; `VecArith` (SIMD) is now the last op with no
+        // x64 lowering. Whoever implements it must move this to the next
+        // one rather than delete the test: its job is to prove an
+        // unlowered op fails LOUDLY, by name, instead of falling through
+        // and emitting nothing.
         emit_op(
             &mut e,
-            &Ir::NlrReturn {
-                closure: VReg(0),
-                value: VReg(0),
+            &Ir::VecArith {
+                kind: crate::compiler::ir::VecKind::F64x2,
+                op: crate::compiler::ir::FArithOp::Add,
+                dst: VReg(0),
+                a: VReg(0),
+                b: VReg(0),
+                fail: BlockId(0),
             },
         );
     }

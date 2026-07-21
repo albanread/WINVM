@@ -1,0 +1,12 @@
+"One call, a very long loop. The method is cold when entered, so tiering
+ up requires ON-STACK REPLACEMENT: the loop must migrate to compiled code
+ mid-flight, or it never compiles at all."
+Object subclass: O [
+    O class >> longSum: n [
+        | s i |
+        s := 0. i := 1.
+        [ i <= n ] whileTrue: [ s := s + i. i := i + 1 ].
+        ^s
+    ]
+]
+Transcript showCr: (O longSum: 3000000) printString.

@@ -939,15 +939,6 @@ fn compile_method_full(
         // call-path compile of this same method may well succeed. This is
         // the same fail-soft shape the OSR planner below already uses for
         // a header it cannot resolve.
-        if osr_bci.is_some() {
-            if vm.options.trace.is_enabled("jit") {
-                eprintln!(
-                    "[jit] x64 back end has no OSR entry; declining OSR compile of {}",
-                    selector_string(method)
-                );
-            }
-            return None;
-        }
         if let Some(reason) = x64_decline_reason(&ir_method, prim_shim) {
             if vm.options.trace.is_enabled("jit") {
                 eprintln!(
@@ -1198,7 +1189,6 @@ fn compile_method_full(
             box_float64x2_addr,
             box_float32x4_addr,
             box_int32x4_addr,
-            nlr_originate_addr,
             &osr_req,
         );
         let em = crate::compiler::emit_x64::emit_x64(
@@ -1210,9 +1200,11 @@ fn compile_method_full(
                 alloc_slow: alloc_slow_addr,
                 box_double: box_double_addr,
                 call_primitive: call_primitive_addr,
+                nlr_originate: nlr_originate_addr,
             },
             if method.is_block() { None } else { Some(&guard) },
             prim_shim,
+            osr_req.as_ref(),
         );
         let block_pcs: Vec<emit::BlockPc> = em
             .block_pcs
@@ -1245,7 +1237,7 @@ fn compile_method_full(
             em.verified_entry_off,
             em.ic_sites,
             safepoint_pcs,
-            None::<u32>,
+            em.osr_off,
         )
     };
 

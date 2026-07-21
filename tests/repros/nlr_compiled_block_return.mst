@@ -1,0 +1,15 @@
+Object subclass: N [
+    N class >> findIn: n [
+        1 to: n do: [ :i | (i * i) > 400 ifTrue: [ ^i ] ].
+        ^0
+    ]
+    N class >> sumTo: n [
+        | s | s := 0.
+        1 to: n do: [ :i | s := s + i ].
+        ^s
+    ]
+]
+R := 0. S := 0.
+1 to: 400 do: [ :k | R := N findIn: 100 ].
+1 to: 400 do: [ :k | S := N sumTo: 50 ].
+Transcript showCr: R printString, ' ', S printString.
