@@ -91,7 +91,9 @@ pub fn build_ffi_trampoline_x64(ret: FfiRetClassX64) -> CodeBlob {
     let mut a = X64Assembler::new();
 
     // Callee-saved scratch this trampoline needs across the native call.
-    // RBX = target, RSI = argv, RDI unused, R12/R13 = mask/argc.
+    // RBX = target, RSI = argv. The mask and argc are consumed inline
+    // rather than parked, since every register slot is loaded into both
+    // register files unconditionally.
     a.emit("push", &[r64(RBP)]);
     a.emit("mov", &[r64(RBP), r64(RSP)]);
     a.emit("push", &[r64(RBX)]);

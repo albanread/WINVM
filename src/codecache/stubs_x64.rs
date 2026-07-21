@@ -16,7 +16,8 @@
 //!
 //! - **Callee-saved set.** Win64 preserves `RBX RBP RSI RDI R12–R15` (and
 //!   `XMM6–15`). Compiled code freely uses `RBX/RSI/RDI` (they are in the
-//!   allocatable pool) and pins `R12–R15`, so all seven are saved here.
+//!   allocatable pool) and `R12`–`R14` (also allocatable since the pin
+//!   census), leaving only `R15` pinned — so all seven are saved here.
 //!   `XMM6–15` are NOT saved: the x64 register file deliberately leaves
 //!   them out of the FP pool (see `regalloc`'s `FP_ALLOCATABLE_REGS`), so
 //!   compiled code cannot touch them. When Phase 5 claims them for float
@@ -991,7 +992,7 @@ mod tests {
         assert_eq!(
             diff, 0,
             "a callee-saved register came back changed (XOR of all differences); \
-             compiled code writes RBX/RSI/RDI and pins R12-R15, so every one of \
+             compiled code writes RBX/RSI/RDI and R12-R14 and pins R15, so every one of \
              {SAVED:?} must be saved and restored by the stub"
         );
     }

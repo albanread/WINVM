@@ -712,7 +712,9 @@ const ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 
 /// idle across calls, and the residency tier reclaims what the scan
 /// leaves unused.
 #[cfg(not(target_arch = "aarch64"))]
-const ALLOCATABLE_REGS: &[u8] = &[1, 2, 3, 6, 7, 8, 9];
+const ALLOCATABLE_REGS: &[u8] = &[1, 2, 3, 6, 7, 8, 9, 12, 13, 14];
+// RCX RDX RBX RSI RDI R8 R9 R12 R13 R14 — ten. R12-R14 joined once a
+// census found the emitter never wrote them (see assembler_x64).
 
 /// Float fast-path FP pool: `d0`–`d7`, caller-saved scratch — zero
 /// prologue/epilogue cost, clobbered by any call, which is safe because a
@@ -1356,9 +1358,9 @@ mod tests {
         for (num, name) in [
             (x64::RSP, "RSP (stack pointer)"),
             (x64::RBP, "RBP (frame pointer / spill base)"),
-            (x64::R12, "R12 (method)"),
-            (x64::R13, "R13 (bytecode pointer)"),
-            (x64::R14, "R14 (receiver)"),
+            // R12-R14 are NO LONGER reserved: a census found the emitter
+            // never wrote them, so they returned to the pool. Only the
+            // &VmState pin remains.
             (x64::R15, "R15 (&VmState)"),
             (x64::R10, "R10 (emit scratch / VEH trap-pc stash)"),
             (x64::R11, "R11 (emit scratch)"),
@@ -1373,11 +1375,32 @@ mod tests {
                 "{name} must never be a residency candidate"
             );
         }
-        // And the pool is exactly the seven MIGRATION.md §2.1 names.
+        // The pool, exactly. Pinned as a literal so widening it is a
+        // deliberate edit here rather than a silent drift — this is the
+        // scarcest resource on x64 and the one place its size is stated.
         assert_eq!(
             ALLOCATABLE_REGS,
-            &[x64::RCX, x64::RDX, x64::RBX, x64::RSI, x64::RDI, x64::R8, x64::R9]
+            &[
+                x64::RCX,
+                x64::RDX,
+                x64::RBX,
+                x64::RSI,
+                x64::RDI,
+                x64::R8,
+                x64::R9,
+                x64::R12,
+                x64::R13,
+                x64::R14
+            ]
         );
+        // Every callee-saved member must be one the call stub preserves,
+        // or compiled code silently corrupts its Rust caller.
+        for r in [x64::RBX, x64::RSI, x64::RDI, x64::R12, x64::R13, x64::R14] {
+            assert!(
+                ALLOCATABLE_REGS.contains(&r),
+                "expected xmm-free callee-saved register {r} in the pool"
+            );
+        }
         // Residency candidates must themselves be allocatable (the tier
         // reclaims scan leftovers) and callee-saved (never an ABI arg).
         for r in RESIDENCY_CANDIDATES {

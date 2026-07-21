@@ -40,9 +40,7 @@
 //! | role | x64 | A64 original |
 //! |---|---|---|
 //! | `&mut VmState` | `R15` | `x28` |
-//! | receiver cache | `R14` | `x27` |
-//! | bytecode pointer | `R13` | `x26` |
-//! | method/frame info | `R12` | `x25` |
+//! | *(not pinned)* | `R12`–`R14` | `x25`–`x27` |
 //! | frame pointer | `RBP` | `x29` |
 //! | scratch | `R10`/`R11` | `x16`/`x17` |
 //!
@@ -77,12 +75,24 @@ pub const R15: u8 = 15;
 /// `&mut VmState` — the x28 analogue. Callee-saved, so it survives the
 /// runtime calls compiled code makes.
 pub const VM_STATE: u8 = R15;
-/// Cached receiver (x27 analogue).
-pub const RECEIVER: u8 = R14;
-/// Bytecode pointer for tier-0 interop (x26 analogue).
-pub const BCP: u8 = R13;
-/// Method / frame info (x25 analogue).
-pub const METHOD: u8 = R12;
+// R12-R14 are DELIBERATELY not pinned on x86-64.
+//
+// AArch64 pins x25/x26/x27 for the method, bytecode pointer and receiver
+// cache. Spending three registers out of 31 is cheap; out of 16 it is
+// not, and the x64 emitter never used any of them — a census found zero
+// writes to all three, which the `RetSelf` bug had already hinted at by
+// reading a "cached receiver" register that nothing ever filled.
+//
+// Returning them to the allocatable pool takes it from 7 registers to
+// 10. They are callee-saved under Win64 and the call stub already
+// preserves them, so this costs nothing at the Rust boundary; and
+// compiled-to-compiled calls are safe for the same reason RBX/RSI/RDI
+// already were, namely that every call is a regalloc safepoint and
+// spill-all empties the registers before it.
+//
+// Re-pinning any of them means teaching the emitter to maintain it AND
+// removing it from `regalloc::ALLOCATABLE_REGS` — the two must move
+// together.
 /// First scratch (x16/IP0 analogue) — also the deopt trap-pc stash.
 pub const SCRATCH0: u8 = R10;
 /// Second scratch (x17/IP1 analogue).
@@ -682,19 +692,22 @@ mod tests {
         assert_eq!(text[3], "ret");
     }
 
-    /// The pinned VM registers encode as the registers MIGRATION.md §2.1
-    /// names — a mix-up here would be silent and catastrophic.
+    /// The remaining pinned roles encode as the registers MIGRATION.md
+    /// §2.1 names — a mix-up here would be silent and catastrophic.
+    ///
+    /// Only `R15` and the two scratches are left: `R12`-`R14` used to be
+    /// pinned for the method, bytecode pointer and receiver cache, and
+    /// were returned to the allocatable pool once a census found the
+    /// emitter never wrote any of them.
     #[test]
     fn pinned_register_roles_are_the_documented_ones() {
         let mut a = X64Assembler::new();
-        a.emit("mov", &[r64(VM_STATE), r64(RECEIVER)]);
-        a.emit("mov", &[r64(BCP), r64(METHOD)]);
+        a.emit("mov", &[r64(VM_STATE), r64(RAX)]);
         a.emit("mov", &[r64(SCRATCH0), r64(SCRATCH1)]);
         let blob = a.finish();
         let text = disasm(&blob.code[..blob.literal_off as usize], 0);
-        assert_eq!(text[0], "mov r15,r14");
-        assert_eq!(text[1], "mov r13,r12");
-        assert_eq!(text[2], "mov r10,r11");
+        assert_eq!(text[0], "mov r15,rax");
+        assert_eq!(text[1], "mov r10,r11");
     }
 
     /// A forward branch: the displacement is resolved at `finish` against
