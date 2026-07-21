@@ -483,7 +483,7 @@ Surveyed rather than guessed:
 
 | Component | A64 generators to port | Notes |
 |---|---|---|
-| `codecache/stubs.rs` | **13** `build_*` functions | **8 done** (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu`, `not_entrant`, `deopt_return_trampoline` — `stubs_x64.rs`); still needed: `mega_shared`, `box_double`, `call_primitive`, `nlr_originate`, `value_dispatch` |
+| `codecache/stubs.rs` | **13** `build_*` functions | **12 done** (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `box_double`, `call_primitive`, `nlr_originate` — `stubs_x64.rs`); still needed: **`value_dispatch`** (a two-call stub: `rt_value_target` then `rt_value_fallback`) |
 | `codecache/deopt_trap.rs` | ~~3 trampolines~~ | **DONE** — `uncommon`, `assert`, `probe`. The deopt loop is now closed end to end and tested against the real VEH. |
 | `codecache/pics.rs`, `mega.rs`, `adapters.rs` | PIC/megamorphic/adapter emitters | patch-site shapes already fixed by `call_patchable` |
 | `compiler/driver.rs` | back-end selection | the `emit::emit` call site takes 15 parameters and returns a 6-tuple; `emit_x64` returns an `Emitted` struct. Needs a seam, plus `prim_shim` and OSR support, and `SafepointPc`-vs-`TrapSite` reconciliation for `build_deopt_metadata` |
@@ -507,6 +507,15 @@ rather than by my reading of the spec. **Now checked exhaustively: `rt_poll` is 
 non-scalar return in the entire `rt_*` set** — every other returns `u64`
 or `()`. The remaining stubs are free of the hidden-pointer hazard, which
 removes the largest unknown from the estimate.
+
+**A third hazard, and the only one that was silent:** the first
+`must_be_boolean`/`alloc_slow` stubs skipped the **RootSpill** — the
+frame area `memory::roots` scans at `[fp - ROOTSPILL_BYTES + 8*i]` for
+argument oops. Those offsets are an interface with the collector, not an
+arbitrary layout: an oop living only in a register during a call that can
+scavenge would neither be found as a root nor updated when the object
+moved. Every stub now shares one prologue/epilogue that spills, publishes
+the frame, and RELOADS from the slots afterwards.
 
 The send stubs (`stub_resolve`, `dnu`) turned up the other x64-specific
 trap: **there is no link register**, so the return address that
