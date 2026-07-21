@@ -729,6 +729,34 @@ pub fn emit_x64(
         e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
     }
 
+    // Nil-fill every deopt-referenced spill slot before any block code
+    // runs — the x64 counterpart of the AArch64 prologue's task-#94 fill.
+    //
+    // `sub rsp` reserves the frame; it does not CLEAR it. A slot whose
+    // safepoint is reached before its def — or through a sibling arm that
+    // never wrote it — otherwise scans whatever the last frame at this SP
+    // depth left behind. The collector then traces those words as roots.
+    //
+    // That is exactly what `MACVM_TRACE=oops` was reporting under GC
+    // stress: `slot=5 word=0x1` (not an address at all) and
+    // `slot=10 word=0x1ab41540859 (raw addr in to-space)` — a stale
+    // pointer belonging to a dead frame. Nil is what the interpreter's own
+    // frame would hold for a dead temp (S13's "dead → Nil" rule), so this
+    // makes the compiled frame agree with the interpreted one.
+    //
+    // Narrowed to `deopt_nil_init_slots` rather than the whole frame:
+    // regalloc already computed exactly which slots need it, and params
+    // and temps among them are immediately overwritten by their
+    // entry-block defs.
+    if !regalloc.deopt_nil_init_slots.is_empty() {
+        let nil_lit = e.literal_ids[method.nil_lit.0 as usize];
+        e.asm.load_literal(SCRATCH0, nil_lit);
+        for &slot in &regalloc.deopt_nil_init_slots {
+            e.asm
+                .emit("mov", &[mem(RBP, spill_offset(slot)), r64(SCRATCH0)]);
+        }
+    }
+
     // ── Blocks ──────────────────────────────────────────────────────────
     // Blocks are emitted in REGALLOC's order, not source order — and
     // `pos` advances once per op, AFTER emitting it, in exactly the
