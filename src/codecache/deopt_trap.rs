@@ -1282,6 +1282,119 @@ fn arm_veh() {
     assert!(!h.is_null(), "deopt_trap: AddVectoredExceptionHandler failed");
 }
 
+// ── WINVM: the x86-64 deopt trampolines (Phase 3, MIGRATION.md §8) ────────
+//
+// The three landing pads the VEH redirects into. They complete the loop
+// Phase 2 opened: the handler classifies a trap and rewrites `Rip`, and
+// these run the actual work off-handler, in ordinary code.
+//
+// **The trap pc arrives in `R10`**, stashed by `veh_trap_handler` — the
+// x16 role on AArch64.
+//
+// **There is no link register, and that changes the frame shape.** The
+// AArch64 trampoline does `mov x30, x16` and then `stp x29, x30` so the
+// frame's return-address slot records the TRAP PC (which is what makes a
+// bridged frame walkable). On x64 the same layout is built by pushing the
+// trap pc first and the frame pointer second: `[rbp] = trapped frame's
+// RBP`, `[rbp + 8] = trap pc`, identical to what the walker expects.
+//
+// **The uncommon trampoline REPLACES the frame it traps in.** After
+// `rt_uncommon_trap` has materialized and run the interpreter frames, the
+// compiled activation is gone, so the trampoline unwinds to the trapped
+// frame's own `RBP`, pops it, and returns the result to *that* frame's
+// caller — not to the trap site.
+
+/// `deopt_uncommon_trampoline` — the landing for `0xDE00`/`0xDE01`.
+#[cfg(windows)]
+fn build_uncommon_trampoline_x64() -> crate::compiler::assembler::CodeBlob {
+    use crate::compiler::assembler_x64::{imm, mem, r64, X64Assembler, ARG_REGS, R10, R8, RAX, RBP, RSP, VM_STATE};
+    let mut a = X64Assembler::new();
+
+    // Build the bridged frame: [rbp] = trapped RBP, [rbp+8] = trap pc.
+    a.emit("push", &[r64(R10)]); // trap pc, in the return-address slot
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+
+    // Publish it so a GC during materialization can walk across the gap.
+    a.emit("mov", &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)]);
+    a.emit("mov", &[r64(RAX), mem(RBP, 8)]);
+    a.emit("mov", &[mem(VM_STATE, VMREG_LAST_COMPILED_PC_OFFSET as i64), r64(RAX)]);
+    a.emit("mov", &[r64(RAX), imm(KIND_DEOPT_BRIDGE as i64)]);
+    a.emit("mov", &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(RAX)]);
+
+    // rt_uncommon_trap(vm, trap_pc, trapped_fp).
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), mem(RBP, 8)]);
+    a.emit("mov", &[r64(ARG_REGS[2]), mem(RBP, 0)]);
+    let lit = a.literal_u64(
+        rt_uncommon_trap as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.emit("sub", &[r64(RSP), imm(32)]); // shadow space
+    a.call_far(lit);
+    a.emit("add", &[r64(RSP), imm(32)]);
+
+    // Clear the walker record; the bridge is over.
+    a.emit("mov", &[r64(R8), imm(0)]);
+    a.emit("mov", &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(R8)]);
+    a.emit("mov", &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R8)]);
+
+    // The trapped activation no longer exists: unwind to ITS frame and
+    // return the deoptee's result (already in RAX) to its caller.
+    a.emit("mov", &[r64(R8), mem(RBP, 0)]);
+    a.emit("mov", &[r64(RSP), r64(R8)]);
+    a.emit("pop", &[r64(RBP)]);
+    a.emit("ret", &[]);
+    a.finish()
+}
+
+/// `deopt_assert_stub` — the landing for `0xDE02`, a compiled-code
+/// "should not reach". `rt_compiled_assert_failed` never returns; the
+/// trailing trap is a backstop in case it somehow does.
+#[cfg(windows)]
+fn build_assert_stub_x64() -> crate::compiler::assembler::CodeBlob {
+    use crate::compiler::assembler_x64::{imm, r64, X64Assembler, ARG_REGS, R10, RBP, RSP, VM_STATE};
+    let mut a = X64Assembler::new();
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(R10)]); // trap pc, before call_far clobbers R10
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    let lit = a.literal_u64(
+        rt_compiled_assert_failed as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.emit("sub", &[r64(RSP), imm(32)]);
+    a.call_far(lit);
+    a.emit_bytes(&deopt_int3_bytes(TRAP_ASSERT));
+    a.finish()
+}
+
+/// `deopt_probe_trampoline` — the landing for a fault whose pc was inside
+/// a registered code cache. Switches to a dedicated stack before calling,
+/// because the faulting frame's own `RSP` may be exactly what is broken.
+#[cfg(windows)]
+fn build_probe_trampoline_x64() -> crate::compiler::assembler::CodeBlob {
+    use crate::compiler::assembler_x64::{imm, r64, X64Assembler, ARG_REGS, R10, RSP, SCRATCH1, VM_STATE};
+    let mut a = X64Assembler::new();
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(R10)]); // trap pc first — R10 is about to go
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    let top = {
+        let base = PROBE_STACK.0.get() as u64;
+        (base + PROBE_STACK_BYTES as u64) & !15
+    };
+    let stack_lit = a.literal_u64(top, Some(RelocKind::RuntimeAddr));
+    a.load_literal(SCRATCH1, stack_lit);
+    a.emit("mov", &[r64(RSP), r64(SCRATCH1)]);
+    let entry_lit = a.literal_u64(
+        rt_probe_crash as *const () as u64,
+        Some(RelocKind::RuntimeAddr),
+    );
+    a.emit("sub", &[r64(RSP), imm(32)]);
+    a.call_far(entry_lit);
+    a.emit_bytes(&deopt_int3_bytes(TRAP_ASSERT));
+    a.finish()
+}
+
 // ── Trampolines (D4 / D6) generated at startup ────────────────────────────
 
 /// Handles to the generated deopt trampolines, published into the same
@@ -2017,6 +2130,149 @@ mod tests {
         assert_eq!(
             got, entry,
             "VEH must stash the trap pc in R10 and resume in the trampoline"
+        );
+    }
+
+    /// **The deopt loop, closed end to end.** A compiled-style frame
+    /// executes a trap site; the real VEH decodes it and redirects into
+    /// the real uncommon trampoline; the trampoline builds its bridged
+    /// frame, publishes it, calls a stand-in `rt_uncommon_trap`, and then
+    /// **unwinds the trapped frame entirely** — returning the deoptee's
+    /// result to that frame's OWN caller, not to the trap site.
+    ///
+    /// That last step is what makes this worth a test rather than a
+    /// reading: the trampoline replaces a frame it did not create, so a
+    /// wrong unwind returns to the wrong place with a plausible-looking
+    /// value, and nothing faults.
+    ///
+    /// The trampoline is built here with a patched-in probe address
+    /// instead of the real `rt_uncommon_trap`, so the test observes the
+    /// hand-off without needing a live `VmState` and a real nmethod.
+    #[cfg(windows)]
+    #[test]
+    fn uncommon_trampoline_unwinds_the_trapped_frame() {
+        use crate::compiler::assembler_x64::{imm, mem, r64, X64Assembler, RBP, RSP, VM_STATE};
+        use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEEN_PC: AtomicU64 = AtomicU64::new(0);
+        static SEEN_FP: AtomicU64 = AtomicU64::new(0);
+        static SEEN_FP_AT_CALL: AtomicU64 = AtomicU64::new(0);
+
+        // Stands in for rt_uncommon_trap(vm, trap_pc, fp).
+        extern "C" fn trap_probe(vm: u64, trap_pc: u64, fp: u64) -> u64 {
+            SEEN_PC.store(trap_pc, Ordering::Relaxed);
+            SEEN_FP.store(fp, Ordering::Relaxed);
+            // The walker record must be live DURING the call.
+            let vmreg = vm as *const u64;
+            SEEN_FP_AT_CALL.store(
+                unsafe { *vmreg.add(VMREG_LAST_COMPILED_FP_OFFSET / 8) },
+                Ordering::Relaxed,
+            );
+            0xD0DE // the "deoptee's result"
+        }
+
+        // Build the trampoline, then rewrite its runtime-address pool word
+        // to the probe. The pool is at `literal_off`; the RuntimeAddr
+        // reloc for rt_uncommon_trap names the exact word.
+        let mut tramp = build_uncommon_trampoline_x64();
+        let target = tramp
+            .relocs
+            .iter()
+            .find(|r| r.kind == RelocKind::RuntimeAddr)
+            .map(|r| r.offset as usize)
+            .expect("the trampoline pools rt_uncommon_trap as a RuntimeAddr");
+        tramp.code[target..target + 8]
+            .copy_from_slice(&(trap_probe as usize as u64).to_le_bytes());
+
+        // A "compiled method" that establishes a frame and then traps —
+        // the same prologue emit_x64 generates.
+        let mut m = X64Assembler::new();
+        m.emit("push", &[r64(RBP)]);
+        m.emit("mov", &[r64(RBP), r64(RSP)]);
+        m.emit("sub", &[r64(RSP), imm(32)]);
+        let trap_at = m.offset();
+        m.emit_bytes(&deopt_int3_bytes(TRAP_UNCOMMON));
+        // Never reached: if the trampoline returned HERE instead of
+        // unwinding, the test would see this value instead of the probe's.
+        m.emit("mov", &[r64(crate::compiler::assembler_x64::RAX), imm(0xBAD)]);
+        m.emit("mov", &[r64(RSP), r64(RBP)]);
+        m.emit("pop", &[r64(RBP)]);
+        m.emit("ret", &[]);
+        let method = m.finish();
+
+        // Caller: sets R15 (vm) and calls the method.
+        let mut h = X64Assembler::new();
+        h.emit("push", &[r64(RBP)]);
+        h.emit("mov", &[r64(RBP), r64(RSP)]);
+        h.emit("push", &[r64(VM_STATE)]);
+        h.emit("sub", &[r64(RSP), imm(40)]);
+        h.emit("mov", &[r64(crate::compiler::assembler_x64::R10), r64(crate::compiler::assembler_x64::RCX)]);
+        h.emit("mov", &[r64(VM_STATE), r64(crate::compiler::assembler_x64::RDX)]);
+        h.emit("call", &[r64(crate::compiler::assembler_x64::R10)]);
+        h.emit("add", &[r64(RSP), imm(40)]);
+        h.emit("pop", &[r64(VM_STATE)]);
+        h.emit("pop", &[r64(RBP)]);
+        h.emit("ret", &[]);
+        let harness = h.finish();
+
+        let total = tramp.code.len() + method.code.len() + harness.code.len() + 4096;
+        let jit = WinJit::with_capacity(total).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let m_off = (tramp.code.len() + 15) & !15;
+        let h_off = (m_off + method.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(tramp.code.as_ptr(), base, tramp.code.len());
+            core::ptr::copy_nonoverlapping(method.code.as_ptr(), base.add(m_off), method.code.len());
+            core::ptr::copy_nonoverlapping(
+                harness.code.as_ptr(),
+                base.add(h_off),
+                harness.code.len(),
+            );
+        }
+        let m_entry = base as u64 + m_off as u64;
+        let trap_pc = m_entry + trap_at as u64;
+
+        // Register just the METHOD's range, pointing at the trampoline.
+        register_with_probe(
+            m_entry,
+            m_entry + method.code.len() as u64,
+            base as u64,
+            0,
+            0,
+        );
+        if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
+            arm_veh();
+        }
+
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+        let hf: extern "C" fn(u64, u64) -> u64 =
+            unsafe { std::mem::transmute(base.add(h_off)) };
+        let got = hf(m_entry, vm);
+        deregister(m_entry);
+
+        assert_eq!(
+            got, 0xD0DE,
+            "the deoptee's result must reach the trapped frame's caller — \
+             0xBAD would mean the trampoline returned to the trap site instead"
+        );
+        assert_eq!(
+            SEEN_PC.load(Ordering::Relaxed),
+            trap_pc,
+            "rt_uncommon_trap receives the trapping pc"
+        );
+        assert_ne!(SEEN_FP.load(Ordering::Relaxed), 0, "and the trapped frame's fp");
+        assert_ne!(
+            SEEN_FP_AT_CALL.load(Ordering::Relaxed),
+            0,
+            "last_compiled_fp must be published DURING the call, so a GC \
+             inside materialization can walk across the bridge"
+        );
+        assert_eq!(
+            vmreg[VMREG_LAST_COMPILED_FP_OFFSET / 8],
+            0,
+            "...and cleared once the bridge is over"
         );
     }
 
