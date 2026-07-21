@@ -31,6 +31,15 @@ pub struct DecodedInsn {
     pub off: usize,
     pub len: usize,
     pub text: String,
+    /// Absolute address this instruction's RIP-relative memory operand
+    /// resolves to, if it has one.
+    ///
+    /// This is the x64 analogue of an AArch64 `ldr`-literal target, and
+    /// it is what lets a listing show the *constant* a pool load fetches
+    /// rather than just `[rip+0x2f]`. Comparing what the compiler baked
+    /// against what the runtime dispatched, in one screen, is the whole
+    /// point of the `disasm-native` verb.
+    pub ip_rel_target: Option<u64>,
 }
 
 /// Decode `code` (starting at virtual address `rip`) from its first byte,
@@ -50,10 +59,16 @@ pub fn decode_all(code: &[u8], rip: u64, limit_off: Option<usize>) -> Vec<Decode
         decoder.decode_out(&mut insn);
         let mut text = String::new();
         fmt.format(&insn, &mut text);
+        let ip_rel_target = if insn.is_ip_rel_memory_operand() {
+            Some(insn.ip_rel_memory_address())
+        } else {
+            None
+        };
         out.push(DecodedInsn {
             off,
             len: insn.len(),
             text,
+            ip_rel_target,
         });
     }
     out
@@ -111,6 +126,21 @@ pub fn window(
         out.push(line);
     }
     out
+}
+
+/// If `code[off..]` begins a deopt trap site, its 16-bit immediate.
+///
+/// A trap is `int3` followed by a raw `imm16` that is *data*, not an
+/// operand — so a disassembler faithfully renders the two bytes after
+/// `0xCC` as whatever instruction they happen to encode. In the panic
+/// output that closed the `last_compiled_pc` bug, `cc 00 de` printed as
+/// `int3` then `add dh,bl`, which is correct and useless. A listing that
+/// knows the emitter's own trap convention can say `0xDE00` instead.
+pub fn trap_imm_at(code: &[u8], off: usize) -> Option<u16> {
+    if off + 3 > code.len() || code[off] != 0xCC {
+        return None;
+    }
+    Some(u16::from_le_bytes([code[off + 1], code[off + 2]]))
 }
 
 /// Plain linear listing of a whole blob — the `MACVM_DBG_IR` companion,

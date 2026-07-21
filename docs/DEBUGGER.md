@@ -522,6 +522,90 @@ infrastructure is sitting right there) make it trustworthy fast.
 what let the task-#88 investigation compare "what the compiler baked" against
 "what the runtime dispatched" in one screen.
 
+### 4.4b PROBE on Windows / x86-64 (WINVM Phase 3)
+
+Everything above describes the macOS/AArch64 original. The Windows port
+keeps the design intact — classify, capture, escape to ordinary code —
+but four mechanisms differ, and one design *decision* was revisited.
+
+**Signals become a Vectored Exception Handler.** There is no `sigaction`,
+no `ucontext`, no sigreturn. `AddVectoredExceptionHandler(first=1)`
+installs `veh_trap_handler`, which inspects the kernel's `CONTEXT`,
+rewrites `Rip` in place, and answers `EXCEPTION_CONTINUE_EXECUTION`. The
+escape is the same shape as the `__pc` rewrite; the plumbing is simpler.
+Anything PROBE does not claim returns `EXCEPTION_CONTINUE_SEARCH`, so
+debuggers and the default handler still see it — which gives the macOS
+layer's `SIG_DFL`-restore dance for free.
+
+**PROBE claims six NT status codes, not two signals:**
+
+| code | why |
+|---|---|
+| `ACCESS_VIOLATION` | the SIGSEGV analogue; `ExceptionInformation[1]` is the faulting address (the `__far` analogue) |
+| `IN_PAGE_ERROR` | the SIGBUS analogue |
+| `ILLEGAL_INSTRUCTION` | what a `ud2` placeholder raises — and, during a port, what executing *the wrong architecture's bytes* usually decays into |
+| `PRIVILEGED_INSTRUCTION` | same family; a wild jump landing in data |
+| `INTEGER_DIVIDE_BY_ZERO` | `idiv` with a zero divisor, which on x64 traps rather than producing a value |
+| `STACK_OVERFLOW` | reportable *because* the probe trampoline switches to its own stack before doing anything |
+
+`BREAKPOINT` (`int3`) stays on the deopt path, not PROBE's.
+
+**Registers are named for the host.** The dossier prints
+`rax rcx rdx rbx rsp rbp rsi rdi r8..r15`, not `x0..x28`. This is not
+cosmetic: in the x64 capture order slot 4 is `RSP` and slot 5 is `RBP`,
+so a dossier labelled `x4`/`x5` invites a reader with AArch64 habits to
+mistake the stack pointer for an argument register. `lr` is omitted
+entirely — x64 has no link register, and printing a permanently-zero
+field implies a value that does not exist.
+
+**The disassembler decision is reversed for x64.** §4.4 chose a
+hand-rolled decoder over vendoring Capstone, and the reasoning was sound
+for AArch64: the encoder is ours, closed, fixed-width, and *a fallback
+line is itself a finding*. None of that survives the move to x86-64 —
+the instruction set is neither fixed-width nor small, and a hand-rolled
+partial decoder would produce confident nonsense rather than an honest
+`.word` fallback. `iced-x86` was already vendored as a dev-dependency
+for the encoder's own difftests, so `disasm_x64` uses it, and it is now
+a REGULAR dependency: a dossier that only exists in test builds is no
+use, because the crashes that matter happen in the shipped binary.
+
+**Variable-length instructions change how a window is chosen.** On a
+fixed-width ISA any 4-byte boundary is an instruction boundary, so a
+window around a faulting pc is just `pc-64 .. pc+64`. On x86-64 there is
+no way to tell from the bytes alone where an instruction starts;
+decoding from `pc - 64` will in general land mid-instruction and produce
+a listing that is plausible and entirely wrong — worse than none, in a
+crash dump someone is reading under pressure. `disasm_x64::window`
+therefore decodes FORWARD from the nmethod base, which is an instruction
+boundary by construction, and selects the window by *counting decoded
+instructions*. A pc that is not itself a boundary is reported as such
+(`MID-INSTRUCTION`) rather than snapped to the containing instruction —
+"control reached a non-boundary address" is a far sharper finding than
+"it crashed near here".
+
+**Two x64-specific listing conventions**, both in `disasm-native` and the
+dossier:
+
+- *Pool loads resolve through RIP-relative addressing*, not `ldr`-literal.
+  The annotation is identical (`; pool[0xf8]=0x…  =false`); only the
+  decode differs.
+- *A deopt trap is `int3` plus a raw `imm16` that is **data***. A faithful
+  disassembler renders those two bytes as whatever instruction they
+  encode — `cc 00 de` prints as `int3` then `add dh,bl`, which is correct
+  and useless. The listing knows the emitter's own trap convention, prints
+  `int3 0xde00  ; deopt trap`, and SKIPS the immediate bytes.
+
+**Not yet ported, and known-broken rather than merely untested.** §4.6's
+live compiled-send auditor fails on x64 today —
+`it_debugger::step_call_stops_at_compiled_send_and_inspects_without_
+changing_result` is red, and was red before the debugging work in this
+phase, so it is a genuine gap and not a regression. §4.3's planted
+low-level breakpoints (`0xDE10–0xDE1F`) are in the same position: the
+trap decode covers the immediate range, but nothing has driven it. §4.2's
+frozen-frame report and the walkback DO work — the RBP chain walk is
+structurally identical to the `x29` one and has been used against real
+faults.
+
 ### 4.5 What PROBE deliberately does not do
 
 - **No deopt, ever.** `resume` from a planted breakpoint continues the
@@ -618,6 +702,7 @@ Three read-only modes over that choke point:
 | `MACVM_DBG_REEXEC=1` | (debug builds) one stderr line per value the deopt materializer pushes for a reexecute site's recorded operand stack (`nm`, `bci`, `ValueLoc`, value, receiver). The runtime half of `MACVM_DBG_IR`'s compile-time story: compare what the scope RECORDED against what the frame slot actually HELD. Two entries printing the same address was the tell that closed task #94 (stale slot aliasing a recycled eden-base allocation) |
 | `MACVM_TRACE=calls` | (DBG5 §4.6, release-capable) force-cold ICs + one `[calls] nm#site #sel recv=<klass> → <tier> argc=<n>` line per compiled send. The complete live compiled-dispatch log (superset of `MACVM_DBG_RESOLVE`'s misses-only). Byte-identical results; `ic_misses` inflates (stderr stat) so don't mix with IC-transition-asserting repros |
 | `MACVM_TRACE=oops` | (DBG5 §4.6, release-capable) at every GC, flag any live compiled-frame oop-map slot holding a mem-tagged word in no used heap region — BEFORE the collector derefs it. Silent on healthy code; `⚠SUSPECT nm=… slot=… word=… →OUTSIDE-HEAP` on a wild/stale spill (localized S24 A3b in one line) |
+| `MACVM_JIT=threshold=1` + RUSTTCL `nmethods` / `disasm-native` | the first two commands of any x64 codegen investigation. `nmethods` says what compiled and how big; `disasm-native` shows the machine code WITH its pool constants, IC sites and trap sites annotated. Both work on Windows/x64 as of Phase 3 (§4.4b) |
 | `MACVM_STEP_CALLS=1` | (DBG5 §4.6) interactive step-call auditor: stop at each compiled send boundary, service `bt | slots [N] | step|s | continue|c | quit`, never deopting. Force-colds ICs like `calls`; independent of `MACVM_DEBUG` |
 
 ---

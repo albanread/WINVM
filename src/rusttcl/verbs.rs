@@ -87,7 +87,7 @@ const TABLE: &[VerbDoc] = &[
     VerbDoc {
         name: "disasm-native",
         usage: "disasm-native <Class> <selector>",
-        help: "Disassemble a compiled nmethod's MACHINE CODE (DBG3): one line per instruction, with ic-site and safepoint offsets annotated. Requires the method to have compiled (see nmethods). Contrast `disasm`, which shows bytecode.",
+        help: "Disassemble a compiled nmethod's MACHINE CODE (DBG3): one line per instruction, annotated with entry/verified_entry, IC send sites, safepoints, deopt traps (int3 + imm16, shown by name), and resolved literal-pool loads with well-known oops tagged (=true/=false/=nil). Host ISA: AArch64 or x86-64. Requires the method to have compiled (see nmethods). Contrast `disasm`, which shows bytecode.",
     },
     VerbDoc {
         name: "pin",
@@ -628,7 +628,6 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         nm.pcdescs.iter().map(|p| p.pc_off as usize).collect();
     // Disassemble the CODE region only (up to the literal pool).
     let code = &nm.code.as_bytes()[..nm.literal_off as usize];
-    let listing = crate::compiler::disasm_a64::disasm_slice(code, None);
     let mut rows: Vec<String> = vec![format!(
         "nmethod #{} v{} entry+{:#x} verified+{:#x} ({} code bytes, {} pool)",
         id.0,
@@ -638,8 +637,7 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         nm.literal_off,
         nm.code.len - nm.literal_off as usize
     )];
-    // Whole-blob bytes for resolving ldr-literal pool loads (a load's
-    // target lands PAST literal_off, in the pool).
+    // Whole-blob bytes: a pool load's target lands PAST literal_off.
     let all = nm.code.as_bytes();
     let tag = |raw: u64| -> &'static str {
         if raw == ctx.vm.universe.true_obj.raw() {
@@ -652,49 +650,90 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
             ""
         }
     };
-    for (i, line) in listing.lines().enumerate() {
-        let off = i * 4;
-        let mut annot = String::new();
+    // Shared annotation for one instruction at `off`, whatever the ISA.
+    let annotate = |off: usize, pool_target: Option<usize>| -> String {
+        let mut a = String::new();
         if off == nm.entry_off as usize {
-            annot.push_str("  ; entry");
+            a.push_str("  ; entry");
         }
         if off == nm.verified_entry_off as usize && nm.verified_entry_off != nm.entry_off {
-            annot.push_str("  ; verified_entry");
+            a.push_str("  ; verified_entry");
         }
         if ic_offs.contains(&off) {
-            annot.push_str("  ; IC send site");
+            a.push_str("  ; IC send site");
         }
         if sp_offs.contains(&off) {
-            annot.push_str("  ; safepoint");
+            a.push_str("  ; safepoint");
         }
-        // Resolve ldr-literal pool loads: word 0x58xxxxxx, imm19 = bits[23:5].
-        if off + 4 <= all.len() {
-            let w = u32::from_le_bytes([all[off], all[off + 1], all[off + 2], all[off + 3]]);
-            if w & 0xff00_0000 == 0x5800_0000 {
-                let imm19 = ((w >> 5) & 0x7ffff) as i64;
-                let disp = if imm19 & (1 << 18) != 0 {
-                    imm19 - (1 << 19)
-                } else {
-                    imm19
-                };
-                let target = off as i64 + disp * 4;
-                if target >= 0 && (target as usize) + 8 <= all.len() {
-                    let t = target as usize;
-                    let raw = u64::from_le_bytes([
-                        all[t],
-                        all[t + 1],
-                        all[t + 2],
-                        all[t + 3],
-                        all[t + 4],
-                        all[t + 5],
-                        all[t + 6],
-                        all[t + 7],
-                    ]);
-                    annot.push_str(&format!("  ; pool[{target:#x}]={raw:#x}{}", tag(raw)));
-                }
+        if let Some(t) = pool_target {
+            if t + 8 <= all.len() {
+                let raw = u64::from_le_bytes(all[t..t + 8].try_into().expect("8 bytes"));
+                a.push_str(&format!("  ; pool[{t:#x}]={raw:#x}{}", tag(raw)));
             }
         }
-        rows.push(format!("{line}{annot}"));
+        a
+    };
+
+    // WINVM: variable-length instructions mean the listing cannot be
+    // indexed by `i * 4`. Offsets come from the decoder itself, which is
+    // also what supplies the RIP-relative pool target.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let base = nm.code.base as u64;
+        // A trap site is three bytes, only the first of which is an
+        // instruction. Everything inside one is data and must be SKIPPED,
+        // not rendered — the decoder happily reads `00 de` as `add dh,bl`.
+        let mut skip_until = 0usize;
+        for insn in
+            crate::compiler::disasm_x64::decode_all(code, base, Some(nm.literal_off as usize))
+        {
+            if insn.off < skip_until {
+                continue;
+            }
+            // A deopt trap is `int3` + a raw imm16 that is DATA; decoding
+            // those two bytes as an instruction is faithful and useless.
+            if let Some(imm) = crate::compiler::disasm_x64::trap_imm_at(all, insn.off) {
+                skip_until = insn.off + 3;
+                rows.push(format!(
+                    "+{:#06x}  int3 {imm:#06x}{}  ; deopt trap",
+                    insn.off,
+                    annotate(insn.off, None)
+                ));
+                continue;
+            }
+            let pool = insn
+                .ip_rel_target
+                .map(|t| t.wrapping_sub(base) as usize)
+                .filter(|t| *t >= nm.literal_off as usize);
+            rows.push(format!(
+                "+{:#06x}  {}{}",
+                insn.off,
+                insn.text,
+                annotate(insn.off, pool)
+            ));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let listing = crate::compiler::disasm_a64::disasm_slice(code, None);
+        for (i, line) in listing.lines().enumerate() {
+            let off = i * 4;
+            // Resolve ldr-literal pool loads: word 0x58xxxxxx, imm19 = bits[23:5].
+            let mut pool = None;
+            if off + 4 <= all.len() {
+                let w = u32::from_le_bytes([all[off], all[off + 1], all[off + 2], all[off + 3]]);
+                if w & 0xff00_0000 == 0x5800_0000 {
+                    let imm19 = ((w >> 5) & 0x7ffff) as i64;
+                    let disp = if imm19 & (1 << 18) != 0 { imm19 - (1 << 19) } else { imm19 };
+                    let target = off as i64 + disp * 4;
+                    if target >= 0 {
+                        pool = Some(target as usize);
+                    }
+                }
+            }
+            rows.push(format!("{line}{}", annotate(off, pool)));
+        }
     }
     Ok(Value::new(rows.join("\n")))
 }
