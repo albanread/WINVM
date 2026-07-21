@@ -483,7 +483,7 @@ Surveyed rather than guessed:
 
 | Component | A64 generators to port | Notes |
 |---|---|---|
-| `codecache/stubs.rs` | **13** `build_*` functions | **4 done** (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow` — `stubs_x64.rs`); still needed: `stub_resolve`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `dnu`, `box_double`, `call_primitive`, `nlr_originate`, `value_dispatch` |
+| `codecache/stubs.rs` | **13** `build_*` functions | **6 done** (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu` — `stubs_x64.rs`); still needed: `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `box_double`, `call_primitive`, `nlr_originate`, `value_dispatch` |
 | `codecache/deopt_trap.rs` | **3** trampolines | `uncommon`, `assert`, `probe` — the VEH already redirects to them; they just need x64 bodies |
 | `codecache/pics.rs`, `mega.rs`, `adapters.rs` | PIC/megamorphic/adapter emitters | patch-site shapes already fixed by `call_patchable` |
 | `compiler/driver.rs` | back-end selection | the `emit::emit` call site takes 15 parameters and returns a 6-tuple; `emit_x64` returns an `Emitted` struct. Needs a seam, plus `prim_shim` and OSR support, and `SafepointPc`-vs-`TrapSite` reconciliation for `build_deopt_metadata` |
@@ -503,9 +503,16 @@ instruction-for-instruction port would have read `RAX`/`RDX` as the two
 fields and gotten a pointer plus garbage, with nothing failing at the
 point of the error. That is now pinned by a test that calls a real Rust
 `extern "C"` returning such a struct and requires both fields intact,
-rather than by my reading of the spec. **Expect at least one more of
-these** among the remaining nine stubs — struct returns, varargs, and
-by-value aggregates are exactly where the two ABIs disagree.
+rather than by my reading of the spec. **Now checked exhaustively: `rt_poll` is the ONLY
+non-scalar return in the entire `rt_*` set** — every other returns `u64`
+or `()`. The remaining stubs are free of the hidden-pointer hazard, which
+removes the largest unknown from the estimate.
+
+The send stubs (`stub_resolve`, `dnu`) turned up the other x64-specific
+trap: **there is no link register**, so the return address that
+identifies a missing IC site comes off the stack at `[rbp+8]`, and the
+hand-off to a resolved method is a `jmp` after fully unwinding — never a
+`call` — so the target's `ret` reaches the original caller.
 
 Only after that do the `target_arch = "aarch64"`-gated tier-1 tests come
 back — and those are the real differential check against the Mac, worth
