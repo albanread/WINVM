@@ -548,6 +548,60 @@ pub fn build_stub_nlr_originate_x64(rt_nlr_originate_addr: u64, kind: u64) -> Co
     build_shift_and_call_stub(rt_nlr_originate_addr, 2, kind)
 }
 
+/// `stub_value_dispatch` — `value`/`value:`… on a closure receiver. The
+/// only stub with TWO runtime calls and two different tails, which is why
+/// it does not fit either shape above:
+///
+/// 1. `rt_value_target(vm, closure, argc)` asks for a compiled entry to
+///    jump straight to. A non-zero answer is the fast path: **tail-jump**,
+///    so the closure's own `ret` reaches this stub's caller.
+/// 2. Zero means "not a closure, or not compiled" — fall back to
+///    `rt_value_fallback(vm, argv, argc)`, which interprets the send and
+///    **returns** a value like an ordinary stub.
+///
+/// `argc` is baked in at build time (there is one of these stubs per
+/// arity, as on AArch64), and the fallback's `argv` points at the
+/// RootSpill the prologue filled — so the arguments it interprets are the
+/// GC-visible, GC-updated copies, not stale registers.
+pub fn build_stub_value_dispatch_x64(
+    rt_value_target_addr: u64,
+    rt_value_fallback_addr: u64,
+    argc: u64,
+    kind: u64,
+) -> CodeBlob {
+    let mut a = X64Assembler::new();
+    emit_stub_prologue_x64(&mut a, kind);
+
+    // (1) rt_value_target(vm, closure_bits, argc)
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(ARG_REGS[0])]); // closure, before vm overwrites it
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("mov", &[r64(ARG_REGS[2]), imm(argc as i64)]);
+    let target_lit = a.literal_u64(rt_value_target_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(target_lit);
+
+    let fallback = a.new_label();
+    a.emit("test", &[r64(RAX), r64(RAX)]);
+    a.jcc(Cond::E, fallback);
+
+    // Fast path: tail-jump to the compiled closure entry.
+    a.emit("mov", &[r64(R11), r64(RAX)]);
+    emit_stub_epilogue_x64(&mut a);
+    a.emit("jmp", &[r64(R11)]);
+
+    // (2) Fallback: rt_value_fallback(vm, argv, argc), returning a value.
+    a.bind(fallback);
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("lea", &[r64(ARG_REGS[1]), mem(RBP, -ROOTSPILL)]);
+    a.emit("mov", &[r64(ARG_REGS[2]), imm(argc as i64)]);
+    let fallback_lit = a.literal_u64(rt_value_fallback_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(fallback_lit);
+    a.emit("mov", &[r64(R11), r64(RAX)]);
+    emit_stub_epilogue_x64(&mut a);
+    a.emit("mov", &[r64(RAX), r64(R11)]);
+    a.emit("ret", &[]);
+    a.finish()
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
@@ -1265,6 +1319,101 @@ mod tests {
             vmreg[VMREG_LAST_COMPILED_FP_OFFSET / 8],
             0,
             "walker record cleared once the bridge is over"
+        );
+    }
+
+
+    /// `value_dispatch` takes two different tails, and only running both
+    /// distinguishes them: the fast path TAIL-JUMPS to a compiled closure
+    /// (so the closure's own `ret` reaches this stub's caller, with the
+    /// stub gone), while the fallback RETURNS an interpreted result
+    /// normally. A stub that used one tail for both would still produce a
+    /// plausible value on one of the two paths.
+    #[cfg(windows)]
+    #[test]
+    fn value_dispatch_tail_jumps_on_hit_and_returns_on_fallback() {
+        use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TARGET: AtomicU64 = AtomicU64::new(0);
+        static FB_ARGV0: AtomicU64 = AtomicU64::new(0);
+        static FB_ARGC: AtomicU64 = AtomicU64::new(0);
+        static SEEN_CLOSURE: AtomicU64 = AtomicU64::new(0);
+        static SEEN_ARGC: AtomicU64 = AtomicU64::new(0);
+
+        extern "C" fn value_target(_vm: u64, closure: u64, argc: u64) -> u64 {
+            SEEN_CLOSURE.store(closure, Ordering::Relaxed);
+            SEEN_ARGC.store(argc, Ordering::Relaxed);
+            TARGET.load(Ordering::Relaxed) // 0 selects the fallback
+        }
+        extern "C" fn value_fallback(_vm: u64, argv: *const u64, argc: u64) -> u64 {
+            FB_ARGV0.store(unsafe { *argv }, Ordering::Relaxed);
+            FB_ARGC.store(argc, Ordering::Relaxed);
+            0xFA11
+        }
+        // The "compiled closure" the fast path jumps to.
+        extern "C" fn compiled_closure(_a: u64) -> u64 {
+            0xC105
+        }
+
+        let stub = build_stub_value_dispatch_x64(
+            value_target as usize as u64,
+            value_fallback as usize as u64,
+            1,
+            crate::codecache::stubs::KIND_VALUE_DISPATCH,
+        );
+
+        let jit = WinJit::with_capacity(stub.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        unsafe { core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len()) };
+
+        // Harness: plant R15, call the stub with the closure in arg0.
+        let mut h = X64Assembler::new();
+        h.emit("push", &[r64(RBP)]);
+        h.emit("mov", &[r64(RBP), r64(RSP)]);
+        h.emit("push", &[r64(R15)]);
+        h.emit("sub", &[r64(RSP), imm(40)]);
+        h.emit("mov", &[r64(R10), r64(RCX)]);
+        h.emit("mov", &[r64(R15), r64(RDX)]);
+        h.emit("mov", &[r64(RCX), r64(R8)]);
+        h.emit("call", &[r64(R10)]);
+        h.emit("add", &[r64(RSP), imm(40)]);
+        h.emit("pop", &[r64(R15)]);
+        h.emit("pop", &[r64(RBP)]);
+        h.emit("ret", &[]);
+        let hb = h.finish();
+        let jit2 = WinJit::with_capacity(hb.code.len() + 4096).expect("RWX");
+        let (hbase, _) = jit2.region_raw();
+        unsafe { core::ptr::copy_nonoverlapping(hb.code.as_ptr(), hbase, hb.code.len()) };
+        let hf: extern "C" fn(u64, u64, u64) -> u64 = unsafe { std::mem::transmute(hbase) };
+
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+        const CLOSURE: u64 = 0xC0C0_0001;
+
+        // Fast path: a compiled entry exists -> tail-jump to it.
+        TARGET.store(compiled_closure as usize as u64, Ordering::Relaxed);
+        assert_eq!(
+            hf(base as u64, vm, CLOSURE),
+            0xC105,
+            "the tail-jumped closure's result must reach the stub's caller"
+        );
+        assert_eq!(SEEN_CLOSURE.load(Ordering::Relaxed), CLOSURE);
+        assert_eq!(SEEN_ARGC.load(Ordering::Relaxed), 1, "argc is baked in");
+
+        // Fallback: no compiled entry -> interpret and RETURN.
+        TARGET.store(0, Ordering::Relaxed);
+        assert_eq!(hf(base as u64, vm, CLOSURE), 0xFA11, "fallback returns");
+        assert_eq!(
+            FB_ARGV0.load(Ordering::Relaxed),
+            CLOSURE,
+            "the fallback's argv points at the RootSpill, so it interprets the              GC-visible copies rather than stale registers"
+        );
+        assert_eq!(FB_ARGC.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            vmreg[crate::oops::layout::VMREG_LAST_COMPILED_FP_OFFSET / 8],
+            0,
+            "walker record cleared on both paths"
         );
     }
 
