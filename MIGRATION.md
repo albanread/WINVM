@@ -286,10 +286,49 @@ relative-to-C ratios.
     frames; the interpreter-only Windows build has none yet, so a Rust
     `catch_unwind`-based recovery is viable and is the intended fix before
     tier-1 lands.
-- **Next (Phase 3):** the x64 compiler back end — `assembler.rs` operand
-  DSL over `rasm`, `regalloc.rs` (7-reg pool, two-address form),
-  `emit.rs` op-by-op, `stubs.rs`/`adapters.rs` in x64. This turns the JIT
-  on and re-enables the gated tier-1 and FFI test surface.
+- **2026-07-21 — Phase 3 begun; the x64 back end executes.** Three commits:
+  - **`assembler_x64.rs`** — the `JasmAssembler` sibling, producing the
+    same `CodeBlob` so `codecache`/`nmethod`/GC are untouched. Branches
+    always take the rel32 form (width known before displacement, so no
+    relaxation pass); symbol operands *are* used, because the x64 encoder
+    returns structured `Rel32`/`RipRel32` fixups — the exact hook a
+    structured emitter wants (the A64 side's P6 rule doesn't apply);
+    literals are RIP-relative, so every fixup records `insn_end`.
+    13 tests, verified by decoding output with **iced-x86** rather than
+    asserting hand-copied bytes.
+  - **`regalloc.rs` register file** — the scan, spill policy, and oop-map
+    bookkeeping stay shared verbatim; only the file is target-conditional.
+    Pools became explicit lists of architectural numbers (x64's pool has
+    holes — RSP/RBP sit mid-numbering). x64 GPR pool is **7** registers
+    (RCX RDX RBX RSI RDI R8 R9) against AArch64's 16. Residency has no
+    disjoint callee-saved base on x64 (every callee-saved register is
+    pinned or already allocatable), so it draws only on scan leftovers
+    among RBX/RSI/RDI — sound because residency only claims
+    `!crosses_call` intervals. A new test pins that no reserved register
+    (RSP/RBP/R10–R15/RAX) can ever be allocated.
+  - **`emit_x64.rs`** — the vertical slice: ConstSmi, Move, Param,
+    LoadField, SmiArith, SmiCmpBr, Jump, Ret, Bailout. **Its tests
+    execute**, not inspect: all six arithmetic ops, guard bailout, real
+    `SMI_MAX` overflow through the OF flag, compare-and-branch across
+    zero, and the two-address `dst == b` aliasing hazard.
+  - **Three findings worth carrying forward.** (1) `SMI_SHIFT == 2` with
+    `INT_TAG == 0` makes tagged add/sub/bitwise need *no* untag and makes
+    `jo` an exact overflow test — x64 gets this cheaper than AArch64's
+    `smulh` dance. (2) `SmiOp` has **no division**, so the `idiv`
+    RAX:RDX precoloring the plan feared is simply not needed. (3) The
+    existing spill-all-at-safepoints policy means nothing is live in
+    registers across a call, so emit may clobber freely at call
+    boundaries — no ABI precoloring needed either.
+  - 676 lib tests pass; world interpreter still 5891/0.
+- **Next (rest of Phase 3):** the remaining IR surface — `CallSend` +
+  inline caches, `Alloc`, `Poll`, `GuardKlass`, `CallRuntime`,
+  `UncommonTrap` (emitting the `int3`+imm16 site the Phase-2 VEH already
+  decodes), deopt scopes and `oopmap.rs` register numbering — then the
+  x64 **call stub** in `stubs.rs` (which establishes the pinned
+  `&VmState`/receiver registers) to wire tier-up through
+  `compiled_call.rs`, and `adapters.rs`. That is what re-enables the
+  `target_arch = "aarch64"`-gated tier-1 tests and turns the JIT on for
+  real workloads.
 
 ## 7. What deliberately does *not* change
 
