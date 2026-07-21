@@ -486,7 +486,7 @@ Surveyed rather than guessed:
 | `codecache/stubs.rs` | ~~14 `build_*` functions~~ | **DONE — 14/14** (`c2i_shared` was missed by the first survey) (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `box_double`, `call_primitive`, `nlr_originate`, `value_dispatch` — all in `stubs_x64.rs`) |
 | `codecache/deopt_trap.rs` | ~~3 trampolines~~ | **DONE** — `uncommon`, `assert`, `probe`. The deopt loop is now closed end to end and tested against the real VEH. |
 | `codecache/pics.rs`, `mega.rs`, `adapters.rs` | ~~PIC/mega/adapter emitters~~ | **DONE** — `pics_x64.rs`, `thunks_x64.rs`. **`codecache` is now fully ported.** |
-| `compiler/driver.rs` | back-end selection | the `emit::emit` call site takes 15 parameters and returns a 6-tuple; `emit_x64` returns an `Emitted` struct. Needs a seam, plus `prim_shim` and OSR support, and `SafepointPc`-vs-`TrapSite` reconciliation for `build_deopt_metadata` |
+| `compiler/driver.rs` | back-end selection | **the only structural piece left.** `emit_x64`'s OUTPUT now matches the contract (block order, `block_pcs`, `verified_entry_off`, safepoints with `position`). What remains is the call site itself: `RuntimeAddrs` must grow the remaining stub addresses (`box_double`, the three SIMD boxers, `call_primitive`, `nlr_originate`), and `prim_shim`/OSR are unsupported — so `eligibility_detail` must REFUSE those methods on x64 rather than mis-compile them, leaving them interpreted |
 | `compiler/disasm_a64.rs` | trace/debug disassembly | replace with `iced-x86` (already a dev-dependency) |
 
 So the honest position: **the hard, novel work is done and tested; what
