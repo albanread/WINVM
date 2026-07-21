@@ -231,12 +231,12 @@ pub fn build_stub_alloc_slow_x64(rt_addr: u64) -> CodeBlob {
 // `rt_alloc_slow` can scavenge, and a klass oop living only in a register
 // would neither be found as a root nor updated when the object moved.)
 
-const ROOTSPILL: i64 = crate::oops::layout::ROOTSPILL_BYTES as i64;
+pub(crate) const ROOTSPILL: i64 = crate::oops::layout::ROOTSPILL_BYTES as i64;
 /// RootSpill + 32 bytes of outgoing shadow space. At stub entry `RSP % 16
 /// == 8` (the return address); `push rbp` makes it 0 and this keeps it 0.
 const STUB_FRAME: i64 = ROOTSPILL + 32;
 
-fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
+pub(crate) fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
     use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
     a.emit("push", &[r64(RBP)]);
     a.emit("mov", &[r64(RBP), r64(RSP)]);
@@ -258,7 +258,7 @@ fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
 /// Clears the walker record and RELOADS the arguments from the RootSpill
 /// — deliberately not from registers, since a GC during the call may have
 /// relocated the oops those slots hold.
-fn emit_stub_epilogue_x64(a: &mut X64Assembler) {
+pub(crate) fn emit_stub_epilogue_x64(a: &mut X64Assembler) {
     use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
     a.emit("mov", &[r64(R10), imm(0)]);
     a.emit(
