@@ -1,4 +1,4 @@
-﻿// Vendored from JASM (wfasm), https://github.com/albanread/JASM  commit f2177391538cbede0c8cfcaa29bd3303ae421d0c
+// Vendored from JASM (wfasm), https://github.com/albanread/JASM  commit f2177391538cbede0c8cfcaa29bd3303ae421d0c
 // Original path: rust/src/rasm/assemble.rs.  License: MIT (see LICENSE-JASM in this
 // directory; Copyright (c) 2026 alban read).
 // Local modifications are marked with `// WINVM:` comments — keep the diff
@@ -6,12 +6,12 @@
 // WINVM: `crate::backend`/`crate::rasm` -> `crate::vendor::wfasm::*` (modules
 // moved under WINVM's own tree).
 
-//! Two-pass assembler driver: assembled text â†’ [`EncodedModule`].
+//! Two-pass assembler driver: assembled text → [`EncodedModule`].
 //!
 //! 1. Parse every line into an [`Item`] (code bytes / data / label / globl /
 //!    align / relaxable branch).
 //! 2. Branch relaxation: internal `jmp`/`jcc` start short (rel8) and grow to
-//!    rel32 only when the displacement overflows i8 â€” iterated to a fixpoint
+//!    rel32 only when the displacement overflows i8 — iterated to a fixpoint
 //!    (branches only grow, so it converges). This mirrors LLVM-MC's
 //!    start-short/relax-on-overflow policy, for byte-identity. `call` is always
 //!    rel32; branches to externs are always rel32.
@@ -54,7 +54,7 @@ enum Item {
     Code { bytes: Vec<u8>, riprel: Vec<(usize, String)> },
     Label(String),
     Globl(String),
-    /// `.align`/`.p2align` â€” pad to a 2^n boundary (n already normalized).
+    /// `.align`/`.p2align` — pad to a 2^n boundary (n already normalized).
     AlignP2(u32),
     Branch(Branch),
 }
@@ -75,7 +75,7 @@ impl Item {
 
 /// Emit `count` bytes of alignment padding using the same canonical multi-byte
 /// NOP encodings LLVM-MC's `X86AsmBackend::writeNopData` uses in a code section
-/// â€” required for byte-identity (a run of `0x90` would diverge). Lengths 1..=10
+/// — required for byte-identity (a run of `0x90` would diverge). Lengths 1..=10
 /// come straight from the table; 11..=15 prepend `count-10` `0x66` operand-size
 /// prefixes to the 10-byte form. Pads longer than the max single NOP (15) are
 /// split into successive NOPs, largest first.
@@ -129,7 +129,7 @@ fn branch_for(mnemonic: &str, target: &str) -> Option<Branch> {
 
 /// Assemble a whole module's worth of text into an [`EncodedModule`].
 pub fn assemble(text: &str) -> Result<EncodedModule> {
-    // â”€â”€ Pass 1: parse into items â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Pass 1: parse into items ────────────────────────────────────────────
     let mut items: Vec<Item> = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
         // MC allows `label: insn` / `label: .quad ...` on one line; peel any
@@ -182,7 +182,7 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
         })
         .collect();
 
-    // â”€â”€ Pass 2: branch relaxation to a fixpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Pass 2: branch relaxation to a fixpoint ─────────────────────────────
     loop {
         let (offsets, labels) = layout(&items);
         let mut changed = false;
@@ -193,7 +193,7 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
                 if b.is_long {
                     continue;
                 }
-                // Extern target â†’ must be long.
+                // Extern target → must be long.
                 let must_long = match labels.get(&b.target) {
                     None => true,
                     Some(&tgt) => {
@@ -213,7 +213,7 @@ pub fn assemble(text: &str) -> Result<EncodedModule> {
         }
     }
 
-    // â”€â”€ Pass 3: emit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── Pass 3: emit ────────────────────────────────────────────────────────
     let (offsets, labels) = layout(&items);
     let mut code: Vec<u8> = Vec::new();
     let mut symbols: BTreeMap<String, usize> = BTreeMap::new();
@@ -356,9 +356,9 @@ ret
         let m = assemble(src).unwrap();
         // Both globls exported.
         assert!(m.symbols.contains_key("helper") && m.symbols.contains_key("entry"));
-        // entry$$skip is local â€” not exported.
+        // entry$$skip is local — not exported.
         assert!(!m.symbols.contains_key("entry$$skip"));
-        // helper is internal â†’ the `call helper` is resolved, NOT a reloc.
+        // helper is internal → the `call helper` is resolved, NOT a reloc.
         assert!(m.relocs.is_empty(), "internal targets must not produce relocs: {:?}", m.relocs);
         assert!(m.externs.is_empty());
         // jz short form (74) present.
@@ -410,7 +410,7 @@ helper:
 ret
 ";
         let m = assemble(src).unwrap();
-        // helper is internal â†’ patched; rt_emit â†’ reloc.
+        // helper is internal → patched; rt_emit → reloc.
         assert_eq!(m.relocs.len(), 1);
         assert_eq!(m.relocs[0].kind, RelocKind::RipRel32);
         assert_eq!(m.relocs[0].target, "rt_emit");

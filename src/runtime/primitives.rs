@@ -1,12 +1,12 @@
-﻿//! The primitive mechanism (SPEC Â§10): pinned ids/semantics for the smi,
+//! The primitive mechanism (SPEC §10): pinned ids/semantics for the smi,
 //! oops, bytes, and system (dev-hook) groups. Every `PrimFn` validates its
-//! own receiver/arg tags and formats â€” a violation is always `PrimResult::Fail`
+//! own receiver/arg tags and formats — a violation is always `PrimResult::Fail`
 //! (bytecode-body fallback), never a Rust panic; `args[0]` is always the
 //! receiver.
 //!
-//! Layer boundary (`sprint_s03_detail.md` Â§Layer boundaries): this module
+//! Layer boundary (`sprint_s03_detail.md` §Layer boundaries): this module
 //! reads/writes the operand stack only through `VmState::prim_arg`/the
-//! `args` slice handed in by the interpreter â€” it never pushes a frame.
+//! `args` slice handed in by the interpreter — it never pushes a frame.
 
 use crate::memory::alloc;
 use crate::oops::klass::Format;
@@ -25,19 +25,19 @@ use std::io::Write;
 pub enum PrimResult {
     Ok(Oop),
     Fail,
-    /// The primitive already replaced the sender's continuation â€” pushed a
-    /// real frame and set `vm.regs` itself (SPEC Â§10, S4: the `value`
+    /// The primitive already replaced the sender's continuation — pushed a
+    /// real frame and set `vm.regs` itself (SPEC §10, S4: the `value`
     /// family, `ensure:`, `ifCurtailed:`). The interpreter's primitive-call
     /// site must push NO result and just return to dispatch; pushing one
     /// would corrupt the new frame's temp area by one slot.
     Activated,
     /// S24 A1: a COMPILED block body invoked by `activate_block`'s
     /// enter-compiled fast path performed a non-local return, and
-    /// `continue_unwind` has ALREADY run â€” this is its outcome, to be
+    /// `continue_unwind` has ALREADY run — this is its outcome, to be
     /// relayed exactly like `EnterResult::Nlr`/`SendOutcome::Nlr` (S11
     /// D6.3). Produced ONLY by `interpreter::blocks::activate_block`; the
     /// consumer must NOT touch the operand stack (`sp = base` would be
-    /// wrong â€” after an NLR the stack belongs to a different activation).
+    /// wrong — after an NLR the stack belongs to a different activation).
     Nlr(crate::interpreter::unwind::UnwindStep),
 }
 
@@ -53,7 +53,7 @@ pub struct PrimDesc {
     pub can_fail: bool,
 }
 
-/// Binary-searched by [`prim_by_id`] â€” MUST stay sorted by `id` (the
+/// Binary-searched by [`prim_by_id`] — MUST stay sorted by `id` (the
 /// `prim_table_sorted_unique` test enforces this).
 pub static PRIMITIVES: &[PrimDesc] = &[
     PrimDesc {
@@ -352,7 +352,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
-    // R2 reflection (docs/APPS.md Â§3). Kept in id order â€” `prim_by_id`
+    // R2 reflection (docs/APPS.md §3). Kept in id order — `prim_by_id`
     // binary-searches, so the table must stay sorted.
     PrimDesc {
         id: 62,
@@ -458,7 +458,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // --- Double group (S6, SPEC Â§1.3) ------------------------------------
+    // --- Double group (S6, SPEC §1.3) ------------------------------------
     PrimDesc {
         id: 100,
         name: "+",
@@ -558,13 +558,13 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_fail: false,
     },
     // --- Alien group (S20 step 5) --------------------------------------------
-    // docs/FFI.md Â§4 "Representation": `Alien`'s own typed byte-level
+    // docs/FFI.md §4 "Representation": `Alien`'s own typed byte-level
     // accessors + constructors (`runtime::alien`'s own module doc has the
-    // full design rationale â€” reused `Format::IndexableBytes` shape, one
+    // full design rationale — reused `Format::IndexableBytes` shape, one
     // named external-address field, direct-vs-indirect split). Every one of
     // these validates its own receiver/arg tags exactly like every other
     // group in this table; `can_allocate` is true only for `doubleAt:` (the
-    // one allocating accessor â€” see `runtime::alien::prim_alien_double_at`'s
+    // one allocating accessor — see `runtime::alien::prim_alien_double_at`'s
     // own doc comment) and the two constructors (`new:`/`forAddress:size:`,
     // which allocate the fresh Alien itself).
     PrimDesc {
@@ -639,11 +639,11 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // â”€â”€ libm transcendentals (float fast-path companions): unary Double
-    //    receivers, exactly `sqrt`(106)'s shape â€” the shim makes them
+    // ── libm transcendentals (float fast-path companions): unary Double
+    //    receivers, exactly `sqrt`(106)'s shape — the shim makes them
     //    compiled-callable, and the surrounding arithmetic fuses to native
     //    FP, so a plotted curve is one libm call per point plus register
-    //    maths. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //    maths. ──────────────────────────────────────────────────────────
     PrimDesc {
         id: 121,
         name: "sin",
@@ -692,11 +692,11 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // â”€â”€ SIMD Float64x2 (docs/SIMD.md): the interpreter baseline for the
-    //    2-lane f64 vector value class â€” the analog of Double's own
+    // ── SIMD Float64x2 (docs/SIMD.md): the interpreter baseline for the
+    //    2-lane f64 vector value class — the analog of Double's own
     //    primitives, which the JIT vector fast-path will later fuse to NEON.
     //    Lane math is done here in scalar f64 (bit-identical to per-lane
-    //    Double arithmetic, which the fast-path must also match). â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    //    Double arithmetic, which the fast-path must also match). ──────────
     PrimDesc {
         id: 127,
         name: "x:y:",
@@ -753,10 +753,10 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // SIMD Float32x4 (docs/SIMD.md) â€” the 4-lane f32 companion to Float64x2.
+    // SIMD Float32x4 (docs/SIMD.md) — the 4-lane f32 companion to Float64x2.
     // `x:y:z:w:` is the only 4-arg constructor; the rest mirror Float64x2's
     // elementwise ops, guarded on the Float32x4 klass (the fast-path fuse's
-    // is_float32x4_inlinable maps 136-139 â†’ `.4s` NEON arithmetic).
+    // is_float32x4_inlinable maps 136-139 → `.4s` NEON arithmetic).
     PrimDesc {
         id: 134,
         name: "x:y:z:w:",
@@ -813,7 +813,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // SIMD level 2: FloatArray (docs/SIMD.md Part E) â€” element access + the
+    // SIMD level 2: FloatArray (docs/SIMD.md Part E) — element access + the
     // explicit-NEON bulk kernels (+@ elementwise, sum/dot: fast reductions).
     PrimDesc {
         id: 141,
@@ -871,7 +871,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // SIMD Int32x4 (docs/SIMD.md) â€” 4-lane i32. `+ - *` fuse to NEON integer
+    // SIMD Int32x4 (docs/SIMD.md) — 4-lane i32. `+ - *` fuse to NEON integer
     // `add/sub/mul v.4s` (is_int32x4 via the fuse's vec_arith_op, base 150);
     // there is NO vector integer divide, so no `/`.
     PrimDesc {
@@ -922,7 +922,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // SIMD level 2: more FloatArray NEON kernels â€” scale: (elementwise Ã—scalar)
+    // SIMD level 2: more FloatArray NEON kernels — scale: (elementwise ×scalar)
     // + max/min reductions (docs/SIMD.md Part E; max/min are order-independent
     // so bit-exact, unlike the FP sum).
     PrimDesc {
@@ -949,7 +949,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // --- variable reflection (docs/APPS.md Â§3, the variable half of R2) ---
+    // --- variable reflection (docs/APPS.md §3, the variable half of R2) ---
     PrimDesc {
         id: 157,
         name: "instanceVariablesOf:",
@@ -1095,7 +1095,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: false,
         can_fail: true,
     },
-    // Worker group (docs/multi-smalltalk-worker.md Â§5) â€” spawn/send/poll (M1)
+    // Worker group (docs/multi-smalltalk-worker.md §5) — spawn/send/poll (M1)
     // + the MOP pickle pair (M0, provable solo).
     PrimDesc {
         id: 220,
@@ -1169,7 +1169,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // cocoa bridge C0 (docs/cocoa_bridge_design.md Â§8, prims 230-239).
+    // cocoa bridge C0 (docs/cocoa_bridge_design.md §8, prims 230-239).
     PrimDesc {
         id: 230,
         name: "Cocoa class>>primClassNamed:",
@@ -1341,7 +1341,7 @@ pub static PRIMITIVES: &[PrimDesc] = &[
         can_allocate: true,
         can_fail: true,
     },
-    // --- DBG4: the programmer's `debugger;` â€” open the debugger here ------
+    // --- DBG4: the programmer's `debugger;` — open the debugger here ------
     PrimDesc {
         id: 251,
         name: "halt",
@@ -1363,7 +1363,7 @@ pub fn prim_by_id(id: u16) -> Option<&'static PrimDesc> {
 //
 // Each primitive validates its Smalltalk SmallInt arguments, then emits a
 // `GameCommand` over `vm.game_sink` and returns the receiver (`self`). A bad
-// argument fails the primitive so the Smalltalk fallback (`^self`) runs â€” no
+// argument fails the primitive so the Smalltalk fallback (`^self`) runs — no
 // value ever reaches an `assert!`-panicking engine setter. A headless VM (no
 // sink installed) silently drops the command.
 
@@ -1569,7 +1569,7 @@ fn prim_game_play_tune(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `blit:` (215): overwrite the active pane buffer from a `ByteArray` of
-/// palette indices (row-major) in one command â€” the bulk path for a
+/// palette indices (row-major) in one command — the bulk path for a
 /// CPU-generated frame. A non-`ByteArray` argument fails.
 fn prim_game_blit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(bytes) = ByteArrayOop::try_from(args[1]) else {
@@ -1581,15 +1581,15 @@ fn prim_game_blit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(args[0])
 }
 
-// --- worker group: MOP pickle (docs/multi-smalltalk-worker.md Â§5, M0) --------
+// --- worker group: MOP pickle (docs/multi-smalltalk-worker.md §5, M0) --------
 //
 // The copy-passing boundary's serializer, exposed as its own primitives so
-// the whole format is testable in ONE VM with zero threads. Ids 220â€“226 (the
+// the whole format is testable in ONE VM with zero threads. Ids 220–226 (the
 // registry/spawn/send half) land with M1; only 227/228 exist yet.
 
 /// `pickle:` (227): serialize an object graph to a MOP ByteArray. Fails
-/// (never panics) on unpicklable kinds â€” blocks, contexts, methods, classes,
-/// aliens â€” and on the size/depth guards; the world method's fallback body
+/// (never panics) on unpicklable kinds — blocks, contexts, methods, classes,
+/// aliens — and on the size/depth guards; the world method's fallback body
 /// turns that into a clean Smalltalk error.
 fn prim_mop_pickle(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // Pickling is read-only by construction (`mop::pickle` takes `&VmState`,
@@ -1613,7 +1613,7 @@ fn prim_mop_unpickle(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(src) = ByteArrayOop::try_from(args[1]) else {
         return PrimResult::Fail;
     };
-    // Exactly a ByteArray â€” not any bytes-format object (a String or Alien
+    // Exactly a ByteArray — not any bytes-format object (a String or Alien
     // holding pickle bytes would be a type confusion worth failing loudly).
     let src_m = MemOop::try_from(args[1]).expect("ByteArrayOop implies a mem oop");
     if src_m.klass().oop().raw() != vm.universe.bytearray_klass.oop().raw() {
@@ -1627,14 +1627,14 @@ fn prim_mop_unpickle(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// A smi argument as a worker id (â‰¥ 0; 0 means the primary on the reply path).
+/// A smi argument as a worker id (≥ 0; 0 means the primary on the reply path).
 fn smi_worker_id(oop: Oop) -> Option<u32> {
     let v = SmallInt::try_from(oop)?.value();
     u32::try_from(v).ok()
 }
 
 /// Build a fresh Smalltalk `String` oop from Rust bytes (the inverse of
-/// [`string_arg`]) â€” used where a primitive answers a Rust-constructed message
+/// [`string_arg`]) — used where a primitive answers a Rust-constructed message
 /// (CG4's `primEvalDoit:` compile-error text).
 fn string_oop(vm: &mut VmState, s: &str) -> Oop {
     let klass = vm.universe.string_klass;
@@ -1645,32 +1645,32 @@ fn string_oop(vm: &mut VmState, s: &str) -> Oop {
     b.oop()
 }
 
-/// `primEvalDoit:` (250, Cocoa GUI CG4, `cocoa_gui_design.md` Â§7.3): evaluate a
+/// `primEvalDoit:` (250, Cocoa GUI CG4, `cocoa_gui_design.md` §7.3): evaluate a
 /// doit source `String` on THIS (primary) VM through the existing
-/// `execute_do_it` path and answer the RESULT oop. A Workspace `âŒ˜P`/`âŒ˜D` ships
+/// `execute_do_it` path and answer the RESULT oop. A Workspace `⌘P`/`⌘D` ships
 /// its selection here as a `{#uiReq. corr. #doit. source}` request; the primary
 /// evaluates it (the doit runs where the persistent objects live) and replies
 /// the result.
 ///
-/// Runs **inline under the caller's top-level recovery guard** â€” the dispatching
+/// Runs **inline under the caller's top-level recovery guard** — the dispatching
 /// `exec("Worker dispatchInbox.")`. The doit is compiled to an anonymous `#doIt`
 /// method (the `execute_do_it` shape) and run through
-/// [`crate::interpreter::run_method_reentrant`] â€” the SAME nested-interpreter
+/// [`crate::interpreter::run_method_reentrant`] — the SAME nested-interpreter
 /// entry `perform:withArguments:` (prim 64) uses. Plain `run_method`
 /// (`execute_do_it`'s own path) is a *top-level* entry that does not
 /// save/restore the caller's activation, so calling it from inside a running
-/// method corrupts the caller's continuation â€” the reason this primitive cannot
+/// method corrupts the caller's continuation — the reason this primitive cannot
 /// simply reuse `execute_do_it`. No nested `sigsetjmp` is armed (which would
 /// clobber the one-per-thread jmp slot). A compile/parse error answers a
 /// `String` describing it, so the `#uiReply` carries the message instead of
 /// raising; a runtime raise unwinds to the caller's guard as any `perform` does
-/// (v1: the dispatch aborts and no reply is sent â€” the RPC path's documented
+/// (v1: the dispatch aborts and no reply is sent — the RPC path's documented
 /// property, `47_worker.mst`).
 ///
 /// NON-shimmable (`compiler::driver::PRIM_REENTERS_INTERPRETER`, with
 /// `perform:withArguments:`): a compiled caller must reach this through the
-/// c2i adapter â€” whose `rt_interpret_call` brackets the crossing with
-/// `TierLink::IntoInterpreter` â€” never through `rt_call_primitive`, which
+/// c2i adapter — whose `rt_interpret_call` brackets the crossing with
+/// `TierLink::IntoInterpreter` — never through `rt_call_primitive`, which
 /// brackets nothing. Shimmed, the first GC inside a nested doit walked the
 /// tier journal mispaired and aborted the process (the Cocoa `Worker uiDoit:`
 /// relay crash after ~10 warmed dispatches); see the driver list's own doc
@@ -1692,14 +1692,14 @@ fn prim_eval_doit(vm: &mut VmState, args: &[Oop]) -> PrimResult {
                 Err(e) => return PrimResult::Ok(string_oop(vm, &format!("compile error: {e}"))),
             };
             // Nested interpreter entry (activation saved/restored), receiver nil
-            // â€” the `#doIt` convention. No allocation between compile and run,
+            // — the `#doIt` convention. No allocation between compile and run,
             // so `m` needs no extra rooting.
             let recv = vm.universe.nil_obj;
             let result = crate::interpreter::run_method_reentrant(vm, m, recv, &[]);
             PrimResult::Ok(result)
         }
         // A class definition from the Workspace: install it (no nested doit run
-        // â€” `install_class_def` only compiles methods), answer nil.
+        // — `install_class_def` only compiles methods), answer nil.
         other => match crate::frontend::classdef::execute_top_item(vm, other) {
             Ok(_) => PrimResult::Ok(vm.universe.nil_obj),
             Err(e) => PrimResult::Ok(string_oop(vm, &format!("compile error: {e}"))),
@@ -1719,7 +1719,7 @@ fn string_arg(vm: &VmState, oop: Oop) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Build the guest-facing envelope `{fromId. corr. bytes}` â€” a 3-slot Array.
+/// Build the guest-facing envelope `{fromId. corr. bytes}` — a 3-slot Array.
 /// Allocation order + HandleScope: the ByteArray first (rooted), then the
 /// Array (whose alloc may move the bytes; refetch through the handle).
 fn envelope_to_oop(vm: &mut VmState, env: crate::runtime::workers::Envelope) -> Oop {
@@ -1740,7 +1740,7 @@ fn envelope_to_oop(vm: &mut VmState, env: crate::runtime::workers::Envelope) -> 
 
 /// `primSpawn:` (220): boot a worker VM via the registered boot closure and
 /// answer its id; the argument is an init doit source String (run once in
-/// the fresh worker â€” how its `Worker onMessage:` handler gets installed) or
+/// the fresh worker — how its `Worker onMessage:` handler gets installed) or
 /// nil for none. Fails with no boot fn registered, from a worker (star
 /// topology), or at the cap.
 fn prim_worker_spawn(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -1759,9 +1759,9 @@ fn prim_worker_spawn(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `primSend:corr:bytes:` (221): enqueue a MOP ByteArray on worker `id`'s
-/// channel (or, from a worker, `id` 0 = the primary â€” echoing `corr` routes
+/// channel (or, from a worker, `id` 0 = the primary — echoing `corr` routes
 /// the reply to its continuation). The send fires the coalesced inbox wake
-/// (Â§3.1) on the receiving side's router.
+/// (§3.1) on the receiving side's router.
 fn prim_worker_send(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(id) = smi_worker_id(args[1]) else {
         return PrimResult::Fail;
@@ -1782,7 +1782,7 @@ fn prim_worker_send(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `primPoll` (222): the next envelope for THIS vm as `{fromId. corr. bytes}`,
-/// or nil â€” non-blocking, called from inside a wake-triggered dispatch (never
+/// or nil — non-blocking, called from inside a wake-triggered dispatch (never
 /// a poll loop). Primary: the shared inbox. Worker: the staged pending
 /// message its host loop parked.
 fn prim_worker_poll(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -1796,7 +1796,7 @@ fn prim_worker_poll(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `primAwaitInbox:` (223): the headless run loop's sleep â€” block in the
+/// `primAwaitInbox:` (223): the headless run loop's sleep — block in the
 /// inbox up to `timeoutMs`, answering the envelope or nil. This block IS the
 /// primary's idle state (the channel send is the wake; zero spin). Primary
 /// only.
@@ -1840,7 +1840,7 @@ fn prim_worker_alive(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     })
 }
 
-/// `primSelfId` (226): 0 in the primary, i â‰¥ 1 in worker i â€” lets shared
+/// `primSelfId` (226): 0 in the primary, i ≥ 1 in worker i — lets shared
 /// world code know which side of the boundary it is on.
 fn prim_worker_self_id(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = args;
@@ -1848,14 +1848,14 @@ fn prim_worker_self_id(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(i64::from(id)).oop())
 }
 
-// --- cocoa group: the bridge C0 (docs/cocoa_bridge_design.md Â§8) ------------
+// --- cocoa group: the bridge C0 (docs/cocoa_bridge_design.md §8) ------------
 //
 // ObjcRef sends + ownership + the class/NSString entry points. Every send
-// goes through the @try shim (objc_bridge::try_send) â€” an NSException comes
+// goes through the @try shim (objc_bridge::try_send) — an NSException comes
 // back as a description, is written to the transcript, and the prim FAILS
 // (the world method's fallback raises a Smalltalk error; the VM never sees
-// an ObjC unwind). Marshalling in C0: ObjcRef â†’ its id, nil â†’ NULL,
-// SmallInteger â†’ the value as a GPR word. Everything else fails.
+// an ObjC unwind). Marshalling in C0: ObjcRef → its id, nil → NULL,
+// SmallInteger → the value as a GPR word. Everything else fails.
 
 /// Report a caught NSException to the transcript, then fail the prim.
 #[cfg(target_os = "macos")]
@@ -1865,7 +1865,7 @@ fn cocoa_exception_fail(vm: &mut VmState, selector: &str, desc: &str) -> PrimRes
 }
 
 /// A String OR Symbol argument's text (both are byte-format; only the
-/// klass differs) â€” the general send's selector/ret-token arguments read
+/// klass differs) — the general send's selector/ret-token arguments read
 /// naturally as either `'id'` or `#id`.
 #[cfg(target_os = "macos")]
 fn text_arg(vm: &VmState, oop: Oop) -> Option<String> {
@@ -1880,7 +1880,7 @@ fn text_arg(vm: &VmState, oop: Oop) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// C0 argument marshalling (design Â§2 clause 3): copies and ids only.
+/// C0 argument marshalling (design §2 clause 3): copies and ids only.
 #[cfg(target_os = "macos")]
 fn cocoa_marshal_arg(vm: &VmState, o: Oop) -> Option<*mut std::os::raw::c_void> {
     if o.raw() == vm.universe.nil_obj.raw() {
@@ -1899,8 +1899,8 @@ fn prim_cocoa_class_named(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(name) = string_arg(vm, args[1]) else {
         return PrimResult::Fail;
     };
-    // CG2 (cocoa_gui_design.md Â§8): fail LOUDLY if a background VM tries to
-    // reach an AppKit UI class â€” only the main-thread UI worker may. The
+    // CG2 (cocoa_gui_design.md §8): fail LOUDLY if a background VM tries to
+    // reach an AppKit UI class — only the main-thread UI worker may. The
     // transcript line names the refusal; the primitive fails so the guest send
     // raises rather than corrupting AppKit's main-thread-only state.
     if let Err(msg) = crate::runtime::objc_bridge::check_appkit_main_thread(&name) {
@@ -1913,11 +1913,11 @@ fn prim_cocoa_class_named(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// The shared send core for 231/232/233: n GPR args, id result, wrapped â€”
+/// The shared send core for 231/232/233: n GPR args, id result, wrapped —
 /// through the +1-family classifier (C1): an `alloc`/`new`/`copy`/
 /// `mutableCopy`/`init` result is already caller-owned so the wrap skips
 /// its retain, and an init-family send consumes the RECEIVER's ownership
-/// (poison-without-release, BEFORE the allocating wrap â€” `args[0]` would
+/// (poison-without-release, BEFORE the allocating wrap — `args[0]` would
 /// be stale after a scavenge).
 #[cfg(target_os = "macos")]
 fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
@@ -1947,7 +1947,7 @@ fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
         }
         Err(desc) => {
             // ns_consumes_self: init consumed the receiver even on a
-            // throw â€” a live wrapper here would over-release later.
+            // throw — a live wrapper here would over-release later.
             if fam == crate::runtime::objc_bridge::Family::Init {
                 crate::runtime::objc_bridge::consume_receiver(vm, args[0]);
             }
@@ -1956,21 +1956,21 @@ fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
     }
 }
 
-/// `ObjcRef >> primSend:args:ret:` (240) â€” the C1 general send: any mix of
+/// `ObjcRef >> primSend:args:ret:` (240) — the C1 general send: any mix of
 /// up to 6 GPR-class + 8 FPR-class arguments, spilling to 4 shared stack
-/// words in declaration order â€” AAPCS64's exact stage-C rule for SCALAR
+/// words in declaration order — AAPCS64's exact stage-C rule for SCALAR
 /// 8-byte arguments. Two honest limits of the flat model (adversarial-
 /// review findings, deliberately deferred to C2's `cocoa_data`-driven
 /// shapes): a struct-by-value argument must fit ENTIRELY in its class's
 /// remaining registers (a composite that would straddle the register/
-/// stack boundary is placed differently by the real ABI â€” whole-composite
-/// to stack, registers left idle â€” which this per-scalar model can't
+/// stack boundary is placed differently by the real ABI — whole-composite
+/// to stack, registers left idle — which this per-scalar model can't
 /// express), and a spilled argument narrower than 8 bytes (BOOL/int in
 /// stack position) packs to natural size under Darwin, not a full word.
 ///
-/// Argument marshalling (flat register model â€” design Â§2 clause 3):
-///   nilâ†’NULL, true/falseâ†’1/0, SmallIntegerâ†’GPR word, ObjcRefâ†’its id,
-///   Doubleâ†’FPR double, Stringâ†’a temp NSString (+0 under the bottom pool).
+/// Argument marshalling (flat register model — design §2 clause 3):
+///   nil→NULL, true/false→1/0, SmallInteger→GPR word, ObjcRef→its id,
+///   Double→FPR double, String→a temp NSString (+0 under the bottom pool).
 /// A register-resident struct-by-value argument IS its fields in
 /// consecutive slots under this model: an NSRange argument is two
 /// SmallIntegers, a CGPoint two Doubles, a CGRect four Doubles.
@@ -1978,10 +1978,10 @@ fn cocoa_send_n(vm: &mut VmState, args: &[Oop], argn: usize) -> PrimResult {
 /// Ret tokens (the register-classifiable subset of `cocoa_data`'s ABI
 /// vocabulary): #id #i64 #i32 #f64 #bool #str #void #range #point #size
 /// #rect. #i32 exists because a callee returning C `int` writes only w0
-/// (zero-extended) â€” reading it as #i64 makes a negative int a huge
+/// (zero-extended) — reading it as #i64 makes a negative int a huge
 /// positive smi, silently; #i32 sign-extends from bit 31 instead.
 /// More args than slots, an unknown token, or an unmarshalable argument
-/// all FAIL cleanly (the world fallback raises) â€” the FFI arc's
+/// all FAIL cleanly (the world fallback raises) — the FFI arc's
 /// argv-overflow lesson, applied at this entry point from day one.
 #[cfg(target_os = "macos")]
 fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -2018,7 +2018,7 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     };
     // Ownership gate (C1 adversarial-review findings): a +1-family
     // selector (alloc/new/copy/mutableCopy/init) answers an object the
-    // caller must OWN â€” only #id can take that ownership. Any other ret
+    // caller must OWN — only #id can take that ownership. Any other ret
     // token would leak the +1 invisibly (no wrap, no counter), so the
     // send is refused BEFORE it runs (no side effects).
     let fam = objc_bridge::selector_family(&sel);
@@ -2027,7 +2027,7 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 
     // Marshal every argument to plain native words BEFORE the call (and
-    // before any Smalltalk allocation) â€” GPR class fills x2..x7 then the
+    // before any Smalltalk allocation) — GPR class fills x2..x7 then the
     // shared stack words; FPR class fills d0..d7 then the same stack words,
     // in declaration order, per AAPCS64.
     let mut gpr = [0u64; SEND_GPR_SLOTS];
@@ -2061,7 +2061,7 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         } else if let Some(id) = objc_bridge::read_id(vm, a) {
             id as u64
         } else if let Some(s) = string_arg(vm, a) {
-            // A temp NSString: +0 autoreleased under the bottom pool â€”
+            // A temp NSString: +0 autoreleased under the bottom pool —
             // alive for the call, never wrapped, never retained.
             match objc_bridge::nsstring_from(s.as_bytes()) {
                 Ok(ns_id) => ns_id as u64,
@@ -2085,7 +2085,7 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         Ok(o) => o,
         Err(desc) => {
             // ns_consumes_self: an init-family send consumed the receiver
-            // even when it THREW â€” leaving the wrapper live would let a
+            // even when it THREW — leaving the wrapper live would let a
             // later release over-release (the one direction the design
             // forbids). Consume on both outcomes.
             if fam == objc_bridge::Family::Init {
@@ -2095,14 +2095,14 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         }
     };
 
-    // An init-family send consumed the receiver's ownership â€” poison it
+    // An init-family send consumed the receiver's ownership — poison it
     // FIRST (allocation-free; `args[0]` is still valid because nothing
     // has allocated since entry).
     if fam == objc_bridge::Family::Init {
         objc_bridge::consume_receiver(vm, args[0]);
     }
 
-    // Result construction â€” the only allocating region of this primitive.
+    // Result construction — the only allocating region of this primitive.
     match ret_tok.as_str() {
         "id" => PrimResult::Ok(objc_bridge::wrap_result(
             vm,
@@ -2118,14 +2118,14 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
             }
         }
         "i32" => {
-            // A C `int` return lives in w0 (upper bits zero) â€” sign-extend
+            // A C `int` return lives in w0 (upper bits zero) — sign-extend
             // from bit 31 so `intValue`'s -5 answers -5, not 2^32-5.
             let v = out.gpr[0] as u32 as i32 as i64;
             PrimResult::Ok(SmallInt::new(v).oop())
         }
         "bool" => {
             // BOOL comes back in w0's low byte; AAPCS64 leaves the upper
-            // bits unspecified â€” mask before judging.
+            // bits unspecified — mask before judging.
             PrimResult::Ok(if (out.gpr[0] & 0xFF) != 0 {
                 vm.universe.true_obj
             } else {
@@ -2156,7 +2156,7 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
             let smi_ok =
                 |v: i64| (crate::oops::layout::SMI_MIN..=crate::oops::layout::SMI_MAX).contains(&v);
             if !smi_ok(loc) || !smi_ok(len) {
-                return PrimResult::Fail; // NSNotFound territory â€” report, don't wrap wrong
+                return PrimResult::Fail; // NSNotFound territory — report, don't wrap wrong
             }
             let a = alloc::alloc_indexable_oops(vm, vm.universe.array_klass, 2);
             a.at_put(0, SmallInt::new(loc).oop());
@@ -2171,13 +2171,13 @@ fn prim_cocoa_send_general(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// A fresh Array of fresh Doubles â€” the HFA-result materializer shared by
+/// A fresh Array of fresh Doubles — the HFA-result materializer shared by
 /// prims 240/241. The array must survive each `alloc_double` (which may
-/// move it) â€” handle-rooted, re-derived per store. The store goes through
+/// move it) — handle-rooted, re-derived per store. The store goes through
 /// the write-barrier door (`store_tail_oop`), NOT bare `at_put`: a
 /// mid-loop scavenge can PROMOTE the array (and re-clean its card once no
 /// slot points young), after which a bare store of the next fresh Double
-/// is an oldâ†’new reference no future scavenge would ever see â€” the C1
+/// is an old→new reference no future scavenge would ever see — the C1
 /// adversarial review's dangling-slot scenario under tenuring-threshold 0.
 #[cfg(target_os = "macos")]
 fn cocoa_double_array(vm: &mut VmState, vals: &[f64]) -> Oop {
@@ -2193,10 +2193,10 @@ fn cocoa_double_array(vm: &mut VmState, vals: &[f64]) -> Oop {
     arr_h.get(vm)
 }
 
-/// `ObjcRef >> primSendAuto:args:` (241) â€” the C2 DNU engine: resolve the
+/// `ObjcRef >> primSendAuto:args:` (241) — the C2 DNU engine: resolve the
 /// selector's ABI shape from the LIVE runtime (`method_getTypeEncoding`
-/// via [`objc_bridge::resolve_shape`], cached per classÃ—selector), then
-/// marshal ENCODING-DRIVEN â€” the callee's signature decides each
+/// via [`objc_bridge::resolve_shape`], cached per class×selector), then
+/// marshal ENCODING-DRIVEN — the callee's signature decides each
 /// argument's register class, so `numberWithDouble: 3` coerces the
 /// SmallInteger to d0 instead of misplacing it in a GPR. Fails cleanly
 /// (the world `doesNotUnderstand:` fallback raises) when the class has no
@@ -2207,16 +2207,16 @@ fn prim_cocoa_send_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     cocoa_send_auto_impl(vm, args, false)
 }
 
-/// `ObjcRef >> primSendMainAuto:args:` (242) â€” the C3 variant: identical
+/// `ObjcRef >> primSendMainAuto:args:` (242) — the C3 variant: identical
 /// resolution + marshalling, dispatched synchronously ON THE MAIN THREAD
-/// (design Â§4 path 2 â€” AppKit is main-thread-only). Inline when already
+/// (design §4 path 2 — AppKit is main-thread-only). Inline when already
 /// on main; a clean failure when no GUI host has enabled the hop.
 #[cfg(target_os = "macos")]
 fn prim_cocoa_send_main_auto(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     cocoa_send_auto_impl(vm, args, true)
 }
 
-/// The shared engine behind prims 241/242 â€” `on_main` picks the dispatch
+/// The shared engine behind prims 241/242 — `on_main` picks the dispatch
 /// leg ([`objc_bridge::try_send_full`] vs [`try_send_full_on_main`]);
 /// everything before and after the call is identical, including the
 /// ownership rules (the marshalled registers are plain words either way,
@@ -2240,7 +2240,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
         return PrimResult::Fail;
     };
     // `MACVM_COCOA_DIAG=1` traces each auto-send's selector, resolved ABI
-    // shape, and the reason for any failure â€” the channel that localized the
+    // shape, and the reason for any failure — the channel that localized the
     // nil-SEL menu-init bug. Cached: cocoa sends are rare, but one atomic load
     // beats an env lookup per send.
     let diag = {
@@ -2274,7 +2274,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
     }
     // The ownership gate, same rule as prim 240: a +1-family result must
     // be taken as an id. Real family methods always return `@`; a family
-    // NAME on a non-object return is the annotated-corner smell â€” refuse.
+    // NAME on a non-object return is the annotated-corner smell — refuse.
     let fam = objc_bridge::selector_family(&sel);
     if fam != objc_bridge::Family::Plus0 && shape.ret != ObjcRet::Id {
         if diag {
@@ -2363,7 +2363,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
                 } else {
                     return PrimResult::Fail;
                 };
-                // BOOL is 1 byte â€” register-only: a spilled BOOL packs to
+                // BOOL is 1 byte — register-only: a spilled BOOL packs to
                 // natural size on Darwin, so an 8-byte spill word would
                 // shift every later stack offset (C2 review).
                 if ng >= SEND_GPR_SLOTS {
@@ -2375,7 +2375,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
                 let Some(v) = as_i64(a) else {
                     return PrimResult::Fail;
                 };
-                // Range-check against the DECLARED width â€” the callee
+                // Range-check against the DECLARED width — the callee
                 // reads exactly that many bits; silently truncating a
                 // too-big SmallInteger would be a wrong answer.
                 let fits = if *signed {
@@ -2398,7 +2398,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
                     return PrimResult::Fail;
                 }
                 // Narrow integers refuse to SPILL (Darwin packs stack
-                // args to natural size â€” the C2 review's mis-marshal
+                // args to natural size — the C2 review's mis-marshal
                 // finding); registers are width-agnostic and always fine.
                 if *bits < 64 && ng >= SEND_GPR_SLOTS {
                     return PrimResult::Fail;
@@ -2419,12 +2419,12 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
                 if nf >= SEND_FPR_SLOTS {
                     return PrimResult::Fail;
                 }
-                // The f32 bits ride the d-register's LOW half â€” exactly
+                // The f32 bits ride the d-register's LOW half — exactly
                 // the callee's `s`-register view of the same register.
                 push_f!(f64::from_bits((v as f32).to_bits() as u64));
             }
             ObjcArg::Sel => {
-                // `nil` marshals to a NULL SEL â€” a legitimate AppKit idiom
+                // `nil` marshals to a NULL SEL — a legitimate AppKit idiom
                 // (e.g. a submenu-holding `NSMenuItem`'s `action: nil`, or any
                 // `target:action:` cleared to no-action). Only a NON-nil value
                 // must be a selector name.
@@ -2489,7 +2489,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
 
     // The hop takes result OWNERSHIP on the main thread (C3 review): a +0
     // object result is retained INSIDE the hop (before main's pools can
-    // pop it), a char* result is copied to owned bytes there â€” so the VM
+    // pop it), a char* result is copied to owned bytes there — so the VM
     // thread always receives a +1 id (`hop_owned_id`, wrapped with
     // wrap_owned) or owned Rust memory (`hop_bytes`), never a pointer
     // whose lifetime main still controls.
@@ -2519,7 +2519,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
         Ok(o) => o,
         Err(desc) => {
             // ns_consumes_self holds on the throw path (C1 review). An
-            // un-enabled hop fails BEFORE the send ran â€” but the hop error
+            // un-enabled hop fails BEFORE the send ran — but the hop error
             // and a thrown NSException are indistinguishable here, and
             // consuming on both keeps the bias leak-side either way.
             if fam == objc_bridge::Family::Init {
@@ -2538,7 +2538,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
             let id = out.gpr[0] as *mut std::os::raw::c_void;
             PrimResult::Ok(if hop_owned_id {
                 // The hop already secured the +1 ON MAIN (retain for
-                // Plus0, the family's own +1 otherwise) â€” a retaining
+                // Plus0, the family's own +1 otherwise) — a retaining
                 // wrap here would double-own.
                 objc_bridge::wrap_owned(vm, id)
             } else {
@@ -2552,7 +2552,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
         }),
         ObjcRet::Int { signed, bits } => {
             // Truncate to the DECLARED width, then sign-/zero-extend from
-            // there (the #i32 lesson at every width â€” a callee returning
+            // there (the #i32 lesson at every width — a callee returning
             // `c`/`s`/`i` writes only that many meaningful bits, upper
             // bits unspecified). A char return is a SmallInteger, never a
             // Boolean: on arm64 BOOL encodes `B`.
@@ -2571,7 +2571,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
                     32 => (raw & 0xFFFF_FFFF) as i64,
                     _ => {
                         if raw > crate::oops::layout::SMI_MAX as u64 {
-                            // NSNotFound territory â€” report, don't wrap wrong.
+                            // NSNotFound territory — report, don't wrap wrong.
                             return PrimResult::Fail;
                         }
                         raw as i64
@@ -2599,7 +2599,7 @@ fn cocoa_send_auto_impl(vm: &mut VmState, args: &[Oop], on_main: bool) -> PrimRe
             PrimResult::Ok(a.oop())
         }
         ObjcRet::CharStar => {
-            // Copied to owned bytes BEFORE any pool can drain them â€” on
+            // Copied to owned bytes BEFORE any pool can drain them — on
             // the MAIN thread for a hopped send (the copy came back in
             // `hop_bytes`), on this thread otherwise.
             let bytes = if on_main {
@@ -2640,9 +2640,9 @@ fn prim_cocoa_send2(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 
 /// `ObjcRef >> primSendI64:` (234): a send whose GPR result is an
 /// NSInteger/NSUInteger, answered as a SmallInteger. Fails if the value
-/// can't be a smi (a >2^61 NSUInteger â€” report, don't wrap wrong), and
+/// can't be a smi (a >2^61 NSUInteger — report, don't wrap wrong), and
 /// REFUSES +1-family selectors before sending (the result would be an
-/// owned object this integer path can never own â€” C1 review finding).
+/// owned object this integer path can never own — C1 review finding).
 #[cfg(target_os = "macos")]
 fn prim_cocoa_send_i64(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(target) = crate::runtime::objc_bridge::read_id(vm, args[0]) else {
@@ -2678,7 +2678,7 @@ fn prim_cocoa_send_i64(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `ObjcRef >> primSendString:` (235): a send answering an NSString, copied
-/// out as a fresh Smalltalk String (design Â§2 clause 3 â€” data crosses by
+/// out as a fresh Smalltalk String (design §2 clause 3 — data crosses by
 /// copy; the intermediate NSString stays +0 under the bottom pool).
 /// +1-family selectors are refused before sending, same as 234: the +1
 /// NSString would leak invisibly behind the copy.
@@ -2712,7 +2712,7 @@ fn prim_cocoa_send_string(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `ObjcRef >> primRelease` (236): release-with-poison. A double release
-/// fails cleanly (the leak-side bias, design Â§3.3).
+/// fails cleanly (the leak-side bias, design §3.3).
 #[cfg(target_os = "macos")]
 fn prim_cocoa_release(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     if crate::runtime::objc_bridge::release(vm, args[0]) {
@@ -2723,7 +2723,7 @@ fn prim_cocoa_release(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `Cocoa class >> primNSString:` (237): a Smalltalk String copied into a
-/// fresh NSString, wrapped (+0 return â†’ wrap retains).
+/// fresh NSString, wrapped (+0 return → wrap retains).
 #[cfg(target_os = "macos")]
 fn prim_cocoa_nsstring(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(s) = string_arg(vm, args[1]) else {
@@ -2755,14 +2755,14 @@ fn prim_cocoa_is_valid(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     })
 }
 
-/// `Cocoa class >> primNewAction:` (243) â€” C4: mint a `MacvmAction`
+/// `Cocoa class >> primNewAction:` (243) — C4: mint a `MacvmAction`
 /// target/action trampoline bound to `ticket`. The `{#cocoaEvent. ticket}`
 /// fire payload is pickled HERE, on the VM thread, and stored with the
-/// registry entry â€” the ObjC-side fire IMP never sees a VmState. Routes to
+/// registry entry — the ObjC-side fire IMP never sees a VmState. Routes to
 /// THIS VM's own inbox (`self_inbox_sender`): a Primary posts to itself
-/// (unchanged C4/CocoaPad behaviour); a Worker â€” the Cocoa GUI's UI worker â€”
+/// (unchanged C4/CocoaPad behaviour); a Worker — the Cocoa GUI's UI worker —
 /// posts along its `to_primary` link, lifting the primary-only refusal
-/// (`cocoa_gui_design.md` Â§4.3, review item 5). Fails cleanly only when the VM
+/// (`cocoa_gui_design.md` §4.3, review item 5). Fails cleanly only when the VM
 /// has no worker role at all (no inbox to post to).
 #[cfg(target_os = "macos")]
 fn prim_cocoa_new_action(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -2774,7 +2774,7 @@ fn prim_cocoa_new_action(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     };
     // Build {#cocoaEvent. ticket} in-heap, pickle it, drop the oops. The
     // interned Symbol rides a handle across the Array allocation; the
-    // ticket is a smi (an immediate â€” no move can stale it).
+    // ticket is a smi (an immediate — no move can stale it).
     let scope = crate::memory::handles::HandleScope::enter(vm);
     let sym = vm.universe.intern(b"cocoaEvent");
     let sym_h = scope.handle(vm, sym.oop());
@@ -2790,15 +2790,15 @@ fn prim_cocoa_new_action(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `MacvmDelegate class >> primNewDelegate:ticket:` (249) â€” C6 reverse dispatch
-/// (`cocoa_gui_design.md` Â§4, CG3): mint a per-role ObjC delegate/data-source
-/// instance (`args[1]` a role Symbol â€” `#window`/`#text`/`#table`/`#outline`)
+/// `MacvmDelegate class >> primNewDelegate:ticket:` (249) — C6 reverse dispatch
+/// (`cocoa_gui_design.md` §4, CG3): mint a per-role ObjC delegate/data-source
+/// instance (`args[1]` a role Symbol — `#window`/`#text`/`#table`/`#outline`)
 /// bound Rust-side to `(current UI-VM generation, args[2] ticket)`. The world-
-/// side `MacvmDelegate` class owns the ticketâ†’receiver map; the ObjC selectors
+/// side `MacvmDelegate` class owns the ticket→receiver map; the ObjC selectors
 /// this instance answers dispatch synchronously as top-level entries into THIS
 /// VM (`objc_delegate`). Works from ANY VM role, including the Worker UI worker:
 /// unlike a C4 action it posts no envelope, so it needs no inbox sender (design
-/// Â§4.3). Answers a +1 id (alloc/init â€” wrapped with `wrap_owned`).
+/// §4.3). Answers a +1 id (alloc/init — wrapped with `wrap_owned`).
 #[cfg(target_os = "macos")]
 fn prim_cocoa_new_delegate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(role) = crate::oops::wrappers::SymbolOop::try_from(args[1]).map(|s| s.as_string())
@@ -2808,7 +2808,7 @@ fn prim_cocoa_new_delegate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(ticket) = SmallInt::try_from(args[2]) else {
         return PrimResult::Fail;
     };
-    // The generation live NOW (design Â§4.3): a callback later refuses to dispatch
+    // The generation live NOW (design §4.3): a callback later refuses to dispatch
     // if the UI worker has since been restarted past this generation.
     let gen = crate::embed::current_ui_vm_generation();
     match crate::runtime::objc_delegate::new_delegate(&role, gen, ticket.value()) {
@@ -2817,7 +2817,7 @@ fn prim_cocoa_new_delegate(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `Cocoa class >> primPoolPush` (244) â€” open a `poolDo:` mint-list scope:
+/// `Cocoa class >> primPoolPush` (244) — open a `poolDo:` mint-list scope:
 /// a fresh in-heap list `[count(smi)=0, 8 slots]` pushed on the rooted
 /// stack. Every wrapper minted while the scope is open is appended
 /// (objc_bridge::mint_note), surviving any number of collections because
@@ -2830,8 +2830,8 @@ fn prim_cocoa_pool_push(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(args[0])
 }
 
-/// `Cocoa class >> primPoolPop` (245) â€” close the innermost mint-list
-/// scope and answer its list (`[count, w1..wN, nilsâ€¦]`) for the world's
+/// `Cocoa class >> primPoolPop` (245) — close the innermost mint-list
+/// scope and answer its list (`[count, w1..wN, nils…]`) for the world's
 /// release sweep. Fails if no scope is open (an unbalanced pop).
 #[cfg(target_os = "macos")]
 fn prim_cocoa_pool_pop(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -2842,7 +2842,7 @@ fn prim_cocoa_pool_pop(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-// --- smi group (SPEC Â§10 appendix) ------------------------------------------
+// --- smi group (SPEC §10 appendix) ------------------------------------------
 
 
 // WINVM: the Cocoa bridge is macOS-only; on other platforms every cocoa
@@ -3160,7 +3160,7 @@ fn prim_byte_size(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
 
 /// Copies `arg3[1 .. to-from+1]` (source always addressed from 1,
 /// independent of `from`) into `receiver[from..to]`. `to < from` is a
-/// no-op. Same-object overlap is handled via an intermediate buffer â€” the
+/// no-op. Same-object overlap is handled via an intermediate buffer — the
 /// heap accessor discipline (`oops::heap`) never exposes a raw `&mut [u8]`
 /// into the heap, so there is no slice to `copy_within` on directly.
 fn prim_replace_from_to_with(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -3236,9 +3236,9 @@ fn prim_compare(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(r).oop())
 }
 
-// --- block-value group (SPEC Â§10, S4) ----------------------------------------
-// Layer boundary (sprint_s04_detail.md Â§Layer boundaries): the arrow from
-// runtime/ into interpreter/ is allowed ONLY for this Activated family â€”
+// --- block-value group (SPEC §10, S4) ----------------------------------------
+// Layer boundary (sprint_s04_detail.md §Layer boundaries): the arrow from
+// runtime/ into interpreter/ is allowed ONLY for this Activated family —
 // these primitives never touch InterpRegs directly, they just delegate to
 // `interpreter::blocks::activate_block`.
 
@@ -3271,7 +3271,7 @@ fn prim_value3(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// Spreads `args[1]` (an `Array` whose size must equal the block's argc) in
-/// place on the operand stack â€” pure stack surgery, no allocation. Checks
+/// place on the operand stack — pure stack surgery, no allocation. Checks
 /// the size *before* popping the array (Pitfalls: never allocate/mutate on
 /// a still-unvalidated argument).
 fn prim_value_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -3293,9 +3293,9 @@ fn prim_value_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     crate::interpreter::blocks::activate_block_interp(vm, cl, n)
 }
 
-/// SPEC Â§5.4 Algorithm 6: `ensure:`/`ifCurtailed:` both activate the
+/// SPEC §5.4 Algorithm 6: `ensure:`/`ifCurtailed:` both activate the
 /// receiver (the protected block, argc 0), then arm the handler as that
-/// *new* activation's marker â€” the marker lives on the protected block's
+/// *new* activation's marker — the marker lives on the protected block's
 /// own frame, never on a frame of its own for `ensure:` itself.
 fn prim_ensure_like(
     vm: &mut VmState,
@@ -3312,7 +3312,7 @@ fn prim_ensure_like(
         return PrimResult::Fail;
     }
     // `activate_block` computes the new frame's receiver-arg slot as
-    // `sp - argc - 1` on the CALLER's stack â€” but the caller's stack here
+    // `sp - argc - 1` on the CALLER's stack — but the caller's stack here
     // still holds the handler as `ensure:`'s own keyword argument, one
     // slot above `protected`. Drop it (already captured in `handler`
     // above) so `sp - 1` lands on `protected`, matching a plain `value`
@@ -3320,7 +3320,7 @@ fn prim_ensure_like(
     vm.stack.sp -= 1;
     // `activate_block_interp`, NOT the trigger-bearing `activate_block`
     // (S24 A1): the marker set below lives ON the protected block's
-    // interpreter frame â€” it is what `do_return` intercepts for the
+    // interpreter frame — it is what `do_return` intercepts for the
     // normal-completion handler run and what `continue_unwind`'s scan
     // finds for the NLR case. The compiled path completes the whole block
     // INSIDE the primitive (no frame, `Completed`/`Nlr`, never
@@ -3338,7 +3338,7 @@ fn prim_ensure_like(
 
 // --- reflection group ---------------------------------------------------------
 
-/// `anObject respondsTo: #foo` â€” does a lookup from the receiver's klass find
+/// `anObject respondsTo: #foo` — does a lookup from the receiver's klass find
 /// the selector? Answers the question directly through the SAME chain walk
 /// (and lookup cache) real dispatch uses, rather than the Smalltalk-level
 /// alternative of materializing every class's `selectorsOf:` Array up the
@@ -3352,19 +3352,19 @@ fn prim_responds_to(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(bool_oop(vm, found))
 }
 
-/// `anObject shallowCopy` â€” a fresh object of the receiver's exact klass and
+/// `anObject shallowCopy` — a fresh object of the receiver's exact klass and
 /// size, with every named instance variable and every indexed element copied
 /// verbatim (one level deep; the elements themselves are shared).
 ///
 /// FAILS (so the Smalltalk fallback answers `self`) for anything that is not a
 /// copyable heap shape: immediates (smis/chars), Doubles, and the internal
-/// Klass/Method/Closure/Context/Process formats â€” all either value-like or
+/// Klass/Method/Closure/Context/Process formats — all either value-like or
 /// not meaningfully duplicable. `Symbol` is IndexableBytes and so *would* copy
 /// here; 32_object_ext.mst overrides it back to `^self`, because a Symbol's
 /// whole contract is that identity IS equality.
 fn prim_shallow_copy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(src) = MemOop::try_from(args[0]) else {
-        return PrimResult::Fail; // immediate â€” the fallback answers self
+        return PrimResult::Fail; // immediate — the fallback answers self
     };
     let klass = src.klass();
     let format = klass.format();
@@ -3375,7 +3375,7 @@ fn prim_shallow_copy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         _ => return PrimResult::Fail,
     };
 
-    // The allocation below can scavenge, which MOVES the receiver â€” every read
+    // The allocation below can scavenge, which MOVES the receiver — every read
     // of `src` after it must go through the handle, never the stale local.
     // (`alloc_words` roots the klass it is handed itself, so `klass` needs no
     // handle of its own.)
@@ -3393,7 +3393,7 @@ fn prim_shallow_copy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         copy.set_body_oop(i, src.body_oop(i));
     }
     match format {
-        // Body layout is [named ivars][size slot][elements] â€” element i sits
+        // Body layout is [named ivars][size slot][elements] — element i sits
         // at body index `named + 1 + i` (`heap::instance_size_words`).
         Format::IndexableOops => {
             for i in 0..len {
@@ -3413,7 +3413,7 @@ fn prim_shallow_copy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(copy.oop())
 }
 
-/// `aBlock numArgs` â€” the block's declared argument count, straight off its
+/// `aBlock numArgs` — the block's declared argument count, straight off its
 /// CompiledBlock.
 fn prim_block_num_args(_vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let Some(closure) = crate::oops::wrappers::ClosureOop::try_from(args[0]) else {
@@ -3452,14 +3452,14 @@ fn prim_millisecond_clock(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(millis).oop())
 }
 
-/// `Smalltalk gcScavenge` (SPEC Â§10 system group): runs one young-gen
+/// `Smalltalk gcScavenge` (SPEC §10 system group): runs one young-gen
 /// collection, answers the receiver. A stall here is handled exactly like
-/// the allocation cascade's own terminal stall (`alloc::stall_exit`) â€” an
+/// the allocation cascade's own terminal stall (`alloc::stall_exit`) — an
 /// explicit `gcScavenge` call finding no way forward is just as fatal as
 /// one the allocator triggered itself, not a different situation.
 fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     // S12 step 7: S11 D8's defer arm (`if compiled_depth > 0 {
-    // request_pending_gc(...); return }`) lived here and is DELETED â€” a
+    // request_pending_gc(...); return }`) lived here and is DELETED — a
     // scavenge under a live compiled frame is now an ordinary, fully
     // rooted collection (`roots::each_code_root`), so this primitive
     // always collects immediately, at any depth.
@@ -3468,24 +3468,24 @@ fn prim_gc_scavenge(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         alloc::stall_exit(err);
     }
     // `prim_arg(0)`, NOT `args[0]`: the scavenge above may have MOVED the
-    // receiver, and `args` is a pre-call copy of raw bits (SPEC Â§10
-    // Pitfalls â€” re-read every arg through the live stack slot after any
+    // receiver, and `args` is a pre-call copy of raw bits (SPEC §10
+    // Pitfalls — re-read every arg through the live stack slot after any
     // allocating/collecting call). Latent since S8, unreachable until now:
     // every real sender was `Smalltalk gcScavenge`, and the `smalltalk`
     // singleton is tenured by the time user code runs, so the stale copy
-    // always happened to equal the live slot. A YOUNG receiver â€” exactly
-    // what `mid_loop_forced_scavenge`'s own `p scav` sends â€” moves, and
+    // always happened to equal the live slot. A YOUNG receiver — exactly
+    // what `mid_loop_forced_scavenge`'s own `p scav` sends — moves, and
     // returning the stale copy would resurrect its vacated address as a
     // value.
     PrimResult::Ok(vm.prim_arg(0))
 }
 
-/// `Smalltalk gcFull` (SPEC Â§10 system group): runs the full mark-slide-
+/// `Smalltalk gcFull` (SPEC §10 system group): runs the full mark-slide-
 /// compact collection, answers the receiver. `full_gc` never actually
-/// returns `Err` (pure compaction needs no new memory â€” see its own doc);
+/// returns `Err` (pure compaction needs no new memory — see its own doc);
 /// the `expect` documents that rather than silently discarding a `Result`.
 fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
-    // S12 step 7: defer arm deleted, receiver re-read live â€” both for
+    // S12 step 7: defer arm deleted, receiver re-read live — both for
     // exactly `prim_gc_scavenge`'s reasons (see its comments; a full GC's
     // compaction slides young AND old objects, so the stale-`args[0]`
     // hazard is even broader here).
@@ -3495,25 +3495,25 @@ fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(vm.prim_arg(0))
 }
 
-/// `Smalltalk gcStats` (SPEC Â§10 dev hook, S8): answers an 8-element Array
+/// `Smalltalk gcStats` (SPEC §10 dev hook, S8): answers an 8-element Array
 /// of smis in the SPEC-pinned order `(scavengeCount fullGcCount edenUsed
-/// oldUsed oldCommitted bytesPromoted markedBytesLast contextAllocs)` â€”
+/// oldUsed oldCommitted bytesPromoted markedBytesLast contextAllocs)` —
 /// used by the soak harness and S14's Context-elision gate, which both
 /// index into it by POSITION, so this order is load-bearing, not
 /// cosmetic. `can_allocate: true` (the result Array itself allocates); no
 /// arg oops are read after the allocation, so there is nothing here for
 /// that to invalidate.
-/// R1 reflection (`docs/APPS.md` Â§3): every class object in the system, as an
+/// R1 reflection (`docs/APPS.md` §3): every class object in the system, as an
 /// `Array`. Walks the global namespace (`vm.universe.smalltalk`: slot 0 is the
 /// tally, then `tally` Associations) and collects each association value that
-/// is a klass â€” the image-side `ClassMirror` filters these by `superclass` to
+/// is a klass — the image-side `ClassMirror` filters these by `superclass` to
 /// compute subclasses (the VM keeps no subclass index, exactly as Strongtalk's
 /// `ClassVMMirror` walks `Smalltalk classesDo:`). Receiver/args are ignored.
 ///
 /// GC-safe two-pass: pass 1 counts (no allocation); `alloc_indexable_oops` may
 /// then scavenge, so pass 2 re-reads `vm.universe.smalltalk` (a scanned root,
 /// updated across the collection) rather than caching any oop across the alloc.
-/// `Object >> perform:withArguments:` (64) â€” a dynamic send: look the
+/// `Object >> perform:withArguments:` (64) — a dynamic send: look the
 /// `selector` (a Symbol) up on the receiver's class and invoke the found
 /// method with the elements of `argsArray` spread as its arguments,
 /// answering the result. This is Smalltalk's reflective "call a method by
@@ -3525,11 +3525,11 @@ fn prim_gc_full(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// Fails cleanly (the world fallback raises) on: a non-Symbol selector, a
 /// non-Array args, an argc mismatch between the array and the resolved
 /// method, or a selector the receiver's class does not implement
-/// (`doesNotUnderstand:` territory â€” reported by the world method rather
+/// (`doesNotUnderstand:` territory — reported by the world method rather
 /// than silently). The heavy lifting is [`run_method_reentrant`], the same
 /// synchronous-nested-invoke `rt_dnu` uses: it handles a primitive,
 /// compiled, or interpreted target uniformly and returns the result oop.
-/// NON-shimmable for the same reason as `primEvalDoit:` (250) â€” see
+/// NON-shimmable for the same reason as `primEvalDoit:` (250) — see
 /// `compiler::driver::PRIM_REENTERS_INTERPRETER`: the nested run needs the
 /// c2i bracket when the caller is compiled, and a `PrimFn` body cannot
 /// supply it correctly for both of its entry doors.
@@ -3544,14 +3544,14 @@ fn prim_perform_with_arguments(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let n = arr.len();
     let k = klass_of(vm, receiver);
     let Some(method) = crate::runtime::lookup::lookup(vm, k, sel) else {
-        return PrimResult::Fail; // not understood â€” world fallback raises
+        return PrimResult::Fail; // not understood — world fallback raises
     };
     if method.argc() != n {
         return PrimResult::Fail; // wrong number of arguments for this method
     }
     // Root the receiver, the resolved method, and every argument across
     // the nested run (which allocates freely), then materialize the call
-    // slice fresh immediately before invoking â€” nothing allocates between
+    // slice fresh immediately before invoking — nothing allocates between
     // `get` and `run_method_reentrant`'s own receiver/args push.
     let scope = crate::memory::handles::HandleScope::enter(vm);
     let recv_h = scope.handle(vm, receiver);
@@ -3608,9 +3608,9 @@ fn prim_all_classes(vm: &mut VmState, _args: &[Oop]) -> PrimResult {
     PrimResult::Ok(result.oop())
 }
 
-/// R2 reflection (`docs/APPS.md` Â§3): the selectors a behavior defines *in
+/// R2 reflection (`docs/APPS.md` §3): the selectors a behavior defines *in
 /// its own* method dictionary (not inherited), as an `Array` of `Symbol`s in
-/// unspecified order (the caller sorts). `args[1]` is the behavior â€” pass a
+/// unspecified order (the caller sorts). `args[1]` is the behavior — pass a
 /// class for its instance selectors, `aClass class` (the metaclass) for its
 /// class-side selectors. A behavior with no method dictionary yet answers an
 /// empty `Array`.
@@ -3648,8 +3648,8 @@ fn prim_selectors_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(result.oop())
 }
 
-/// R2 reflection (`docs/APPS.md` Â§3): a class's OWN instance-variable names (not
-/// inherited), as an `Array` of `Symbol`s in declaration order â€” the variable
+/// R2 reflection (`docs/APPS.md` §3): a class's OWN instance-variable names (not
+/// inherited), as an `Array` of `Symbol`s in declaration order — the variable
 /// half of source-level reflection, the analogue of `selectorsOf:`. `args[1]` is
 /// the class. A FRESH array is answered (never the Klass's own `inst_var_names`
 /// array), so a caller can't mutate the class's shape. GC-safe: the behavior is
@@ -3733,9 +3733,9 @@ fn prim_primitive_of(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 /// R2 reflection (senders): does `behavior`'s method for `msel` (`args[2]`)
 /// SEND `target` (`args[3]`)? Scans the method's inline-cache side table
 /// (`ics`, one stride-`IC_STRIDE` slot per send site, the selector at
-/// `IC_SEL_OFFSET`) â€” selectors are interned, so an identity compare suffices.
-/// `false` if the method is undefined here. (Sends inlined by the compiler â€”
-/// `ifTrue:` etc. â€” have no IC and so aren't counted, same limit Strongtalk's
+/// `IC_SEL_OFFSET`) — selectors are interned, so an identity compare suffices.
+/// `false` if the method is undefined here. (Sends inlined by the compiler —
+/// `ifTrue:` etc. — have no IC and so aren't counted, same limit Strongtalk's
 /// own senders had.)
 fn prim_method_sends(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     use crate::oops::layout::{IC_SEL_OFFSET, IC_STRIDE};
@@ -3796,14 +3796,14 @@ fn prim_gc_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 }
 
 /// `__vmStats` (S15 A8 dev hook): answers a 16-element Array of smis in
-/// PINNED order â€” `(icMisses picExtends megaTransitions compilations
+/// PINNED order — `(icMisses picExtends megaTransitions compilations
 /// recompiles recompileDeclined deoptCount deoptTrap deoptReturn deoptPoll
 /// osrEntries osrDeclined scavengeCount fullGcCount contextsAllocated
-/// bytesPromoted)` â€” the tier/dispatch/speculation twin of `gcStats`
+/// bytesPromoted)` — the tier/dispatch/speculation twin of `gcStats`
 /// (same positional-array convention, same reason: harnesses index by
 /// position, so the order is load-bearing). Values are captured BEFORE
 /// the result Array allocates, so the allocation cannot skew them beyond
-/// its own GC side effects (which land AFTER the snapshot â€” acceptable
+/// its own GC side effects (which land AFTER the snapshot — acceptable
 /// for a diagnostics hook).
 fn prim_vm_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let smi = |v: u64| SmallInt::new(v as i64).oop();
@@ -3841,12 +3841,12 @@ fn prim_vm_stats(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(result.oop())
 }
 
-/// SPEC Â§6.3: prints the message + a VM stack trace, terminates. Never
+/// SPEC §6.3: prints the message + a VM stack trace, terminates. Never
 /// returns (its Rust return type is only `PrimResult` so it fits the
-/// `PrimFn` signature â€” `std::process::exit`'s `!` unifies with it).
-/// DBG4 `halt` (Object) â€” the programmer's `debugger;` statement: open the
+/// `PrimFn` signature — `std::process::exit`'s `!` unifies with it).
+/// DBG4 `halt` (Object) — the programmer's `debugger;` statement: open the
 /// debugger HERE when one is armed, then continue normally (unlike `error:`,
-/// `halt` is NOT terminal â€” a resume falls through and returns self). A no-op
+/// `halt` is NOT terminal — a resume falls through and returns self). A no-op
 /// when no debugger is active. `session_depth` already guards the debugger's
 /// own print-eval doits from recursively halting.
 fn prim_halt(vm: &mut VmState, args: &[Oop]) -> PrimResult {
@@ -3871,8 +3871,8 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let _ = writeln!(vm.out, "Error: {text}");
     crate::runtime::error::print_stack_trace(vm);
     let _ = vm.out.flush();
-    // DBG1 (docs/DEBUGGER.md Â§3.1): when the debugger is active, a fatal
-    // guest error becomes an inspectable stop â€” the halt loop opens on the
+    // DBG1 (docs/DEBUGGER.md §3.1): when the debugger is active, a fatal
+    // guest error becomes an inspectable stop — the halt loop opens on the
     // erring activation. The error stays terminal on resume (`error:` has
     // no proceed semantics in v1); the halt is for looking, not healing.
     if crate::runtime::debug::wants_error_halt(vm) {
@@ -3886,12 +3886,12 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
             );
         }
     }
-    // DBG0 (docs/DEBUGGER.md Â§4.1): a fatal guest error gets the PROBE
-    // mini-dossier â€” walkback + tier-link/anchor state + recent-history
+    // DBG0 (docs/DEBUGGER.md §4.1): a fatal guest error gets the PROBE
+    // mini-dossier — walkback + tier-link/anchor state + recent-history
     // ring + heap verify. No signal machinery: the interpreter is coherent
     // here. `MACVM_PROBE=off` silences it for exact-stderr golden tests.
     // Skipped when a recovery is actually about to happen (embedded
-    // `VmHandle::eval`, `deopt_trap::raise_guest_fatal` below) â€” see
+    // `VmHandle::eval`, `deopt_trap::raise_guest_fatal` below) — see
     // `dnu_fallback`'s identical reasoning.
     if !crate::codecache::deopt_trap::has_registered_jmp_slot()
         && crate::runtime::probe::guest_report_enabled()
@@ -3899,7 +3899,7 @@ fn prim_error(vm: &mut VmState, args: &[Oop]) -> PrimResult {
         crate::runtime::probe::fatal_guest_report(vm, &format!("error: {text}"));
     }
     // An error curtails everything between here and the entry frame, so the
-    // armed ensure:/ifCurtailed: blocks must run â€” the jump below is a raw
+    // armed ensure:/ifCurtailed: blocks must run — the jump below is a raw
     // register restore that would otherwise skip straight past them. After
     // the report above, so the error's own diagnosis stays intact.
     crate::interpreter::unwind::run_curtailment_blocks_on_error(vm);
@@ -3915,7 +3915,7 @@ fn prim_quit_colon(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(args[0])
 }
 
-// --- Double group (S6, SPEC Â§1.3) --------------------------------------------
+// --- Double group (S6, SPEC §1.3) --------------------------------------------
 
 fn double2(
     args: &[Oop],
@@ -3953,7 +3953,7 @@ fn prim_double_mul(vm: &mut VmState, args: &[Oop]) -> PrimResult {
 fn prim_double_div(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match double2(args) {
         // IEEE division by zero yields inf/nan, never fails (pinned,
-        // sprint_s06_detail.md Â§08 Double) â€” only a non-Double arg fails.
+        // sprint_s06_detail.md §08 Double) — only a non-Double arg fails.
         Some((a, b)) => PrimResult::Ok(alloc::alloc_double(vm, a.value() / b.value()).oop()),
         None => PrimResult::Fail,
     }
@@ -3973,7 +3973,7 @@ fn prim_double_eq(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// libm transcendentals â€” one shape, six functions: unbox the Double
+/// libm transcendentals — one shape, six functions: unbox the Double
 /// receiver, call the (state-preserving, AAPCS64) libm routine via Rust's
 /// f64 methods, box the result. Fails only on a non-Double receiver.
 macro_rules! prim_double_unary {
@@ -3993,9 +3993,9 @@ prim_double_unary!(prim_double_exp, exp);
 prim_double_unary!(prim_double_ln, ln);
 prim_double_unary!(prim_double_atan, atan);
 
-// â”€â”€ SIMD Float64x2 helpers + primitives (docs/SIMD.md) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── SIMD Float64x2 helpers + primitives (docs/SIMD.md) ────────────────────
 //
-// Read the two f64 lanes of a Float64x2 receiver â€” checks the KLASS, not the
+// Read the two f64 lanes of a Float64x2 receiver — checks the KLASS, not the
 // format: Float64x2 shares `Format::Double` with a scalar Double (both raw
 // bodies), so a format-based wrapper would silently read a Double's single
 // lane as a vector. body_word_raw{0,1} are the two 16-byte-body lanes.
@@ -4011,7 +4011,7 @@ fn as_float64x2(vm: &VmState, o: Oop) -> Option<(f64, f64)> {
 }
 
 /// A scalar lane argument (a constructor operand): a Double, or a
-/// SmallInteger coerced â€” so `Float64x2 x: 1 y: 2` is as friendly as
+/// SmallInteger coerced — so `Float64x2 x: 1 y: 2` is as friendly as
 /// `x: 1.0 y: 2.0`.
 fn as_scalar_f64(vm: &VmState, o: Oop) -> Option<f64> {
     if let Some(n) = SmallInt::try_from(o) {
@@ -4032,7 +4032,7 @@ fn prim_x2_xy(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `Float64x2 splat: v` â€” broadcast one scalar to both lanes.
+/// `Float64x2 splat: v` — broadcast one scalar to both lanes.
 fn prim_x2_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match as_scalar_f64(vm, args[1]) {
         Some(v) => PrimResult::Ok(alloc::alloc_float64x2(vm, v, v)),
@@ -4040,7 +4040,7 @@ fn prim_x2_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// Elementwise binary op on two Float64x2 â€” each lane a single IEEE f64 op,
+/// Elementwise binary op on two Float64x2 — each lane a single IEEE f64 op,
 /// bit-identical to the per-lane scalar Double op (the invariant the JIT
 /// vector fast-path must also honour).
 macro_rules! prim_x2_binop {
@@ -4060,7 +4060,7 @@ prim_x2_binop!(prim_x2_sub, -);
 prim_x2_binop!(prim_x2_mul, *);
 prim_x2_binop!(prim_x2_div, /);
 
-/// `aFloat64x2 at: i` â€” lane 1 or 2 as a Double (1-based, Smalltalk).
+/// `aFloat64x2 at: i` — lane 1 or 2 as a Double (1-based, Smalltalk).
 fn prim_x2_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let (a, b) = match as_float64x2(vm, args[0]) {
         Some(v) => v,
@@ -4078,10 +4078,10 @@ fn prim_x2_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, lane).oop())
 }
 
-// â”€â”€ SIMD Float32x4 helpers + primitives (docs/SIMD.md) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── SIMD Float32x4 helpers + primitives (docs/SIMD.md) ────────────────────
 //
 // Read the four f32 lanes of a Float32x4 receiver (KLASS-checked, like
-// Float64x2 â€” it too shares Format::Double). Lanes unpack in NEON `.4s`
+// Float64x2 — it too shares Format::Double). Lanes unpack in NEON `.4s`
 // element order: lane 0/1 = low/high 32 bits of body word 0, lane 2/3 = word
 // 1. This MUST match `alloc::alloc_float32x4`'s packing and the `ldr q`/`.4s`
 // the JIT fuse uses, so the interpreter and compiled tiers agree bit-for-bit.
@@ -4101,7 +4101,7 @@ fn as_float32x4(vm: &VmState, o: Oop) -> Option<[f32; 4]> {
 }
 
 /// A scalar lane argument narrowed to f32 (a constructor operand): a Double or
-/// a SmallInteger, rounded to f32 â€” the SAME single-precision rounding the
+/// a SmallInteger, rounded to f32 — the SAME single-precision rounding the
 /// `.4s` lanes carry.
 fn as_scalar_f32(vm: &VmState, o: Oop) -> Option<f32> {
     as_scalar_f64(vm, o).map(|v| v as f32)
@@ -4122,7 +4122,7 @@ fn prim_x4_xyzw(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `Float32x4 splat: v` â€” broadcast one scalar to all four lanes.
+/// `Float32x4 splat: v` — broadcast one scalar to all four lanes.
 fn prim_x4_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match as_scalar_f32(vm, args[1]) {
         Some(v) => PrimResult::Ok(alloc::alloc_float32x4(vm, [v, v, v, v])),
@@ -4130,7 +4130,7 @@ fn prim_x4_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// Elementwise binary op on two Float32x4 â€” each lane a single IEEE f32 op,
+/// Elementwise binary op on two Float32x4 — each lane a single IEEE f32 op,
 /// bit-identical to the `.4s` NEON lane (the invariant the JIT fuse honours).
 macro_rules! prim_x4_binop {
     ($name:ident, $op:tt) => {
@@ -4150,7 +4150,7 @@ prim_x4_binop!(prim_x4_sub, -);
 prim_x4_binop!(prim_x4_mul, *);
 prim_x4_binop!(prim_x4_div, /);
 
-/// `aFloat32x4 at: i` â€” lane 1..4 as a Double (exact f32â†’f64 widening, no
+/// `aFloat32x4 at: i` — lane 1..4 as a Double (exact f32→f64 widening, no
 /// rounding). 1-based (Smalltalk convention).
 fn prim_x4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let lanes = match as_float32x4(vm, args[0]) {
@@ -4167,13 +4167,13 @@ fn prim_x4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, lanes[(i - 1) as usize] as f64).oop())
 }
 
-// â”€â”€ SIMD Int32x4 helpers + primitives (docs/SIMD.md) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── SIMD Int32x4 helpers + primitives (docs/SIMD.md) ──────────────────────
 //
 // Read the four i32 lanes of an Int32x4 (KLASS-checked). Lanes unpack in NEON
-// `.4s` element order, identical to Float32x4's layout â€” only the type
+// `.4s` element order, identical to Float32x4's layout — only the type
 // (32-bit two's-complement integer) differs. Arithmetic WRAPS on 32-bit
 // overflow, matching NEON `add/sub/mul v.4s` (a fixed-width lane is not a
-// promote-to-BigInt Smalltalk integer â€” you asked for 32-bit lanes).
+// promote-to-BigInt Smalltalk integer — you asked for 32-bit lanes).
 fn as_int32x4(vm: &VmState, o: Oop) -> Option<[i32; 4]> {
     let m = MemOop::try_from(o)?;
     if m.klass().oop().raw() != vm.universe.int32x4_klass.oop().raw() {
@@ -4190,7 +4190,7 @@ fn as_int32x4(vm: &VmState, o: Oop) -> Option<[i32; 4]> {
 }
 
 /// A scalar lane argument truncated to a 32-bit lane: a SmallInteger's low 32
-/// bits (C-style narrowing â€” consistent with the wrapping arithmetic).
+/// bits (C-style narrowing — consistent with the wrapping arithmetic).
 fn as_scalar_i32(o: Oop) -> Option<i32> {
     SmallInt::try_from(o).map(|n| n.value() as i32)
 }
@@ -4210,7 +4210,7 @@ fn prim_i4_xyzw(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `Int32x4 splat: v` â€” broadcast one integer to all four lanes.
+/// `Int32x4 splat: v` — broadcast one integer to all four lanes.
 fn prim_i4_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match as_scalar_i32(args[1]) {
         Some(v) => PrimResult::Ok(alloc::alloc_int32x4(vm, [v, v, v, v])),
@@ -4218,7 +4218,7 @@ fn prim_i4_splat(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// Elementwise WRAPPING integer op on two Int32x4 â€” each lane a single 32-bit
+/// Elementwise WRAPPING integer op on two Int32x4 — each lane a single 32-bit
 /// two's-complement op, bit-identical to the `.4s` NEON lane (the invariant the
 /// JIT fuse honours). NO divide: NEON has no vector integer divide.
 macro_rules! prim_i4_binop {
@@ -4243,7 +4243,7 @@ prim_i4_binop!(prim_i4_add, wrapping_add);
 prim_i4_binop!(prim_i4_sub, wrapping_sub);
 prim_i4_binop!(prim_i4_mul, wrapping_mul);
 
-/// `anInt32x4 at: i` â€” lane 1..4 as a SmallInteger (an i32 always fits).
+/// `anInt32x4 at: i` — lane 1..4 as a SmallInteger (an i32 always fits).
 fn prim_i4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let lanes = match as_int32x4(vm, args[0]) {
         Some(v) => v,
@@ -4259,10 +4259,10 @@ fn prim_i4_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(SmallInt::new(lanes[(i - 1) as usize] as i64).oop())
 }
 
-// â”€â”€ SIMD level 2: FloatArray + NEON bulk kernels (docs/SIMD.md Part E) â”€â”€â”€â”€â”€
+// ── SIMD level 2: FloatArray + NEON bulk kernels (docs/SIMD.md Part E) ─────
 //
 // A FloatArray is a Format::IndexableBytes buffer of N f64 lanes (N*8 bytes,
-// GC-skipped body). Lane j (0-based) lives at body word (1 + j) â€” word 0 is
+// GC-skipped body). Lane j (0-based) lives at body word (1 + j) — word 0 is
 // the byte-count size slot (alloc_indexable_bytes). Klass-checked, like the
 // vector value classes.
 fn as_float_array(vm: &VmState, o: Oop) -> Option<MemOop> {
@@ -4275,7 +4275,7 @@ fn float_array_len(m: MemOop) -> usize {
     m.indexable_len() / 8
 }
 
-/// Copy the lanes out into an owned `Vec<f64>` â€” done BEFORE any result
+/// Copy the lanes out into an owned `Vec<f64>` — done BEFORE any result
 /// allocation so a scavenge can't leave a dangling body pointer (the vector
 /// value classes' GC lesson). The kernels then run on the slice, which LLVM
 /// auto-vectorizes to NEON `fadd v.2d` etc.
@@ -4286,7 +4286,7 @@ fn float_array_lanes(m: MemOop) -> Vec<f64> {
         .collect()
 }
 
-// The FloatArray bulk kernels are EXPLICIT hand-written NEON â€” see
+// The FloatArray bulk kernels are EXPLICIT hand-written NEON — see
 // `crate::runtime::simd_kernels` (the one module allowed `unsafe` for hardware
 // intrinsics). NOT a scalar loop left to rustc/LLVM to maybe vectorize: a
 // `<primitive:>` bulk op deliberately uses the hardware (docs/SIMD.md Part E).
@@ -4294,7 +4294,7 @@ use crate::runtime::simd_kernels::{
     neon_add, neon_max, neon_min, neon_scale, pairwise_dot, pairwise_sum,
 };
 
-/// `FloatArray new: n` (class-side; args = [class, n]) â€” n zeroed f64 lanes.
+/// `FloatArray new: n` (class-side; args = [class, n]) — n zeroed f64 lanes.
 fn prim_farray_new(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let n = match SmallInt::try_from(args[1]) {
         Some(k) if k.value() >= 0 => k.value() as usize,
@@ -4308,7 +4308,7 @@ fn prim_farray_new(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_indexable_bytes(vm, klass, nbytes).oop())
 }
 
-/// `FloatArray >> size` â†’ lane count.
+/// `FloatArray >> size` → lane count.
 fn prim_farray_size(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     match as_float_array(vm, args[0]) {
         Some(m) => PrimResult::Ok(SmallInt::new(float_array_len(m) as i64).oop()),
@@ -4316,7 +4316,7 @@ fn prim_farray_size(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// `FloatArray >> at: i` â†’ the i-th lane as a Double (1-based).
+/// `FloatArray >> at: i` → the i-th lane as a Double (1-based).
 fn prim_farray_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let m = match as_float_array(vm, args[0]) {
         Some(m) => m,
@@ -4333,7 +4333,7 @@ fn prim_farray_at(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, lane).oop())
 }
 
-/// `FloatArray >> at: i put: aDouble` â†’ aDouble (1-based; SmallInteger coerced).
+/// `FloatArray >> at: i put: aDouble` → aDouble (1-based; SmallInteger coerced).
 fn prim_farray_at_put(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let m = match as_float_array(vm, args[0]) {
         Some(m) => m,
@@ -4354,9 +4354,9 @@ fn prim_farray_at_put(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(args[2])
 }
 
-/// `FloatArray >> +@ other` â†’ a NEW FloatArray of the elementwise sums.
-/// Per-lane exact (bit-identical to scalar Double add â€” the elementwise
-/// discipline, docs/SIMD.md Â§B4). Fails on a length mismatch.
+/// `FloatArray >> +@ other` → a NEW FloatArray of the elementwise sums.
+/// Per-lane exact (bit-identical to scalar Double add — the elementwise
+/// discipline, docs/SIMD.md §B4). Fails on a length mismatch.
 fn prim_farray_add(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let (ma, mb) = match (as_float_array(vm, args[0]), as_float_array(vm, args[1])) {
         (Some(a), Some(b)) => (a, b),
@@ -4373,14 +4373,14 @@ fn prim_farray_add(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     neon_add(&a, &b, &mut c); // explicit `fadd v.2d` stream + scalar tail
     let klass = vm.universe.float_array_klass;
     let out = alloc::alloc_indexable_bytes(vm, klass, n * 8);
-    // No allocation between here and the last write â€” `out` cannot move.
+    // No allocation between here and the last write — `out` cannot move.
     for (i, &ci) in c.iter().enumerate() {
         out.as_mem().set_body_word_raw(1 + i, ci.to_bits());
     }
     PrimResult::Ok(out.oop())
 }
 
-/// `FloatArray >> sum` â†’ Double (fast pairwise NEON reduction, docs/SIMD.md D).
+/// `FloatArray >> sum` → Double (fast pairwise NEON reduction, docs/SIMD.md D).
 fn prim_farray_sum(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let m = match as_float_array(vm, args[0]) {
         Some(m) => m,
@@ -4390,7 +4390,7 @@ fn prim_farray_sum(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, pairwise_sum(&a)).oop())
 }
 
-/// `FloatArray >> dot: other` â†’ Double (fast pairwise NEON reduction). Fails
+/// `FloatArray >> dot: other` → Double (fast pairwise NEON reduction). Fails
 /// on a length mismatch.
 fn prim_farray_dot(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let (ma, mb) = match (as_float_array(vm, args[0]), as_float_array(vm, args[1])) {
@@ -4406,7 +4406,7 @@ fn prim_farray_dot(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, pairwise_dot(&a, &b)).oop())
 }
 
-/// `FloatArray >> scale: aNumber` â†’ a NEW FloatArray of the lanes times the
+/// `FloatArray >> scale: aNumber` → a NEW FloatArray of the lanes times the
 /// scalar (`explicit `fmul v.2d`; per-lane bit-identical to scalar multiply).
 fn prim_farray_scale(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let ma = match as_float_array(vm, args[0]) {
@@ -4430,9 +4430,9 @@ fn prim_farray_scale(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(out.oop())
 }
 
-/// `FloatArray >> max` â†’ Double, the largest lane (explicit `fmax v.2d`
+/// `FloatArray >> max` → Double, the largest lane (explicit `fmax v.2d`
 /// reduction; order-independent, so bit-exact). Fails on an EMPTY array (no
-/// maximum) â€” the world method turns that into a sensible error.
+/// maximum) — the world method turns that into a sensible error.
 fn prim_farray_max(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let m = match as_float_array(vm, args[0]) {
         Some(m) => m,
@@ -4445,7 +4445,7 @@ fn prim_farray_max(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     PrimResult::Ok(alloc::alloc_double(vm, neon_max(&a)).oop())
 }
 
-/// `FloatArray >> min` â†’ Double, the smallest lane (`fmin v.2d`). Fails on empty.
+/// `FloatArray >> min` → Double, the smallest lane (`fmin v.2d`). Fails on empty.
 fn prim_farray_min(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     let m = match as_float_array(vm, args[0]) {
         Some(m) => m,
@@ -4485,8 +4485,8 @@ fn prim_smi_as_double(vm: &mut VmState, args: &[Oop]) -> PrimResult {
     }
 }
 
-/// Shortest round-trip decimal text for a Double (SPEC Â§1.3's `printOn:`
-/// support) â€” mirrors `memory::print::print_f64` but without that
+/// Shortest round-trip decimal text for a Double (SPEC §1.3's `printOn:`
+/// support) — mirrors `memory::print::print_f64` but without that
 /// function's debug-printer framing (no `nan`/`inf` word wrapping beyond
 /// what Rust's own `Display` gives; String result, not a Rust `String`
 /// consumed by a printer).
@@ -4554,7 +4554,7 @@ mod tests {
     /// SIMD Float64x2 (`docs/SIMD.md`): elementwise ops are bit-identical to
     /// per-lane scalar Double arithmetic, and the raw 16-byte vector bodies
     /// survive GC. The GC point is a REGRESSION LOCK: `float64x2_klass` must be
-    /// a GC root (`memory::roots`) â€” it was missed on first wiring, and a
+    /// a GC root (`memory::roots`) — it was missed on first wiring, and a
     /// moved-but-not-updated klass pointer read poison mid-alloc. The
     /// alloc-churn loop under `gc_stress` forces the exact scavenge that
     /// caught it.
@@ -4567,7 +4567,7 @@ mod tests {
 
     #[test]
     fn float64x2_arithmetic_and_gc_survival() {
-        // Part 1 â€” bit-identity, gc_stress OFF: a handful of allocations
+        // Part 1 — bit-identity, gc_stress OFF: a handful of allocations
         // trigger no GC, so the raw local oops stay put; each lane must equal
         // the per-lane scalar Double op.
         let mut vm = test_vm();
@@ -4585,10 +4585,10 @@ mod tests {
         assert_eq!(x2_lane(&mut vm, sum, 1), 1.5 * 2.0 + 0.5);
         assert_eq!(x2_lane(&mut vm, sum, 2), 2.5 * 4.0 + 0.5);
 
-        // Part 2 â€” GC-root survival (the regression lock). Root a vector on
+        // Part 2 — GC-root survival (the regression lock). Root a vector on
         // the process stack (a real GC root, as the interpreter does), force
         // scavenges that MOVE the klass and the vector, and allocate a NEW
-        // vector across each â€” that alloc reads `float64x2_klass`, which must
+        // vector across each — that alloc reads `float64x2_klass`, which must
         // stay a live root or it poison-reads a moved klass. The rooted
         // vector's lanes must survive intact.
         let slot = vm.stack.sp;
@@ -4605,8 +4605,8 @@ mod tests {
     }
 
     /// SIMD Float32x4 (`docs/SIMD.md`): the 4-lane f32 companion. Each lane is
-    /// a single-precision op â€” bit-identical to the `.4s` NEON lane the JIT
-    /// fuse emits (all test values are exact in f32, so `at:`'s f32â†’f64
+    /// a single-precision op — bit-identical to the `.4s` NEON lane the JIT
+    /// fuse emits (all test values are exact in f32, so `at:`'s f32→f64
     /// widening is lossless and the asserts are sharp). Same GC-root
     /// regression lock as Float64x2: `float32x4_klass` must be in
     /// `memory::roots`, or an alloc after a scavenge poison-reads a moved klass.
@@ -4619,7 +4619,7 @@ mod tests {
 
     #[test]
     fn float32x4_arithmetic_and_gc_survival() {
-        // Part 1 â€” bit-identity, gc_stress OFF.
+        // Part 1 — bit-identity, gc_stress OFF.
         let mut vm = test_vm();
         let va = alloc::alloc_float32x4(&mut vm, [1.5, 2.5, 3.5, 4.5]);
         let vb = alloc::alloc_float32x4(&mut vm, [2.0, 4.0, 8.0, 16.0]);
@@ -4637,7 +4637,7 @@ mod tests {
         assert_eq!(x4_lane(&mut vm, sum, 3), ((3.5f32 * 8.0) + 0.5) as f64);
         assert_eq!(x4_lane(&mut vm, sum, 4), ((4.5f32 * 16.0) + 0.5) as f64);
 
-        // Part 2 â€” GC-root survival (the regression lock, as for Float64x2).
+        // Part 2 — GC-root survival (the regression lock, as for Float64x2).
         let slot = vm.stack.sp;
         let keep = alloc::alloc_float32x4(&mut vm, [42.0, 99.0, -7.0, 3.25]);
         vm.stack.push(keep);
@@ -4666,7 +4666,7 @@ mod tests {
 
     #[test]
     fn int32x4_wrapping_arithmetic_and_gc_survival() {
-        // Part 1 â€” arithmetic incl. 32-bit wrap, gc_stress OFF.
+        // Part 1 — arithmetic incl. 32-bit wrap, gc_stress OFF.
         let mut vm = test_vm();
         let a = alloc::alloc_int32x4(&mut vm, [1, 2, 3, i32::MAX]);
         let b = alloc::alloc_int32x4(&mut vm, [10, 20, 30, 1]);
@@ -4686,7 +4686,7 @@ mod tests {
         assert_eq!(i4_lane(&mut vm, prod, 1), 10);
         assert_eq!(i4_lane(&mut vm, prod, 4), i32::MAX as i64); // MAX*1
 
-        // Part 2 â€” GC-root survival (int32x4_klass must be a GC root).
+        // Part 2 — GC-root survival (int32x4_klass must be a GC root).
         let slot = vm.stack.sp;
         let keep = alloc::alloc_int32x4(&mut vm, [42, -99, 7, -1]);
         vm.stack.push(keep);
@@ -4704,7 +4704,7 @@ mod tests {
 
     /// SIMD level 2 (`docs/SIMD.md` Part E): the FloatArray NEON bulk-kernel
     /// primitives (`+@`/`sum`/`dot:`) compute correctly, and `float_array_klass`
-    /// is a GC root (same regression lock as the value classes â€” a moved-but-
+    /// is a GC root (same regression lock as the value classes — a moved-but-
     /// unrooted klass poison-reads mid-alloc). `sum`/`dot:` verify against the
     /// DEFINED pairwise order, NOT a scalar fold (docs/SIMD.md Part D).
     fn make_farray(vm: &mut VmState, xs: &[f64]) -> Oop {
@@ -4718,11 +4718,11 @@ mod tests {
 
     #[test]
     fn float_array_kernels_and_gc_survival() {
-        // Part 1 â€” kernel correctness (gc_stress OFF; raw locals stay put).
+        // Part 1 — kernel correctness (gc_stress OFF; raw locals stay put).
         let mut vm = test_vm();
         let a = make_farray(&mut vm, &[1.5, 2.5, 3.5, 4.5, 5.5]);
         let b = make_farray(&mut vm, &[0.5, 0.5, 0.5, 0.5, 0.5]);
-        // +@ â†’ elementwise (per-lane exact).
+        // +@ → elementwise (per-lane exact).
         let c = match call(145, &mut vm, &[a, b]) {
             PrimResult::Ok(o) => o,
             other => panic!("+@ failed: {other:?}"),
@@ -4731,7 +4731,7 @@ mod tests {
             let lane = f64::from_bits(MemOop::try_from(c).unwrap().body_word_raw(1 + i));
             assert_eq!(lane, *expect);
         }
-        // sum â†’ the DEFINED pairwise order: (a0+a2+a4) + (a1+a3).
+        // sum → the DEFINED pairwise order: (a0+a2+a4) + (a1+a3).
         let sum = match call(146, &mut vm, &[a]) {
             PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o)
                 .unwrap()
@@ -4739,7 +4739,7 @@ mod tests {
             other => panic!("sum failed: {other:?}"),
         };
         assert_eq!(sum, (1.5 + 3.5 + 5.5) + (2.5 + 4.5));
-        // dot â†’ same pairwise order over the products.
+        // dot → same pairwise order over the products.
         let dot = match call(147, &mut vm, &[a, b]) {
             PrimResult::Ok(o) => crate::oops::wrappers::DoubleOop::try_from(o)
                 .unwrap()
@@ -4751,7 +4751,7 @@ mod tests {
             (1.5 * 0.5 + 3.5 * 0.5 + 5.5 * 0.5) + (2.5 * 0.5 + 4.5 * 0.5)
         );
 
-        // Part 2 â€” GC-root survival (float_array_klass must be a GC root). Root
+        // Part 2 — GC-root survival (float_array_klass must be a GC root). Root
         // a FloatArray on the stack, force scavenges that MOVE the klass and the
         // array, and allocate a NEW array across each (that alloc reads the
         // klass). The rooted array's lanes must survive intact.
@@ -4770,11 +4770,11 @@ mod tests {
         assert_eq!(f64::from_bits(m.body_word_raw(3)), -7.0);
     }
 
-    /// `tests_s06.md`'s `prim_ids_frozen`: a regression lock on the idâ†’name
+    /// `tests_s06.md`'s `prim_ids_frozen`: a regression lock on the id→name
     /// map every `.mst` `<primitive: N>` binds against. This registry
     /// deliberately diverges from `sprint_s06_detail.md`'s suggested
     /// numbering (S3/S4 pinned ids 1-61/90-96 first; the doc's own text
-    /// permits this) â€” the table below is MY pinned numbering, not the
+    /// permits this) — the table below is MY pinned numbering, not the
     /// doc's. Adding/renumbering a primitive must update this table
     /// deliberately, not silently.
     #[test]
@@ -5149,7 +5149,7 @@ mod tests {
 
     /// The primitive's source is always addressed from 1, so the only
     /// same-object overlap hazard this signature can produce is `from > 1`
-    /// (dest shifted right of source â€” a naive left-to-right in-place copy
+    /// (dest shifted right of source — a naive left-to-right in-place copy
     /// would read already-overwritten bytes). `from == 1` is an exact
     /// self-overlap (dest == source) and must be a safe identity copy.
     /// Both are covered here since the buffer-based implementation must get
@@ -5162,7 +5162,7 @@ mod tests {
         for (i, v) in [1u8, 2, 3, 4, 5].into_iter().enumerate() {
             let _ = call(41, &mut vm, &[b, smi(i as i64 + 1), smi(v as i64)]);
         }
-        // Shift +1: replaceFrom:2 to:5 with: self (same object) â€” copies
+        // Shift +1: replaceFrom:2 to:5 with: self (same object) — copies
         // self[1..4] into self[2..5].
         let _ = call(43, &mut vm, &[b, smi(2), smi(5), b]);
         for (i, expect) in [1u8, 1, 2, 3, 4].into_iter().enumerate() {
@@ -5193,7 +5193,7 @@ mod tests {
         assert_eq!(call(45, &mut vm, &[ab, ab]), PrimResult::Ok(smi(0)));
     }
 
-    /// A trivial `CompiledBlock` closure with `argc` args and no captures â€”
+    /// A trivial `CompiledBlock` closure with `argc` args and no captures —
     /// enough shape to drive `activate_block`'s argc check and frame push
     /// without needing any real computation inside the block body.
     fn make_block_closure(vm: &mut VmState, argc: usize) -> Oop {
@@ -5282,8 +5282,8 @@ mod tests {
     }
 
     /// S6: `instVarAt:` (p25) on a `Klass`-format receiver reads its 8
-    /// named fields 1-based (SPEC Â§2.4 order) â€” Behavior's accessors
-    /// (`name`, `superclass`, `instVarNames`, â€¦) depend on this.
+    /// named fields 1-based (SPEC §2.4 order) — Behavior's accessors
+    /// (`name`, `superclass`, `instVarNames`, …) depend on this.
     #[test]
     fn prim_instvarat_klass() {
         let mut vm = test_vm();
@@ -5319,7 +5319,7 @@ mod tests {
         }
         assert_eq!(call(104, &mut vm, &[d1, d2]), PrimResult::Ok(true_obj));
         assert_eq!(call(105, &mut vm, &[d1, d1]), PrimResult::Ok(true_obj));
-        // Non-Double arg fails (Smalltalk fallback coerces, SPEC Â§1.3).
+        // Non-Double arg fails (Smalltalk fallback coerces, SPEC §1.3).
         assert_eq!(call(100, &mut vm, &[d1, smi(1)]), PrimResult::Fail);
 
         let big = alloc::alloc_double(&mut vm, 1e10).oop();
@@ -5349,7 +5349,7 @@ mod tests {
 
     /// `tests_s06.md`'s `prim_double_print`: p109 round-trips the shortest
     /// decimal form for a handful of adversarial values (`prim_error`'s own
-    /// trace/exit-1 path can't be unit-tested in-process â€” it calls
+    /// trace/exit-1 path can't be unit-tested in-process — it calls
     /// `std::process::exit`, so that requirement is covered at the CLI
     /// integration layer instead, e.g. `tests/it_world.rs`).
     #[test]
@@ -5399,7 +5399,7 @@ mod tests {
 
     /// S12 step 7: the GC prims re-read their receiver through
     /// `vm.prim_arg(0)` after collecting (the `args` copy is stale bits
-    /// once the receiver itself moves â€” latent since S8, only reachable
+    /// once the receiver itself moves — latent since S8, only reachable
     /// now that a collection can actually run mid-prim with young
     /// receivers). The bare `call` helper above invokes the prim fn
     /// directly with an unrooted slice, so these tests must mimic
@@ -5415,8 +5415,8 @@ mod tests {
     }
 
     /// `Smalltalk gcScavenge` must run a REAL scavenge (id 93), not the old
-    /// no-op stub â€” proven by the counter it bumps, not just "didn't crash".
-    /// The answered receiver must be the LIVE (post-scavenge) nil â€” a young
+    /// no-op stub — proven by the counter it bumps, not just "didn't crash".
+    /// The answered receiver must be the LIVE (post-scavenge) nil — a young
     /// receiver moves, and the pre-call `recv` bits are the vacated address.
     #[test]
     fn prim_gc_scavenge_runs_a_real_scavenge() {
@@ -5438,7 +5438,7 @@ mod tests {
         );
     }
 
-    /// `Smalltalk gcFull` must run a REAL full GC (id 94) â€” same shape as
+    /// `Smalltalk gcFull` must run a REAL full GC (id 94) — same shape as
     /// the scavenge test above, this time against `fullGcCount`.
     #[test]
     fn prim_gc_full_runs_a_real_full_gc() {
@@ -5488,7 +5488,7 @@ mod tests {
     }
 
     /// `Smalltalk gcStats` (id 97) answers an 8-smi Array in the SPEC-pinned
-    /// order â€” checked both structurally (an Array of exactly 8 smis) and
+    /// order — checked both structurally (an Array of exactly 8 smis) and
     /// against the actual counters after a real scavenge + full GC, so a
     /// field silently swapped to the wrong position would fail this, not
     /// just "returns something array-shaped".
@@ -5501,7 +5501,7 @@ mod tests {
         // Re-read the LIVE nil for the second call: the scavenge above
         // moved it, and pushing the stale pre-scavenge `recv` bits as a
         // root is exactly the dangling-root shape the full-gc entry
-        // verifier (correctly) rejects â€” this test tripped it for real
+        // verifier (correctly) rejects — this test tripped it for real
         // the first time this line reused `recv`.
         let recv2 = vm.universe.nil_obj;
         call_rooted(94, &mut vm, recv2); // one full GC
@@ -5509,7 +5509,7 @@ mod tests {
         // Snapshot expectations BEFORE calling gcStats: the primitive
         // itself allocates its own result Array (in eden), so reading
         // eden's usage back out AFTER the call would include that very
-        // allocation â€” gcStats correctly reports the state as of the
+        // allocation — gcStats correctly reports the state as of the
         // moment it was called, not after its own side effect.
         let expected = (
             vm.universe.gc_stats.scavenge_count as i64,

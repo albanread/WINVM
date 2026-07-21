@@ -1,4 +1,4 @@
-﻿// Vendored from JASM (wfasm), https://github.com/albanread/JASM  commit f2177391538cbede0c8cfcaa29bd3303ae421d0c
+// Vendored from JASM (wfasm), https://github.com/albanread/JASM  commit f2177391538cbede0c8cfcaa29bd3303ae421d0c
 // Original path: rust/src/rasm/parse.rs.  License: MIT (see LICENSE-JASM in this
 // directory; Copyright (c) 2026 alban read).
 // Local modifications are marked with `// WINVM:` comments — keep the diff
@@ -30,7 +30,7 @@ pub enum RegClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reg {
     pub class: RegClass,
-    /// Architectural register number 0..=15 (rax=0, rcx=1, â€¦ r15=15; xmm0..15).
+    /// Architectural register number 0..=15 (rax=0, rcx=1, … r15=15; xmm0..15).
     pub num: u8,
 }
 
@@ -40,7 +40,7 @@ pub enum MemSize {
     Word,
     Dword,
     Qword,
-    /// `xmmword ptr` â€” 16-byte SSE operand. A size hint only; SSE opcodes carry
+    /// `xmmword ptr` — 16-byte SSE operand. A size hint only; SSE opcodes carry
     /// their own operand size, so this never affects encoding (used by LET's
     /// `andpd/orpd/xorpd xmm, xmmword ptr [rip + mask]`).
     Xmmword,
@@ -53,7 +53,7 @@ pub struct Mem {
     pub index: Option<Reg>,
     pub scale: u8, // 1, 2, 4, 8
     pub disp: i64,
-    /// `[rip + sym]` â€” RIP-relative to a symbol (mutually exclusive with base/index).
+    /// `[rip + sym]` — RIP-relative to a symbol (mutually exclusive with base/index).
     pub rip_sym: Option<String>,
 }
 
@@ -62,7 +62,7 @@ pub enum Operand {
     Reg(Reg),
     Mem(Mem),
     Imm(i64),
-    /// A bare symbol operand â€” a branch/call target or `lea`-rip target.
+    /// A bare symbol operand — a branch/call target or `lea`-rip target.
     Sym(String),
 }
 
@@ -71,7 +71,7 @@ pub enum Directive {
     IntelSyntax,
     Text,
     Globl(String),
-    /// `.quad a, b, ...` â€” one or more 8-byte little-endian values. LET's
+    /// `.quad a, b, ...` — one or more 8-byte little-endian values. LET's
     /// SSE masks emit two (`.quad 0x8000..., 0x0000...`).
     Quad(Vec<i64>),
     Byte(u8),
@@ -96,7 +96,7 @@ pub enum Line {
 /// Strip a trailing `#`/`;` end-of-line comment (LET codegen annotates lines
 /// like `movabs rax, 0x.. # &sin`; the kernel front-end pre-strips its `;`
 /// comments, so this is a harmless no-op there). The `#`/`;` is only honored at
-/// top level â€” not inside `[]` (no comment chars occur in operands anyway).
+/// top level — not inside `[]` (no comment chars occur in operands anyway).
 pub fn strip_comment(s: &str) -> &str {
     let mut depth = 0i32;
     for (i, c) in s.char_indices() {
@@ -112,7 +112,7 @@ pub fn strip_comment(s: &str) -> &str {
 
 /// If the (comment-stripped) line begins with `symbol:`, return
 /// `(Some(symbol), rest)` where `rest` is everything after the colon. Lets the
-/// assembler accept MC's combined `label: insn` / `label: .quad ...` lines â€”
+/// assembler accept MC's combined `label: insn` / `label: .quad ...` lines —
 /// LET codegen emits its constant-pool data labels inline.
 pub fn split_leading_label(line: &str) -> (Option<&str>, &str) {
     let line = line.trim_start();
@@ -304,7 +304,7 @@ fn parse_mem(s: &str, size: Option<MemSize>) -> Result<Mem> {
             continue;
         }
         if t.eq_ignore_ascii_case("rip") {
-            // [rip + sym] â€” the sym is another term.
+            // [rip + sym] — the sym is another term.
             mem.rip_sym = Some(String::new()); // marker; filled by the sym term
             continue;
         }
@@ -344,12 +344,12 @@ fn parse_mem(s: &str, size: Option<MemSize>) -> Result<Mem> {
     }
     // If we saw `rip` but no symbol term, that's malformed.
     if matches!(mem.rip_sym.as_deref(), Some("")) {
-        bail!("[rip + â€¦] with no symbol in `{s}`");
+        bail!("[rip + …] with no symbol in `{s}`");
     }
     Ok(mem)
 }
 
-// â”€â”€ registers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── registers ───────────────────────────────────────────────────────────────
 
 fn parse_reg(s: &str) -> Option<Reg> {
     let s = s.trim().to_ascii_lowercase();
@@ -394,7 +394,7 @@ fn reg_table(s: &str) -> Option<Reg> {
             return Some(Reg { class: RegClass::R8, num: i as u8 });
         }
     }
-    // Vector registers â€” 0..=31 in AVX-512 (xmm/ymm16-31 and zmm need EVEX).
+    // Vector registers — 0..=31 in AVX-512 (xmm/ymm16-31 and zmm need EVEX).
     for (prefix, class) in [
         ("xmm", RegClass::Xmm),
         ("ymm", RegClass::Ymm),
@@ -411,7 +411,7 @@ fn reg_table(s: &str) -> Option<Reg> {
     None
 }
 
-// â”€â”€ literals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── literals ──────────────────────────────────────────────────────────────
 
 fn looks_like_number(s: &str) -> bool {
     let t = s.strip_prefix(['-', '+']).unwrap_or(s);

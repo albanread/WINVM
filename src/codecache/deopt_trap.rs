@@ -1,4 +1,4 @@
-﻿//! S13 step 5 â€” the `brk`-based uncommon-trap mechanism: `brk` emission, the
+//! S13 step 5 — the `brk`-based uncommon-trap mechanism: `brk` emission, the
 //! macOS SIGTRAP handler, and the startup-generated trampolines that escape
 //! from signal context into ordinary Rust (`sprint_s13_detail.md` D3/D4/D6).
 //!
@@ -7,20 +7,20 @@
 //! code-cache bounds, stub generation, JIT toggle" and "must not touch heap
 //! allocation, Universe, interpreter"). The handler itself (D3) is
 //! async-signal-safe by doing almost nothing: it inspects the fault pc,
-//! namespace-checks the `brk` imm, and â€” for one of *our* traps â€” rewrites
+//! namespace-checks the `brk` imm, and — for one of *our* traps — rewrites
 //! the ucontext to resume in a generated trampoline. Every observable action
 //! (allocation, GC, `VmState` mutation, printing) happens *after* sigreturn,
 //! in the Rust reached through that trampoline. The handler never allocates,
 //! locks, formats a string, unwinds, or touches `VmState`.
 //!
-//! PAC note (D3, `arm64.md` Â§5 baseline): PAC is off for VM-internal control
+//! PAC note (D3, `arm64.md` §5 baseline): PAC is off for VM-internal control
 //! flow, so rewriting `__pc`/`__lr` and the trampoline's later frame surgery
 //! need no `pacia`/`autia`. That is the reason this whole design is legal as
-//! written â€” stated here so it is not silently assumed.
+//! written — stated here so it is not silently assumed.
 //!
 //! **Step 5 boundary.** This module resolves a trapping pc to its owning
 //! nmethod + `DeoptState` and hands off *toward* materialization; the
-//! materializer / interpreter-frame reconstruction (D5 M0â€“M8) is S13 step 6,
+//! materializer / interpreter-frame reconstruction (D5 M0–M8) is S13 step 6,
 //! living in `runtime/deopt.rs`. The handoff seam here is
 //! [`rt_uncommon_trap`], which resolves the `DeoptState` and then
 //! deliberately aborts with a "step 6" marker (see its body).
@@ -42,20 +42,20 @@ use super::stubs::KIND_DEOPT_BRIDGE;
 
 use super::{CodeCache, CodeHandle};
 
-// â”€â”€ The `brk #imm` uncommon-trap namespace (D3 / sprint doc Â§"Uncommon trap
-//    sites") â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── The `brk #imm` uncommon-trap namespace (D3 / sprint doc §"Uncommon trap
+//    sites") ─────────────────────────────────────────────────────────────
 
 /// MACVM claims the `brk #0xDExx` immediate namespace. The trap **site**
-/// (faulting pc â†’ nmethod â†’ `PcDesc::find`) identifies the deopt state; the
+/// (faulting pc → nmethod → `PcDesc::find`) identifies the deopt state; the
 /// imm only namespaces our `brk`s against foreign ones.
 ///
-/// `0xDE00` â€” uncommon trap (guard failure / cold path): deopt + count.
+/// `0xDE00` — uncommon trap (guard failure / cold path): deopt + count.
 pub const TRAP_UNCOMMON: u16 = 0xDE00;
-/// `0xDE01` â€” forced trap from `MACVM_DEOPT_STRESS`: deopt, counted
+/// `0xDE01` — forced trap from `MACVM_DEOPT_STRESS`: deopt, counted
 /// separately, does NOT count toward `UncommonTrapLimit` (S13 step 11 wires
 /// the distinction; step 5 only needs the imm reserved and recognised).
 pub const TRAP_STRESS: u16 = 0xDE01;
-/// `0xDE02` â€” compiled-code assertion ("should not reach"): a VM bug; panic
+/// `0xDE02` — compiled-code assertion ("should not reach"): a VM bug; panic
 /// with the pc (handled off-signal via a tiny assert stub, D3 step 4).
 pub const TRAP_ASSERT: u16 = 0xDE02;
 
@@ -75,7 +75,7 @@ pub const fn brk_word(imm16: u16) -> u32 {
 /// imm16 only when the word is a `brk` **and** the imm is in our reserved
 /// `0xDE00..=0xDE02` range; every other `brk` (notably Rust's `abort()`, which
 /// lowers to `brk #1` on arm64, and `unreachable`/`0xDE03..` we never emit) is
-/// **not ours** â€” `None` here drives the handler's SIG_DFL re-raise so those
+/// **not ours** — `None` here drives the handler's SIG_DFL re-raise so those
 /// stay fatal (Pitfalls: "Foreign `brk`s").
 pub fn decode_deopt_brk(word: u32) -> Option<u16> {
     if word & BRK_OPCODE_MASK != BRK_BASE {
@@ -92,24 +92,24 @@ pub fn decode_deopt_brk(word: u32) -> Option<u16> {
 /// encoder does not support `brk` (assembler.rs `emit_u32` doc names S13's
 /// `brk #imm` traps as exactly the raw-word case), so this goes out as a raw
 /// word. Recording the site's `SafepointState` (`kind = UncommonTrap`,
-/// `reexecute = true`) is the *emit stage's* job (S13 step 3/7) â€” this helper
+/// `reexecute = true`) is the *emit stage's* job (S13 step 3/7) — this helper
 /// only lays down the instruction, so it is equally usable from a real emit
 /// path and from this module's own hand-built test stubs.
 pub fn emit_brk(a: &mut dyn Assembler, imm16: u16) {
     a.emit_u32(brk_word(imm16));
 }
 
-// â”€â”€ The code-cache registry (D3 step 2, multi-VmState-safe) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── The code-cache registry (D3 step 2, multi-VmState-safe) ───────────────
 //
 // The handler cannot safely reach a `&CodeCache` from signal context, so each
 // registered code cache's `[lo, hi)` range and its OWN trampolines are cached
 // here. A trapping pc is looked up against this registry: the entry whose
 // range contains it names the cache the brk came from, and that cache's own
-// (guaranteed-live â€” the brk fired from inside it) uncommon trampoline / assert
+// (guaranteed-live — the brk fired from inside it) uncommon trampoline / assert
 // stub. This replaces an earlier single-range/single-trampoline pair whose
 // last-writer-wins semantics silently misdirected a brk once a SECOND JIT
 // `VmState` (each with its own `CodeCache` at a different address) was created
-// â€” a real hazard in the test suite and any multi-VM host, not just theory.
+// — a real hazard in the test suite and any multi-VM host, not just theory.
 //
 // Signal-safety: the handler only READS these atomics (a fixed-size array
 // scan, no allocation/lock), which is async-signal-safe. Mutation
@@ -125,7 +125,7 @@ static REG_LO: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTR
 static REG_HI: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
 static REG_TRAMP: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
 static REG_ASSERT: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
-/// DBG0: the per-cache PROBE trampoline (docs/DEBUGGER.md Â§4.1) â€” the fifth
+/// DBG0: the per-cache PROBE trampoline (docs/DEBUGGER.md §4.1) — the fifth
 /// registry column, same publish discipline as the other four.
 static REG_PROBE: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGISTRY_CAP];
 /// High-water mark of slots ever used (the handler scans `0..REG_LEN`; retired
@@ -133,10 +133,10 @@ static REG_PROBE: [AtomicU64; REGISTRY_CAP] = [const { AtomicU64::new(0) }; REGI
 static REG_LEN: AtomicUsize = AtomicUsize::new(0);
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
-// â”€â”€ DBG0: PROBE's in-handler capture + reentrancy state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── DBG0: PROBE's in-handler capture + reentrancy state ──────────────────
 //
 // The register file at the trigger, copied in-handler (plain relaxed atomic
-// stores â€” async-signal-safe) and read post-sigreturn by `rt_probe_crash`/
+// stores — async-signal-safe) and read post-sigreturn by `rt_probe_crash`/
 // `rt_compiled_assert_failed`. Layout: [0..29] x0-x28, [29] fp, [30] lr,
 // [31] sp, [32] pc, [33] cpsr, [34] far, [35] signal number.
 const CAP_FP: usize = 29;
@@ -148,17 +148,17 @@ const CAP_FAR: usize = 34;
 const CAP_SIG: usize = 35;
 static CAPTURED: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
 
-// â”€â”€ S21: per-thread foreign-fault recovery registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── S21: per-thread foreign-fault recovery registry ──────────────────────
 //
 // PROBE's own fault handler (below) only ever redirects a fault whose pc
-// falls inside a REGISTERED code cache (the `lookup_pc_full` scan above) â€”
+// falls inside a REGISTERED code cache (the `lookup_pc_full` scan above) —
 // a fault in ordinary Rust code (e.g. `oops::wrappers`' own raw-pointer
 // dereference for an indirect `Alien`, S20 step 5, never JIT-compiled at
 // all) is classified "foreign" and left fatal (`write_foreign_verdict` +
 // `restore_default_for`). That is exactly right for a bare CLI/test run
 // (a foreign fault there really is an unrecoverable bug), but an embedded
-// `VmHandle` (S21, `docs/SPEC.md` Â§16) running on its own dedicated worker
-// thread needs a foreign fault to end ONLY that thread, not the process â€”
+// `VmHandle` (S21, `docs/SPEC.md` §16) running on its own dedicated worker
+// thread needs a foreign fault to end ONLY that thread, not the process —
 // same goal as `runtime::vm_state::fatal_exit`'s `FatalMode::ExitThread`,
 // just for a genuine hardware fault instead of an ordinary guest `error:`/
 // DNU/stack-overflow condition.
@@ -166,13 +166,13 @@ static CAPTURED: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
 // Mechanism, empirically validated (three real, deliberately-induced
 // `SIGSEGV`s in an isolated scratchpad binary before this code was
 // written): `sigsetjmp`/`siglongjmp`, called DIRECTLY from inside the
-// signal handler â€” unlike `panic!`/`catch_unwind` (unsound across a
+// signal handler — unlike `panic!`/`catch_unwind` (unsound across a
 // JIT-compiled frame with no Rust unwind tables) or PROBE's own
 // PC-rewrite-to-trampoline trick (needed only for the heavier, allocating/
 // frame-walking dossier work the in-code-cache path does), `siglongjmp` is
 // itself on the async-signal-safe function list and needs neither. Proven:
 // one real SIGSEGV recovers cleanly; a SECOND real SIGSEGV, after the
-// first recovery, ALSO recovers cleanly (the test that actually matters â€”
+// first recovery, ALSO recovers cleanly (the test that actually matters —
 // it proves `sigsetjmp(env, 1)`'s "save the signal mask" semantics
 // correctly un-blocks SIGSEGV after `siglongjmp`; plain `setjmp`/`longjmp`
 // do NOT restore the mask, which would leave SIGSEGV blocked and a second
@@ -181,7 +181,7 @@ static CAPTURED: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
 // handler (the real deployment shape).
 //
 // `libc` 0.2 does not expose `sigsetjmp`/`siglongjmp`/`sigjmp_buf` at all
-// (verified against the vendored crate, same gap as `ucontext_t` above) â€”
+// (verified against the vendored crate, same gap as `ucontext_t` above) —
 // hand-declared here, with `sigjmp_buf`'s exact layout confirmed from this
 // system's own `/usr/include/.../usr/include/setjmp.h`: on `arm64` macOS,
 // `_JBLEN = (14 + 8 + 2) * 2 = 48`, `sigjmp_buf` is `int[_JBLEN + 1]` =
@@ -201,16 +201,16 @@ fn current_thread_id() -> u64 {
     extern "system" {
         fn GetCurrentThreadId() -> u32;
     }
-    // SAFETY: no arguments, no memory access â€” returns the caller's TID.
+    // SAFETY: no arguments, no memory access — returns the caller's TID.
     unsafe { GetCurrentThreadId() as u64 }
 }
 
 // WINVM: no signal layer on Windows yet (Phase 2 replaces this whole
-// mechanism with a Vectored Exception Handler â€” MIGRATION.md Â§2.2). Until
+// mechanism with a Vectored Exception Handler — MIGRATION.md §2.2). Until
 // then: `sigsetjmp` reports "no recovery point established" (returns 0 and
-// nothing ever jumps back), and `siglongjmp` â€” reachable only through
+// nothing ever jumps back), and `siglongjmp` — reachable only through
 // `raise_guest_fatal` on a thread that claimed a slot, i.e. the embedded
-// `VmHandle` case that doesn't exist on Windows yet â€” aborts loudly rather
+// `VmHandle` case that doesn't exist on Windows yet — aborts loudly rather
 // than unwinding through JIT frames.
 #[cfg(windows)]
 pub(crate) unsafe fn sigsetjmp(
@@ -228,17 +228,17 @@ pub(crate) unsafe fn siglongjmp(_env: *mut core::ffi::c_int, _val: core::ffi::c_
 
 #[cfg(unix)]
 extern "C" {
-    /// Callers MUST invoke this DIRECTLY, inline, at their own call site â€”
+    /// Callers MUST invoke this DIRECTLY, inline, at their own call site —
     /// never through an intervening Rust wrapper function. `sigsetjmp`
     /// captures whichever stack frame is active at the moment it runs; if
     /// that frame belongs to a helper that then returns normally (as an
     /// earlier version of this module's own `register_and_setjmp` wrongly
     /// did), the frame is gone by the time a LATER fault tries to
-    /// `siglongjmp` back into it â€” undefined behavior (observed here as
+    /// `siglongjmp` back into it — undefined behavior (observed here as
     /// execution silently resuming somewhere other than the intended
     /// point, not a clean crash, making it easy to misdiagnose). This is
     /// the exact same "cannot longjmp into a function that has already
-    /// returned" rule C itself has always had â€” Rust's `extern "C"` FFI
+    /// returned" rule C itself has always had — Rust's `extern "C"` FFI
     /// gives no compiler-level protection against getting it wrong, since
     /// `sigsetjmp` is just an ordinary function call from Rust's own point
     /// of view, not compiler-recognized the way it can be in C. The
@@ -251,13 +251,13 @@ extern "C" {
     ) -> core::ffi::c_int;
     /// Safe to call from anywhere, including from inside a signal handler
     /// (unlike `sigsetjmp`, `siglongjmp` itself has no "which frame is
-    /// live" concern â€” it only ever restores a PREVIOUSLY, correctly
+    /// live" concern — it only ever restores a PREVIOUSLY, correctly
     /// established `sigsetjmp` point).
     pub(crate) fn siglongjmp(env: *mut core::ffi::c_int, val: core::ffi::c_int) -> !;
 }
 
 /// Same signal-safety discipline as the code-cache registry above: a fixed
-/// array of plain atomics (never a `Mutex`, never a `thread_local!` â€” the
+/// array of plain atomics (never a `Mutex`, never a `thread_local!` — the
 /// latter's lazy-init path on first touch is not obviously async-signal-safe,
 /// and this registry's whole POINT is being read from inside a handler).
 /// `0` marks an empty/retired slot (`libc::pthread_self()` is never 0 for a
@@ -272,7 +272,7 @@ static JMP_OWNER: [AtomicU64; JMP_REGISTRY_CAP] = [const { AtomicU64::new(0) }; 
 static JMP_BUFS: [[AtomicU32; SIGJMP_BUF_LEN]; JMP_REGISTRY_CAP] =
     [const { [const { AtomicU32::new(0) }; SIGJMP_BUF_LEN] }; JMP_REGISTRY_CAP];
 /// The triggering fault's `(signal, pc, far)`, published into THIS thread's
-/// own slot by the handler immediately before `siglongjmp` â€” read back by
+/// own slot by the handler immediately before `siglongjmp` — read back by
 /// whatever resumes at the `sigsetjmp` point (same thread, so no ordering
 /// concern beyond plain same-thread program order) to build a real report.
 static JMP_LAST_SIG: [AtomicU64; JMP_REGISTRY_CAP] =
@@ -283,16 +283,16 @@ static JMP_LAST_FAR: [AtomicU64; JMP_REGISTRY_CAP] =
 static JMP_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
 /// Claims a registry slot for the CURRENT thread (reusing a stale slot this
-/// same thread previously registered, or any retired slot, before growing â€”
+/// same thread previously registered, or any retired slot, before growing —
 /// same dedup-then-append shape as `register_with_probe`) and returns its
-/// index. Pure bookkeeping â€” does NOT itself call `sigsetjmp` (deliberately:
+/// index. Pure bookkeeping — does NOT itself call `sigsetjmp` (deliberately:
 /// see [`jmp_buf_ptr`]'s own doc for why that must happen inline, at the
 /// caller's own call site, never inside a helper that would then return and
-/// invalidate the very frame a later fault needs to jump back into â€” an
+/// invalidate the very frame a later fault needs to jump back into — an
 /// earlier version of this function called `sigsetjmp` itself and was wrong
 /// in exactly this way, caught by this module's own real-`SIGSEGV` tests).
 ///
-/// Only ever called from ordinary (non-signal) code â€” `VmHandle::boot`
+/// Only ever called from ordinary (non-signal) code — `VmHandle::boot`
 /// (S21 step 2), once, before any guest code runs on that thread.
 pub(crate) fn claim_jmp_slot() -> usize {
     let me = current_thread_id();
@@ -305,11 +305,11 @@ pub(crate) fn claim_jmp_slot() -> usize {
     slot
 }
 
-/// The raw `*mut c_int` for slot `i`'s own `sigjmp_buf` storage â€” pass this
+/// The raw `*mut c_int` for slot `i`'s own `sigjmp_buf` storage — pass this
 /// DIRECTLY to [`sigsetjmp`] (never copy it, never route it through another
 /// function first) at the exact call site whose frame must remain live for
 /// the whole recovery window (in practice: a loop, called fresh each
-/// iteration â€” e.g. `VmHandle`'s own per-eval loop, S21 step 2).
+/// iteration — e.g. `VmHandle`'s own per-eval loop, S21 step 2).
 ///
 /// # Safety
 /// `i` must be a slot this thread itself claimed via [`claim_jmp_slot`] and
@@ -325,7 +325,7 @@ pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
     JMP_BUFS[i][0].as_ptr() as *mut core::ffi::c_int
 }
 
-/// Clears this thread's own registered slot, if any â€” called once a worker
+/// Clears this thread's own registered slot, if any — called once a worker
 /// thread is about to end for good (a clean shutdown, or right before the
 /// `fatal_exit` that follows a caught crash), so a much-later, unrelated
 /// thread that happens to reuse the same recycled `pthread_t` value never
@@ -348,7 +348,7 @@ pub(crate) fn deregister_setjmp() {
     }
 }
 
-/// How many `sigsetjmp` recovery slots are currently owned by a live thread â€”
+/// How many `sigsetjmp` recovery slots are currently owned by a live thread —
 /// the count of nonzero `JMP_OWNER` entries. Ordinary (non-signal) code only.
 /// CG9's UI-worker restart leak gate uses this: a `VmHandle` drop must
 /// `deregister_setjmp` its slot, so booting-then-dropping a UI worker N times
@@ -361,7 +361,7 @@ pub fn active_jmp_slots() -> usize {
         .count()
 }
 
-/// How many code-cache PROBE registry slots are live (`REG_PROBE` nonzero) â€”
+/// How many code-cache PROBE registry slots are live (`REG_PROBE` nonzero) —
 /// the sibling leak gate for the deopt/probe registry. A dropped `VmHandle`
 /// whose nmethods were flushed must not strand PROBE entries across restarts.
 pub fn active_probe_slots() -> usize {
@@ -370,7 +370,7 @@ pub fn active_probe_slots() -> usize {
         .count()
 }
 
-/// How many `sigsetjmp` recovery slots THIS thread owns (0 or 1 in practice â€”
+/// How many `sigsetjmp` recovery slots THIS thread owns (0 or 1 in practice —
 /// `claim_jmp_slot` reuses the caller thread's slot). The parallel-safe leak
 /// gate: a `VmHandle` boot/drop cycle on one thread must return this to 0,
 /// immune to other threads' concurrent tests (unlike the process-global
@@ -386,7 +386,7 @@ pub fn current_thread_jmp_slots() -> usize {
 
 /// Async-signal-safe: does THIS (faulting) thread have a registered
 /// recovery slot? A fixed-array linear scan matched by `pthread_self()`,
-/// no lock, no allocation â€” the same shape as `lookup_pc_full` above, just
+/// no lock, no allocation — the same shape as `lookup_pc_full` above, just
 /// keyed by owning thread instead of by pc range.
 fn lookup_jmp_slot_for_current_thread() -> Option<usize> {
     let me = current_thread_id();
@@ -395,7 +395,7 @@ fn lookup_jmp_slot_for_current_thread() -> Option<usize> {
 
 /// Reads back (and clears) the `(signal, pc, far)` [`sig_fault_handler`]'s
 /// foreign-fault branch published for the CURRENT thread just before its
-/// `siglongjmp` â€” `None` if this thread never had a foreign fault recorded
+/// `siglongjmp` — `None` if this thread never had a foreign fault recorded
 /// (e.g. a fresh boot, `sigsetjmp`'s own `0` return). Ordinary
 /// (non-signal) code only; same-thread program order makes the plain
 /// `Relaxed` loads here see whatever the handler (necessarily on this same
@@ -411,29 +411,29 @@ pub(crate) fn take_last_crash_info() -> Option<(i32, u64, u64)> {
     Some((sig as i32, pc, far))
 }
 
-/// Per-slot storage for [`raise_guest_fatal`]'s message â€” a `String`, unlike
+/// Per-slot storage for [`raise_guest_fatal`]'s message — a `String`, unlike
 /// `JMP_LAST_*` above, because every caller here runs in ORDINARY (non-signal-
 /// handler) code: `runtime::error::dnu_fallback` and `primitives::prim_error`
 /// execute during normal interpreted dispatch, never from inside
-/// `sig_fault_handler`. A `Mutex` is fine for exactly that reason â€” this file's
+/// `sig_fault_handler`. A `Mutex` is fine for exactly that reason — this file's
 /// own "must not touch heap allocation... " constraint (module doc) binds the
 /// async-signal-safe handler path only, not this one.
 static GUEST_FATAL_MSG: Mutex<[Option<String>; JMP_REGISTRY_CAP]> =
     Mutex::new([const { None }; JMP_REGISTRY_CAP]);
 
-/// The `siglongjmp` resume value [`raise_guest_fatal`] uses â€” distinct from
+/// The `siglongjmp` resume value [`raise_guest_fatal`] uses — distinct from
 /// [`sig_fault_handler`]'s own `1`, so `VmHandle::eval`'s `sigsetjmp` call
 /// site can tell "a genuine native fault was recovered" (1) apart from "the
 /// guest hit an unhandled DNU/`error:` and was recovered" (2) without
 /// consulting anything but the return value itself.
 pub(crate) const GUEST_FATAL_JMP_VAL: core::ffi::c_int = 2;
 
-/// Ordinary (non-signal) code only â€” is a `sigsetjmp` recovery point
+/// Ordinary (non-signal) code only — is a `sigsetjmp` recovery point
 /// registered for the CURRENT thread? `runtime::error::dnu_fallback` and
 /// `primitives::prim_error` call this BEFORE building a PROBE dossier: a
 /// dossier (register/frame/heap dump) is the right response to a condition
 /// that's about to genuinely end the process, and pure noise for a routine,
-/// interactively-recovered DNU or `error:` in an embedded `VmHandle` â€”
+/// interactively-recovered DNU or `error:` in an embedded `VmHandle` —
 /// skip it precisely when a recovery is actually about to happen.
 pub(crate) fn has_registered_jmp_slot() -> bool {
     lookup_jmp_slot_for_current_thread().is_some()
@@ -443,26 +443,26 @@ pub(crate) fn has_registered_jmp_slot() -> bool {
 /// `runtime::vm_state::fatal_exit` call at the end of `dnu_fallback`/
 /// `prim_error`: an unhandled DNU or explicit `self error:` is a genuinely
 /// terminal condition for the CURRENT computation in Smalltalk's own terms
-/// (`error:` "has no proceed semantics in v1", `prim_error`'s own doc) â€”
+/// (`error:` "has no proceed semantics in v1", `prim_error`'s own doc) —
 /// but it is NOT a sign anything about the VM itself is broken, unlike the
 /// conditions `FatalMode`/`fatal_exit` exist for (heap exhaustion, stack
 /// overflow, a genuine native fault). Tearing down the whole worker thread
-/// (`FatalMode::ExitThread`) for an everyday Workspace typo â€” the single
-/// most common "mistake" in interactive use â€” is the wrong tool: it works,
+/// (`FatalMode::ExitThread`) for an everyday Workspace typo — the single
+/// most common "mistake" in interactive use — is the wrong tool: it works,
 /// but every DNU pays a full VM respawn instead of an ordinary recoverable
 /// error, exactly the "any mistake kills the Workspace" experience real
 /// Smalltalk's own recoverable `doesNotUnderstand:` was designed to avoid.
 ///
 /// If this thread has a registered recovery slot (i.e. it is inside
 /// `VmHandle::eval`'s own `sigsetjmp`), publish `message` and jump straight
-/// back there with [`GUEST_FATAL_JMP_VAL`] â€” same `siglongjmp` mechanism
+/// back there with [`GUEST_FATAL_JMP_VAL`] — same `siglongjmp` mechanism
 /// `sig_fault_handler` already uses for a genuine foreign fault, chosen for
 /// the identical reason: it is a raw register/SP restore, not a Rust
 /// unwind, so it is sound to cross however many interpreted AND compiled
 /// frames sit between here and `eval`'s call site (the standing rule this
 /// project enforces elsewhere: never `catch_unwind` through JIT frames).
 /// No slot registered (plain CLI/batch use, `VmHandle` never booted) falls
-/// back to today's `fatal_exit` unchanged â€” this only changes behavior for
+/// back to today's `fatal_exit` unchanged — this only changes behavior for
 /// the embedded case that never had a sound recovery path before.
 #[allow(unsafe_code)]
 pub(crate) fn raise_guest_fatal(message: String) -> ! {
@@ -479,7 +479,7 @@ pub(crate) fn raise_guest_fatal(message: String) -> ! {
 }
 
 /// Reads back (and clears) the message [`raise_guest_fatal`] published for
-/// the CURRENT thread just before its `siglongjmp` â€” ordinary code only,
+/// the CURRENT thread just before its `siglongjmp` — ordinary code only,
 /// called from `VmHandle::eval` right after `sigsetjmp` returns
 /// [`GUEST_FATAL_JMP_VAL`]. Same same-thread program-order reasoning as
 /// [`take_last_crash_info`].
@@ -488,17 +488,17 @@ pub(crate) fn take_last_guest_fatal_message() -> Option<String> {
     GUEST_FATAL_MSG.lock().unwrap()[i].take()
 }
 
-/// Â§4.5's backstop: `true` from the moment a fault is claimed for PROBE
+/// §4.5's backstop: `true` from the moment a fault is claimed for PROBE
 /// until the process dies. A SECOND fault while the dossier runs (the
 /// dossier itself dereferencing something the validation missed) restores
-/// `SIG_DFL` and dies with the original signal â€” the per-step-flushed
+/// `SIG_DFL` and dies with the original signal — the per-step-flushed
 /// dossier prefix survives on stderr.
 #[cfg_attr(windows, allow(dead_code))] // WINVM: read only by the macOS handlers until the Phase-2 VEH
 static PROBE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// The dedicated stack `rt_probe_crash` runs on. A SEGV frame's own sp may
 /// be garbage or exhausted; the probe trampoline unconditionally switches
-/// here, which also makes stack-overflow crashes reportable. Never freed â€”
+/// here, which also makes stack-overflow crashes reportable. Never freed —
 /// the dossier ends in exit(70).
 const PROBE_STACK_BYTES: usize = 512 * 1024;
 struct ProbeStack(core::cell::UnsafeCell<[u8; PROBE_STACK_BYTES]>);
@@ -507,7 +507,7 @@ struct ProbeStack(core::cell::UnsafeCell<[u8; PROBE_STACK_BYTES]>);
 unsafe impl Sync for ProbeStack {}
 static PROBE_STACK: ProbeStack = ProbeStack(core::cell::UnsafeCell::new([0; PROBE_STACK_BYTES]));
 
-/// The alternate SIGNAL stack (sigaltstack) â€” without it `SA_ONSTACK` is
+/// The alternate SIGNAL stack (sigaltstack) — without it `SA_ONSTACK` is
 /// inert (nothing in the tree ever installed one before DBG0) and a SIGSEGV
 /// from native-stack exhaustion could not deliver at all.
 ///
@@ -516,7 +516,7 @@ static PROBE_STACK: ProbeStack = ProbeStack(core::cell::UnsafeCell::new([0; PROB
 /// handler on whatever buffer THIS thread last registered. A single shared
 /// static (the pre-CG0 shape) meant every thread's `sigaltstack` aliased the
 /// same memory, so two threads faulting at once ran their two handlers on the
-/// same buffer and corrupted each other's frames â€” tolerable while only one VM
+/// same buffer and corrupted each other's frames — tolerable while only one VM
 /// ran per process, but the worker fleet and the Cocoa GUI (a primary VM on a
 /// background thread + a UI callback on main) make concurrent faults *likely*.
 /// Each thread now owns its buffer: a boxed array in a `thread_local`,
@@ -525,23 +525,23 @@ static PROBE_STACK: ProbeStack = ProbeStack(core::cell::UnsafeCell::new([0; PROB
 /// macOS arm64's `MINSIGSTKSZ` (32 KiB), leaving ample room for the handler's
 /// own frame.
 ///
-/// Lazy `thread_local` init can allocate, which is NOT async-signal-safe â€” but
+/// Lazy `thread_local` init can allocate, which is NOT async-signal-safe — but
 /// [`arm_this_threads_altstack`] runs only from [`arm_foreign_fault_handler`]/
 /// [`install`], i.e. in ordinary context at boot/arm time, strictly before any
 /// fault; the signal handler itself never touches this `thread_local`.
 ///
 /// Teardown, stated honestly (CG0 review): the buffer lives for the thread's
-/// active life, but the two thread-exit paths dispose of it differently â€”
+/// active life, but the two thread-exit paths dispose of it differently —
 /// **neither is a safety hazard**, because by the time either runs no VM/JIT
 /// code executes on the thread, so no synchronous fault can originate there.
 ///   - `pthread_exit` (the `FatalMode::ExitThread` fail-fast path): TLS
-///     destructors are skipped, so the 256 KiB box is **leaked, not freed** â€”
-///     a real but bounded cost (one leak per dieâ†’respawn of a throwaway
+///     destructors are skipped, so the 256 KiB box is **leaked, not freed** —
+///     a real but bounded cost (one leak per die→respawn of a throwaway
 ///     worker, `feedback_recover_clean_or_die`; the Cocoa UI worker's restart
 ///     path (CG7) drops its `VmHandle` cleanly and does not take this route).
 ///   - a clean thread exit: the TLS destructor DOES free the box, and the
 ///     kernel's per-thread `sigaltstack` registration transiently still points
-///     at freed-but-still-mapped memory until the thread is fully torn down â€”
+///     at freed-but-still-mapped memory until the thread is fully torn down —
 ///     a benign window (no signal can arrive there; freed heap is not
 ///     unmapped), not a live-use hazard.
 const ALT_STACK_BYTES: usize = 256 * 1024;
@@ -551,7 +551,7 @@ thread_local! {
 }
 
 /// Registers THIS thread's own sigaltstack, allocating its buffer on the first
-/// call on this thread (see [`ALT_STACK`]). Ordinary-context only â€” never call
+/// call on this thread (see [`ALT_STACK`]). Ordinary-context only — never call
 /// from inside a signal handler (the lazy `thread_local` init may allocate).
 /// Idempotent: re-arming a thread just points `sigaltstack` at the same buffer.
 fn arm_this_threads_altstack() {
@@ -618,14 +618,14 @@ fn read_captured() -> crate::runtime::probe::CapturedRegs {
 }
 
 /// `true` once a SIGTRAP handler has been armed (by the first `install`).
-/// Arming is process-global and idempotent â€” later caches only add registry
+/// Arming is process-global and idempotent — later caches only add registry
 /// entries, they do not re-`sigaction`.
 static HANDLER_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Register one code cache's `[lo, hi)` range + its own trampolines. Reuses a
 /// retired slot or dedups an existing same-`lo` entry (a re-install of a live
 /// cache) before appending; panics only if `REGISTRY_CAP` distinct LIVE caches
-/// coexist (absurd â€” deregistration on drop keeps this bounded by peak
+/// coexist (absurd — deregistration on drop keeps this bounded by peak
 /// concurrency, not total caches ever created).
 fn register_with_probe(lo: u64, hi: u64, tramp: u64, assert: u64, probe: u64) {
     let _g = REGISTRY_LOCK.lock().unwrap();
@@ -677,7 +677,7 @@ fn lookup_pc(pc: u64) -> Option<(u64, u64)> {
 }
 
 /// Like [`lookup_pc`] but also returns the owning cache's PROBE trampoline
-/// (0 when none was registered â€” a pre-DBG0 test arm).
+/// (0 when none was registered — a pre-DBG0 test arm).
 #[cfg_attr(windows, allow(dead_code))] // WINVM: consumers are the macOS fault handlers
 fn lookup_pc_full(pc: u64) -> Option<(u64, u64, u64)> {
     let n = REG_LEN.load(Ordering::Acquire);
@@ -698,7 +698,7 @@ fn lookup_pc_full(pc: u64) -> Option<(u64, u64, u64)> {
     None
 }
 
-// â”€â”€ The macOS arm64 ucontext, laid out by hand (D3 step 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── The macOS arm64 ucontext, laid out by hand (D3 step 1) ────────────────
 //
 // `libc` 0.2 does NOT expose `ucontext_t` / `__darwin_mcontext64` /
 // `__darwin_arm_thread_state64` on aarch64-apple-darwin (verified against the
@@ -706,11 +706,11 @@ fn lookup_pc_full(pc: u64) -> Option<(u64, u64, u64)> {
 // `<sys/_types/_ucontext.h>` + `<mach/arm/_structs.h>` (the `_STRUCT_MCONTEXT64`
 // / `_STRUCT_ARM_THREAD_STATE64` definitions). We only ever read/write fields
 // up through the thread-state block, so the NEON/exception sub-structs are
-// left as an opaque tail sized to match the real struct â€” the handler never
+// left as an opaque tail sized to match the real struct — the handler never
 // touches them, and getting their *size* right keeps `mcontext64`'s own size
 // honest should anything ever take `size_of` of it (nothing in step 5 does).
 
-/// `_STRUCT_ARM_THREAD_STATE64` â€” the integer register file at a fault. `__x`
+/// `_STRUCT_ARM_THREAD_STATE64` — the integer register file at a fault. `__x`
 /// is x0..x28; `__fp`/`__lr`/`__sp`/`__pc` are the named specials; `__cpsr`
 /// + `__pad` complete the 34-word block.
 #[cfg(target_os = "macos")]
@@ -725,7 +725,7 @@ struct ArmThreadState64 {
     __pad: u32,
 }
 
-/// `_STRUCT_ARM_EXCEPTION_STATE64` â€” 3 words (far/esr/exception). Read never;
+/// `_STRUCT_ARM_EXCEPTION_STATE64` — 3 words (far/esr/exception). Read never;
 /// present only so `__ss` lands at the right offset within `mcontext64`.
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -735,7 +735,7 @@ struct ArmExceptionState64 {
     __exception: u32,
 }
 
-/// `_STRUCT_ARM_NEON_STATE64` â€” 32Ã—128-bit V registers + fpsr/fpcr. Opaque
+/// `_STRUCT_ARM_NEON_STATE64` — 32×128-bit V registers + fpsr/fpcr. Opaque
 /// tail; present only for correct total size. `__v` is `[u128; 32]`; the two
 /// trailing u32s are fpsr/fpcr.
 #[cfg(target_os = "macos")]
@@ -746,7 +746,7 @@ struct ArmNeonState64 {
     __fpcr: u32,
 }
 
-/// `_STRUCT_MCONTEXT64` â€” exception state, then thread state (`__ss`, the one
+/// `_STRUCT_MCONTEXT64` — exception state, then thread state (`__ss`, the one
 /// we touch), then NEON state.
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -756,7 +756,7 @@ struct Mcontext64 {
     __ns: ArmNeonState64,
 }
 
-/// `ucontext_t` â€” only `uc_mcontext` matters here; the leading fields are
+/// `ucontext_t` — only `uc_mcontext` matters here; the leading fields are
 /// laid out exactly so that pointer lands correctly. `uc_mcontext` is a
 /// *pointer* to the `mcontext64` (Apple stores it out-of-line and points
 /// `uc_mcontext` at `__mcontext_data`), which is why the handler double-
@@ -782,7 +782,7 @@ struct StackT {
     ss_flags: i32,
 }
 
-// â”€â”€ The SIGTRAP handler (D3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── The SIGTRAP handler (D3) ──────────────────────────────────────────────
 
 /// SA_SIGINFO handler for SIGTRAP. Async-signal-safe: no allocation, no lock,
 /// no formatting, no unwinding across the signal boundary. Its whole job:
@@ -791,12 +791,12 @@ struct StackT {
 /// 2. Bounds-check the pc against the cached code-cache range (two `u64`
 ///    compares), and decode `*(pc as *const u32)` as one of our deopt `brk`s.
 ///    The code cache is always readable, so the load is safe.
-/// 3. Not ours â†’ restore `SIG_DFL` and return; re-execution kills the process
+/// 3. Not ours → restore `SIG_DFL` and return; re-execution kills the process
 ///    with the default disposition (this keeps Rust `abort()` fatal).
-/// 4. `0xDE02` (compiled assert) â†’ resume in the assert stub (which panics
+/// 4. `0xDE02` (compiled assert) → resume in the assert stub (which panics
 ///    off-signal). Still no work in-handler.
-/// 5. Otherwise (`0xDE00`/`0xDE01`) â†’ **redirect**: stash the trap pc in x16
-///    (IP0 â€” scratch, never live at a safepoint, `arm64.md` Â§3) and set
+/// 5. Otherwise (`0xDE00`/`0xDE01`) → **redirect**: stash the trap pc in x16
+///    (IP0 — scratch, never live at a safepoint, `arm64.md` §3) and set
 ///    `__pc` to the uncommon trampoline. All real work happens after
 ///    sigreturn, in Rust reached via that trampoline.
 ///
@@ -822,9 +822,9 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
         let pc = ss.__pc;
 
         // (2) Which registered code cache owns this pc? The owning entry names
-        // that cache's OWN (guaranteed-live â€” the brk fired from inside it)
+        // that cache's OWN (guaranteed-live — the brk fired from inside it)
         // trampoline + assert stub. A pc in NO registered cache is a foreign
-        // brk (a Rust abort in ordinary text, etc.) â†’ (3) make it fatal.
+        // brk (a Rust abort in ordinary text, etc.) → (3) make it fatal.
         let (tramp, assert) = match lookup_pc(pc) {
             Some(pair) => pair,
             None => {
@@ -832,13 +832,13 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
                 return;
             }
         };
-        // The code cache is always readable â€” this load cannot fault.
+        // The code cache is always readable — this load cannot fault.
         let word = core::ptr::read(pc as *const u32);
         let imm = match decode_deopt_brk(word) {
             Some(imm) => imm,
             None => {
                 // A brk inside a cache we don't recognise (should not happen,
-                // but treat as foreign â€” (3), stay honest/fatal).
+                // but treat as foreign — (3), stay honest/fatal).
                 restore_default_and_return();
                 return;
             }
@@ -846,7 +846,7 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
 
         if imm == TRAP_ASSERT {
             // (4) Redirect to the assert stub, which emits the PROBE
-            // dossier off-signal (DBG0 â€” previously it panicked). Capture
+            // dossier off-signal (DBG0 — previously it panicked). Capture
             // the register file for the dossier's step 3 and claim the
             // reentrancy guard: from here on the process is dying.
             if assert != 0 {
@@ -860,7 +860,7 @@ extern "C" fn sigtrap_handler(_sig: i32, _info: *mut libc::siginfo_t, ctx: *mut 
             return;
         }
 
-        // (5) 0xDE00 / 0xDE01 â€” redirect into the owning cache's uncommon
+        // (5) 0xDE00 / 0xDE01 — redirect into the owning cache's uncommon
         // trampoline with the trap pc stashed in x16 (IP0). PAC is off, so no
         // signing needed.
         if tramp == 0 {
@@ -896,23 +896,23 @@ unsafe fn restore_default_for(sig: i32) {
     sa.sa_sigaction = libc::SIG_DFL;
     // Best-effort: a failure here cannot be reported from signal context, and
     // the re-executed fault will still arrive (just possibly through this
-    // handler again â€” which loops at most until sigaction succeeds; in
+    // handler again — which loops at most until sigaction succeeds; in
     // practice it never fails for SIG_DFL).
     let _ = unsafe { libc::sigaction(sig, &sa, core::ptr::null_mut()) };
 }
 
-// â”€â”€ DBG0: the SIGSEGV/SIGBUS handler (docs/DEBUGGER.md Â§4.1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── DBG0: the SIGSEGV/SIGBUS handler (docs/DEBUGGER.md §4.1) ─────────────
 
 /// Async-signal-safe verdict line for a FOREIGN fault (pc outside every
 /// registered code cache): raw `write(2)` of a fixed message + hand-rolled
-/// hex â€” no allocation, no formatting machinery, no locks. "That
+/// hex — no allocation, no formatting machinery, no locks. "That
 /// classification itself is the first question of every crash triage."
 ///
-/// `recovering`: `false` reproduces today's exact wording (this thread â€”
-/// and, absent S21, the whole process â€” is about to die). `true` is S21's
+/// `recovering`: `false` reproduces today's exact wording (this thread —
+/// and, absent S21, the whole process — is about to die). `true` is S21's
 /// new case: an embedded `VmHandle`'s own worker thread has a registered
 /// recovery slot (`claim_jmp_slot`) and is about to `siglongjmp` back
-/// to it instead â€” the message says so, so a stderr log never claims
+/// to it instead — the message says so, so a stderr log never claims
 /// "dying" immediately before evidence (a subsequent report over the
 /// `TranscriptSink` channel, S21 step 2) that it didn't.
 #[cfg(target_os = "macos")]
@@ -967,13 +967,13 @@ unsafe fn write_foreign_verdict(sig: i32, pc: u64, far: u64, recovering: bool) {
 /// [`sigtrap_handler`]: classify, capture, rewrite `__pc`, and do ALL real
 /// work after sigreturn. Differences: (a) S21's own foreign-fault recovery
 /// check runs FIRST, entirely independent of everything below (see its own
-/// comment inline â€” it must never interact with `PROBE_IN_PROGRESS`, a
+/// comment inline — it must never interact with `PROBE_IN_PROGRESS`, a
 /// different, process-wide, never-reset-until-death concern); (b) PROBE's
-/// own reentrancy check â€” a fault while a dossier is already in progress
+/// own reentrancy check — a fault while a dossier is already in progress
 /// means the dossier itself dereferenced something bad; restore `SIG_DFL`
 /// and die, keeping the per-step-flushed prefix; (c) faults are classified
-/// by their pc being inside a REGISTERED cache â€” only there is the
-/// x28-is-&VmState convention trustworthy (docs/DEBUGGER.md Â§4.1);
+/// by their pc being inside a REGISTERED cache — only there is the
+/// x28-is-&VmState convention trustworthy (docs/DEBUGGER.md §4.1);
 /// everything else gets the raw-write verdict line and the default fatal
 /// disposition.
 #[cfg(target_os = "macos")]
@@ -985,10 +985,10 @@ extern "C" fn sig_fault_handler(
     // SAFETY: kernel-provided pointers for this delivery; same layout
     // contract as `sigtrap_handler`.
     unsafe {
-        // S21 (`docs/SPEC.md` Â§16): an embedded `VmHandle`'s own worker
+        // S21 (`docs/SPEC.md` §16): an embedded `VmHandle`'s own worker
         // thread may have registered a recovery slot (`register_and_
         // setjmp`). Checked FIRST and entirely independently of
-        // `PROBE_IN_PROGRESS` below â€” that flag is process-wide and never
+        // `PROBE_IN_PROGRESS` below — that flag is process-wide and never
         // reset until the process actually dies, which is exactly wrong
         // for this path: a successful recovery must leave a LATER,
         // unrelated fault (on this or another thread, foreign or
@@ -996,12 +996,12 @@ extern "C" fn sig_fault_handler(
         // real fault on the SAME thread after one recovery must ALSO
         // recover cleanly (validated in an isolated scratchpad binary
         // before this code was written). Only fires for a GENUINELY
-        // foreign pc (`lookup_pc_full` returns no owning cache) â€” a fault
+        // foreign pc (`lookup_pc_full` returns no owning cache) — a fault
         // inside a registered code cache, even on an embedded thread,
         // still gets PROBE's real dossier treatment below unchanged (which
         // already correctly terminates via `runtime::vm_state::fatal_exit`
         // rather than a bare `process::exit`, per that function's own
-        // `FatalMode` â€” S21 step 1b).
+        // `FatalMode` — S21 step 1b).
         if let Some(i) = lookup_jmp_slot_for_current_thread() {
             let uc = ctx as *mut Ucontext;
             if !uc.is_null() {
@@ -1053,10 +1053,10 @@ extern "C" fn sig_fault_handler(
     }
 }
 
-// â”€â”€ Trampolines (D4 / D6) generated at startup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Trampolines (D4 / D6) generated at startup ────────────────────────────
 
 /// Handles to the generated deopt trampolines, published into the same
-/// `CodeCache` real nmethods and the SPEC Â§9 stubs live in. Returned by
+/// `CodeCache` real nmethods and the SPEC §9 stubs live in. Returned by
 /// [`install`] and (in later steps) stashed alongside `Stubs`.
 #[derive(Clone, Copy)]
 pub struct DeoptTrampolines {
@@ -1088,11 +1088,11 @@ impl DeoptTrampolines {
 ///   stp  fp, lr, [sp, #-16]!     // push a normal frame record for the walker
 ///   mov  fp, sp                  //   -> [fp] = trapped_frame_fp, [fp+8] = trap_pc
 ///   str  fp, [x28, #LAST_FP]     // PUBLISH the record as the walker's anchor
-///   str  lr, [x28, #LAST_PC]     //   (task #92 â€” the record alone is invisible
+///   str  lr, [x28, #LAST_PC]     //   (task #92 — the record alone is invisible
 ///   movz x9, #KIND_DEOPT_BRIDGE  //    to walk_frames' anchor-driven start rule)
 ///   str  x9, [x28, #LAST_KIND]
 ///   ldr  x2, [fp]                // x2 := fp-of-trapped-frame (= the saved fp)
-///   mov  x0, x28                 // &mut VmState (VM-state register, Â§3)
+///   mov  x0, x28                 // &mut VmState (VM-state register, §3)
 ///   mov  x1, x16                 // trap pc
 ///   ldr  x16, <rt_uncommon_trap>; blr x16   // Rust; result oop -> x0
 ///   str  xzr, [x28, #LAST_FP]    // clear the anchor (P9)
@@ -1114,7 +1114,7 @@ impl DeoptTrampolines {
 /// across it.
 ///
 /// (Historical: under step 5 `rt_uncommon_trap` was an `unimplemented!()`
-/// seam and this teardown never executed; step 6 filled it in â€” it now
+/// seam and this teardown never executed; step 6 filled it in — it now
 /// materializes the frame, runs `interpret_active`, and returns the deopt
 /// result, so this epilogue is live on every uncommon trap.)
 fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
@@ -1122,18 +1122,18 @@ fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
 
     // saved-lr := trap_pc (in x16), so the walker sees pc = trap_pc.
     a.emit("mov", &[x(30), x(16)]);
-    // Push { fp, lr(=trap_pc) } and re-root fp â€” a normal frame record.
+    // Push { fp, lr(=trap_pc) } and re-root fp — a normal frame record.
     a.emit("stp", &[x(29), x(30), mem_pre(31, -16)]);
     a.emit("mov", &[x(29), sp()]);
     // PUBLISH the record as the walker's anchor (task #92): the record alone
-    // is invisible â€” `walk_frames`' start rule reads `last_compiled_fp/pc/
+    // is invisible — `walk_frames`' start rule reads `last_compiled_fp/pc/
     // kind` when the innermost tier crossing is `IntoCompiled`, exactly the
     // state a GC inside `deoptimize_frame`'s materializer allocations (e.g.
     // `alloc_closure` under a block-carrying trap scope) walks from. Without
     // this the walk asserts (frames.rs "no anchor is set") AND, were the
     // assert removed, would skip the trapped frame's oops entirely. Same
     // three writes as `emit_stub_prologue`+`emit_stub_kind_tag`, same x9
-    // scratch precedent (registers are dead at a deopt site â€” S12 spill-all).
+    // scratch precedent (registers are dead at a deopt site — S12 spill-all).
     a.emit(
         "str",
         &[x(29), mem(28, VMREG_LAST_COMPILED_FP_OFFSET as i64)],
@@ -1159,7 +1159,7 @@ fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
         Some(RelocKind::RuntimeAddr),
     );
     a.call_far(lit);
-    // CLEAR the anchor (P9 â€” a stale anchor outliving this frame would let a
+    // CLEAR the anchor (P9 — a stale anchor outliving this frame would let a
     // walker step into freed stack), exactly as `emit_stub_epilogue` does:
     // xzr into fp + kind. Register 31 in a store's data position is the zero
     // register (see `emit_stub_epilogue`'s own note). x0 (the result oop) is
@@ -1173,7 +1173,7 @@ fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
         &[x(31), mem(28, VMREG_LAST_COMPILED_KIND_OFFSET as i64)],
     );
     // Teardown (D4): reload the trapped frame's fp from the stable record,
-    // then set sp to it so the `ldp` pops the COMPILED frame's own {fp,lr} â€”
+    // then set sp to it so the `ldp` pops the COMPILED frame's own {fp,lr} —
     // discarding both the trampoline record and the trapped compiled frame.
     a.emit("ldr", &[x(2), mem(29, 0)]);
     a.emit("mov", &[sp(), x(2)]);
@@ -1185,7 +1185,7 @@ fn build_uncommon_trampoline() -> crate::compiler::assembler::CodeBlob {
 
 /// D3 step 4: the assert stub `0xDE02` traps redirect to. Trap pc is in x16.
 /// Sets up a minimal frame and calls [`rt_compiled_assert_failed`], which
-/// panics â€” so this stub never actually returns. No RootSpill/anchor: the
+/// panics — so this stub never actually returns. No RootSpill/anchor: the
 /// panic tears the process down, so there is nothing for a walker to see.
 ///
 /// ```text
@@ -1214,12 +1214,12 @@ fn build_assert_stub() -> crate::compiler::assembler::CodeBlob {
     a.finish()
 }
 
-/// DBG0 (docs/DEBUGGER.md Â§4.1): the PROBE trampoline SIGSEGV/SIGBUS
-/// redirects resume into. Deliberately NON-destructive â€” unlike the
+/// DBG0 (docs/DEBUGGER.md §4.1): the PROBE trampoline SIGSEGV/SIGBUS
+/// redirects resume into. Deliberately NON-destructive — unlike the
 /// uncommon trampoline it touches neither the trapped frame's fp nor its
 /// sp (the crash scene is evidence, and a SEGV sp may itself be garbage or
 /// exhausted): it switches to PROBE's own dedicated static stack, marshals
-/// `x0 = x28` (&VmState â€” trustworthy because the handler only redirects
+/// `x0 = x28` (&VmState — trustworthy because the handler only redirects
 /// registered-range faults) and the trap pc, and calls the `-> !` dossier
 /// entry. The full register file was already captured in-handler.
 ///
@@ -1253,27 +1253,27 @@ fn build_probe_trampoline() -> crate::compiler::assembler::CodeBlob {
     a.finish()
 }
 
-// â”€â”€ Runtime entry points reached from the trampolines â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Runtime entry points reached from the trampolines ─────────────────────
 
 /// D4/D5: the `extern "C"` entry `deopt_uncommon_trampoline` calls after
-/// sigreturn. A THIN FORWARDER across the `codecache â†’ runtime â†’ interpreter`
+/// sigreturn. A THIN FORWARDER across the `codecache → runtime → interpreter`
 /// deopt seam (the designed crossing D4/D5 place `rt_uncommon_trap`'s
 /// materialization in `runtime`, so it may reach into `runtime`/`interpreter`
 /// here even though this module otherwise "must not touch the interpreter"):
 ///
-/// 1. map `trap_pc â†’ owning nmethod` ([`super::CodeTable::find_by_pc`]),
+/// 1. map `trap_pc → owning nmethod` ([`super::CodeTable::find_by_pc`]),
 /// 2. build the [`FrameView`] naming the trapped physical frame,
-/// 3. hand it to [`crate::runtime::deopt::deoptimize_frame`] â€” which owns ALL
+/// 3. hand it to [`crate::runtime::deopt::deoptimize_frame`] — which owns ALL
 ///    materialization logic (re-resolving the `DeoptState` itself, D5 M0), so
 ///    no `DeoptState` resolve happens here (avoids resolving twice),
 /// 4. run the materialized frame(s) to completion via
 ///    [`crate::interpreter::interpret_active`] (D5 M8),
-/// 5. return the result oop's raw bits â€” the trampoline epilogue hands them to
+/// 5. return the result oop's raw bits — the trampoline epilogue hands them to
 ///    the trapped method's native caller as if it had returned normally.
 ///
 /// This is an uncommon-trap site (`0xDE00`/`0xDE01`), so `reexecute == true`
 /// and `incoming_result` is `None` (the recorded stack holds the re-executing
-/// op's inputs â€” see [`FrameView::incoming_result`]).
+/// op's inputs — see [`FrameView::incoming_result`]).
 ///
 /// # Safety
 /// Only reached via `blr` from `deopt_uncommon_trampoline`; `vm` is `x28`
@@ -1284,11 +1284,11 @@ pub unsafe extern "C" fn rt_uncommon_trap(
     trap_pc: u64,
     fp: u64,
 ) -> u64 {
-    // SAFETY: contract above â€” `vm` is the `x28` &mut VmState the trampoline
+    // SAFETY: contract above — `vm` is the `x28` &mut VmState the trampoline
     // forwarded from the compiled call.
     let vm = unsafe { &mut *vm };
 
-    // trap_pc â†’ owning nmethod. A miss is a VM bug (a deopt brk must live
+    // trap_pc → owning nmethod. A miss is a VM bug (a deopt brk must live
     // inside a published nmethod), so this is a panic, not a graceful path.
     let nm_id = vm.code_table.find_by_pc(trap_pc).unwrap_or_else(|| {
         panic!(
@@ -1317,7 +1317,7 @@ pub unsafe extern "C" fn rt_uncommon_trap(
     vm.tier_links.push(bridge);
     let result = crate::interpreter::interpret_active(vm, resume).raw();
     vm.tier_links.pop();
-    // S14 step 8: the trap's re-execution just WARMED whatever IC was cold â€”
+    // S14 step 8: the trap's re-execution just WARMED whatever IC was cold —
     // count it and, past the limit, recompile this nmethod against the new
     // feedback (the storm-closer). After the nested run so the profile
     // snapshot sees the warmed state.
@@ -1328,12 +1328,12 @@ pub unsafe extern "C" fn rt_uncommon_trap(
 /// D6 helper: the victim activation's ORIGINAL return pc, looked up (peek, no
 /// remove) in `pending_deopts` by the victim's fp. `deopt_return_trampoline`
 /// calls this FIRST, before building its walker-visible frame record, so that
-/// `[record_fp + 8]` can hold `orig_ret_pc` â€” a pc inside the victim nm â€” and a
+/// `[record_fp + 8]` can hold `orig_ret_pc` — a pc inside the victim nm — and a
 /// GC during the later `rt_deopt_on_return` call classifies the victim compiled
 /// frame at its true return safepoint (its oop map covers exactly that pc, D4).
 /// Pure lookup: no allocation, no GC, so it is safe to call before the record
 /// exists. A miss is the same VM bug [`rt_deopt_on_return`] panics on (only
-/// runs for a Â§2c-redirected slot); panicking here surfaces it one call
+/// runs for a §2c-redirected slot); panicking here surfaces it one call
 /// earlier. `rt_deopt_on_return` does the actual `remove`.
 ///
 /// # Safety
@@ -1350,7 +1350,7 @@ pub unsafe extern "C" fn rt_deopt_return_pc(
         .unwrap_or_else(|| {
             panic!(
                 "rt_deopt_return_pc: no pending deopt for victim fp {fp:#x} -- the return \
-                 trampoline fired for a slot Â§2c never redirected (VM-consistency bug)"
+                 trampoline fired for a slot §2c never redirected (VM-consistency bug)"
             )
         })
         .orig_ret_pc as u64
@@ -1359,22 +1359,22 @@ pub unsafe extern "C" fn rt_deopt_return_pc(
 /// D6: the `extern "C"` entry `deopt_return_trampoline` (`codecache::stubs`)
 /// calls after a callee returns into a redirected saved-LR slot of a
 /// `NotEntrant` nmethod activation. The sibling of [`rt_uncommon_trap`] on the
-/// RETURN path â€” the two differ in exactly two inputs to the SAME
+/// RETURN path — the two differ in exactly two inputs to the SAME
 /// materialize+run machinery ([`crate::runtime::deopt::deoptimize_frame`] +
 /// [`crate::interpreter::interpret_active`], reused UNCHANGED):
 ///
 /// - `pc = orig_ret_pc` (the original return address into the victim, whose
-///   `PcDesc` names a `SafepointKind::Call` deopt site â€” `reexecute == false`
+///   `PcDesc` names a `SafepointKind::Call` deopt site — `reexecute == false`
 ///   by construction, since it's a return address), vs the trap pc; and
 /// - `incoming_result = Some(result)` (the completed call's value, which the
 ///   materializer pushes onto the innermost operand stack, D5 M3.3), vs `None`.
 ///
-/// `fp` is the victim (nm) activation's OWN fp â€” the key
+/// `fp` is the victim (nm) activation's OWN fp — the key
 /// [`crate::runtime::vm_state::VmState::pending_deopts`] was populated under by
-/// Â§2c ([`crate::runtime::frames::redirect_returns_into_nm`]). Consuming that
+/// §2c ([`crate::runtime::frames::redirect_returns_into_nm`]). Consuming that
 /// entry yields `PendingDeopt { orig_ret_pc, nm }`; a MISSING entry is a VM bug
-/// (the trampoline only runs for a slot Â§2c redirected, which always inserts
-/// the entry first) â†’ panic. Returns the deoptee's result oop raw bits, which
+/// (the trampoline only runs for a slot §2c redirected, which always inserts
+/// the entry first) → panic. Returns the deoptee's result oop raw bits, which
 /// the trampoline `ret`s to the victim's OWN caller (the activation is gone).
 ///
 /// # Safety
@@ -1388,37 +1388,37 @@ pub unsafe extern "C" fn rt_deopt_on_return(
     fp: u64,
     result: u64,
 ) -> u64 {
-    // SAFETY: contract above â€” `vm` is the `x28` &mut VmState the trampoline
+    // SAFETY: contract above — `vm` is the `x28` &mut VmState the trampoline
     // forwarded.
     let vm = unsafe { &mut *vm };
 
     // NLR escaping through a redirected frame: the callee is propagating a
-    // non-local-return SENTINEL in x0, NOT a call result â€” Â§2c hijacked the
+    // non-local-return SENTINEL in x0, NOT a call result — §2c hijacked the
     // exact native return edge (`[callee_fp+8]`) the NLR sentinel rides on (S11
     // step 9). Do NOT deopt: drop the pending entry and hand the sentinel
     // straight back, so the trampoline's teardown `ret`s it to the victim's
-    // caller â€” exactly what the victim's own `emit_nlr_check` at `orig_ret_pc`
+    // caller — exactly what the victim's own `emit_nlr_check` at `orig_ret_pc`
     // would have done had the return not been redirected. MUST precede the
     // `Oop::from_raw` below: the sentinel (`0b0110`) is a reserved-tag word that
-    // trips `from_raw`'s debug tag check (â†’ abort across the extern "C" edge).
+    // trips `from_raw`'s debug tag check (→ abort across the extern "C" edge).
     if result == crate::oops::layout::NLR_SENTINEL {
         vm.pending_deopts.remove(&(fp as usize));
         return crate::oops::layout::NLR_SENTINEL;
     }
 
     // Consume the pending deopt for THIS activation (keyed by its own fp). A
-    // miss is a VM bug: Â§2c redirects a slot only after inserting its entry, so
+    // miss is a VM bug: §2c redirects a slot only after inserting its entry, so
     // the trampoline can never run for an fp with no entry.
     let pending = vm.pending_deopts.remove(&(fp as usize)).unwrap_or_else(|| {
         panic!(
             "rt_deopt_on_return: no pending deopt for victim fp {fp:#x} -- the return \
-             trampoline fired for a slot Â§2c never redirected (VM-consistency bug)"
+             trampoline fired for a slot §2c never redirected (VM-consistency bug)"
         )
     });
 
     // Reuse the step-6/7 materialize+run path EXACTLY (same two calls
     // `rt_uncommon_trap` makes): the ONLY differences are `pc = orig_ret_pc`
-    // and `incoming_result = Some(result)` â€” a call-return (reexecute == false)
+    // and `incoming_result = Some(result)` — a call-return (reexecute == false)
     // site, so `deoptimize_frame` pushes the result onto the innermost operand
     // stack (D5 M3.3).
     let resume = crate::runtime::deopt::deoptimize_frame(
@@ -1440,9 +1440,9 @@ pub unsafe extern "C" fn rt_deopt_on_return(
 }
 
 /// D3 step 4 (rerouted by DBG0): the off-signal landing for a `0xDE02`
-/// compiled-assertion trap â€” a compiled-code "should not reach", always a
+/// compiled-assertion trap — a compiled-code "should not reach", always a
 /// VM bug. Previously this panicked; now it emits the full PROBE dossier
-/// (docs/DEBUGGER.md Â§4.2 â€” the handler captured the register file on the
+/// (docs/DEBUGGER.md §4.2 — the handler captured the register file on the
 /// `TRAP_ASSERT` arm) and exits 70. `-> !`: it never returns to the assert
 /// stub.
 ///
@@ -1453,12 +1453,12 @@ pub unsafe extern "C" fn rt_compiled_assert_failed(
     vm: *mut crate::runtime::vm_state::VmState,
     trap_pc: u64,
 ) -> ! {
-    // SAFETY: contract above â€” x28 is &mut VmState inside compiled code.
+    // SAFETY: contract above — x28 is &mut VmState inside compiled code.
     let vm = unsafe { &mut *vm };
     let mut regs = read_captured();
     regs.pc = trap_pc; // belt-and-braces: the capture's pc IS the trap pc
     eprintln!(
-        "compiled-code assertion (brk #0xDE02) at pc {trap_pc:#x} â€” a 'should not reach' \
+        "compiled-code assertion (brk #0xDE02) at pc {trap_pc:#x} — a 'should not reach' \
          guard fired; this is a VM/compiler bug"
     );
     // SAFETY: vm is the live VmState per this function's own contract.
@@ -1466,7 +1466,7 @@ pub unsafe extern "C" fn rt_compiled_assert_failed(
 }
 
 /// DBG0: the off-signal landing for a SIGSEGV/SIGBUS whose pc was inside a
-/// registered code cache â€” reached via `build_probe_trampoline` on PROBE's
+/// registered code cache — reached via `build_probe_trampoline` on PROBE's
 /// own dedicated stack, with the register file already captured in-handler.
 /// Emits the dossier and exits 70.
 ///
@@ -1496,14 +1496,14 @@ pub unsafe extern "C" fn rt_probe_crash(
     unsafe { crate::runtime::probe::crash_dossier(vm, &regs, trigger) }
 }
 
-// â”€â”€ A checked native-stack slot read (layer-boundary helper) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── A checked native-stack slot read (layer-boundary helper) ──────────────
 
 /// Read the oop at byte offset `off` from a compiled frame's FP. The single
 /// **safe-to-call** door `runtime/deopt.rs` (step 6, a `#![deny(unsafe_code)]`
 /// module) uses to touch a raw native-stack slot: the safety table pins that
 /// `runtime/deopt` may reach native-stack pointers *only* through this
 /// helper. Kept here (in `codecache`, the unsafe island) so the raw deref is
-/// licensed where unsafe already lives â€” the deref is wrapped internally, so
+/// licensed where unsafe already lives — the deref is wrapped internally, so
 /// the caller (which cannot write `unsafe`) needs no `unsafe` block, exactly
 /// what "the single door the deny-unsafe materializer uses" requires.
 ///
@@ -1511,36 +1511,36 @@ pub unsafe extern "C" fn rt_probe_crash(
 /// obligation: `fp` must be a live compiled frame's FP and `fp + off` a slot
 /// within that frame (guaranteed by a `DeoptState`'s `FrameSlot` offsets,
 /// which the compiler emitted for exactly this frame). A caller that violates
-/// it corrupts memory the same way an out-of-bounds index would â€” the door is
+/// it corrupts memory the same way an out-of-bounds index would — the door is
 /// "safe" in Rust's sense (no `unsafe` at the call site) while still trusting
 /// its input, the standard shape for a licensed low-level primitive.
 pub fn read_frame_slot(fp: usize, off: i32) -> Oop {
     let addr = (fp as isize + off as isize) as *const u64;
-    // SAFETY: contract above â€” `fp + off` is an 8-byte-aligned live slot.
+    // SAFETY: contract above — `fp + off` is an 8-byte-aligned live slot.
     Oop::from_raw(unsafe { core::ptr::read(addr) })
 }
 
 /// [`read_frame_slot`] for a slot holding a RAW `f64` bit pattern
-/// (`ValueLoc::DoubleSlot`, the float fast-path's unboxed temps) â€” same
+/// (`ValueLoc::DoubleSlot`, the float fast-path's unboxed temps) — same
 /// contract, but returns the bits WITHOUT constructing an `Oop`:
 /// `Oop::from_raw`'s debug validation rejects any word whose low bits look
 /// like a mark tag, which ~a quarter of genuine doubles do.
 pub fn read_frame_slot_raw(fp: usize, off: i32) -> u64 {
     let addr = (fp as isize + off as isize) as *const u64;
-    // SAFETY: contract above â€” `fp + off` is an 8-byte-aligned live slot.
+    // SAFETY: contract above — `fp + off` is an 8-byte-aligned live slot.
     unsafe { core::ptr::read(addr) }
 }
 
-/// Read the live oop at oop-pool index `pool_ix` of `nm` â€” the second door
+/// Read the live oop at oop-pool index `pool_ix` of `nm` — the second door
 /// (alongside [`read_frame_slot`]) the `#![deny(unsafe_code)]` materializer
 /// (`runtime/deopt.rs`) uses to reach a raw code-cache word. A `ValueLoc::
 /// ConstPool(i)` / scope `method_pool_ix` names an entry in the nmethod's
-/// oop pool, whose physical home is `code.base + literal_off + 8*i` â€” the
+/// oop pool, whose physical home is `code.base + literal_off + 8*i` — the
 /// SAME word the S9 assembler laid down (`compiler::emit::intern_pool` maps
 /// IR pool entry `i` 1:1 to assembler `LiteralId(i)`, and the pool is the
 /// FIRST thing interned, so IR index == `LiteralId` == this slot) and the
 /// SAME word S12's GC keeps current (`CodeTable::oops_do` relocates it in
-/// place), so a moving collection never invalidates the index â€” only the
+/// place), so a moving collection never invalidates the index — only the
 /// bits behind it, which is exactly why the read must be LIVE (here), never
 /// a compile-time snapshot. Kept in `codecache` (the unsafe island) so the
 /// raw deref is licensed where unsafe already lives, mirroring
@@ -1549,7 +1549,7 @@ pub fn read_frame_slot_raw(fp: usize, off: i32) -> u64 {
 ///
 /// Precondition (a `debug_assert` guards it): `literal_off + 8*(pool_ix+1) <=
 /// code.len` (the slot lies fully inside the nmethod's live MAP_JIT code
-/// region) â€” guaranteed by a `ValueLoc` the compiler emitted against THIS
+/// region) — guaranteed by a `ValueLoc` the compiler emitted against THIS
 /// nmethod's own pool.
 pub fn read_pool_oop(nm: &crate::codecache::nmethod::Nmethod, pool_ix: u32) -> Oop {
     let off = nm.literal_off as usize + 8 * pool_ix as usize;
@@ -1560,50 +1560,50 @@ pub fn read_pool_oop(nm: &crate::codecache::nmethod::Nmethod, pool_ix: u32) -> O
         nm.code.len
     );
     let addr = (nm.code.base as usize + off) as *const u64;
-    // SAFETY: contract above â€” `off` is an 8-byte-aligned live pool slot
+    // SAFETY: contract above — `off` is an 8-byte-aligned live pool slot
     // inside `[code.base, code.base + code.len)`.
     Oop::from_raw(unsafe { core::ptr::read(addr) })
 }
 
-// â”€â”€ install (D3): sigaction once at startup + trampoline generation â”€â”€â”€â”€â”€â”€â”€
+// ── install (D3): sigaction once at startup + trampoline generation ───────
 
 /// Arms the SIGSEGV/SIGBUS foreign-fault handler (+ this thread's own
 /// sigaltstack) directly, without going through [`install`]. `VmState::
-/// with_options` only calls `install` when the JIT is enabled â€” a pure
+/// with_options` only calls `install` when the JIT is enabled — a pure
 /// interpreter never emits a deopt trap, so arming SIGTRAP and publishing
-/// trampolines would be pure overhead â€” but an embedded `VmHandle`
+/// trampolines would be pure overhead — but an embedded `VmHandle`
 /// (`embed::VmHandle::boot`, S21) needs `sig_fault_handler`'s foreign-fault
 /// recovery regardless of JIT mode: the safety directive behind it ("if the
 /// language thread dies, the GUI must not die") draws no JIT-mode
-/// exception, and `docs/SPEC.md` Â§16.5 itself requires the GUI's Browser
+/// exception, and `docs/SPEC.md` §16.5 itself requires the GUI's Browser
 /// accept path to run with `MACVM_JIT=off` until compiled-tier redefinition
 /// lands. Without this, an embedded `JitMode::Off` VM would have NO signal
 /// handler armed at all (`install` never runs), so any native fault (e.g.
 /// `Alien`'s raw pointer accessors, S20) would kill the whole process.
 ///
-/// Deliberately unconditional â€” no "arm once" guard, unlike `install`'s
+/// Deliberately unconditional — no "arm once" guard, unlike `install`'s
 /// `HANDLER_ARMED`: `sigaltstack` is a PER-THREAD kernel resource, so if two
 /// embedded `VmHandle`s ever ran on two different worker threads in the
-/// same process, each needs its OWN call to register its OWN alt-stack â€” an
+/// same process, each needs its OWN call to register its OWN alt-stack — an
 /// "arm once, process-wide" guard would silently leave the second thread
 /// with none. Each thread's alt-stack is now its own per-thread buffer
 /// ([`ALT_STACK`], CG0), so two threads faulting concurrently no longer race
-/// on shared memory â€” the case the worker fleet and the Cocoa GUI (a primary
+/// on shared memory — the case the worker fleet and the Cocoa GUI (a primary
 /// VM on a background thread + a UI callback on main) make likely, proven by
 /// `concurrent_foreign_faults_on_two_threads_each_recover_on_their_own_altstack`.
 /// Redundant calls (a JIT-enabled boot, where `install` already armed the
 /// same two signals on this same thread; or calling `boot` twice on one
-/// thread) are harmless â€” `arm_this_threads_altstack`/`sigaction` are
+/// thread) are harmless — `arm_this_threads_altstack`/`sigaction` are
 /// themselves idempotent, and both paths install the exact same
 /// `sig_fault_handler` function pointer.
 pub(crate) fn arm_foreign_fault_handler() {
-    // Register THIS thread's own sigaltstack (per-thread â€” CG0). Ordinary
+    // Register THIS thread's own sigaltstack (per-thread — CG0). Ordinary
     // context here, so the lazy thread-local buffer alloc is safe.
     arm_this_threads_altstack();
-    // WINVM: no fault handler to arm yet â€” foreign faults keep the OS
+    // WINVM: no fault handler to arm yet — foreign faults keep the OS
     // default disposition until the Phase-2 VEH lands.
     // SAFETY: a fully zeroed, fully initialized `sigaction`, matching the
-    // SA_SIGINFO 3-arg ABI `sig_fault_handler` expects â€” the same shape
+    // SA_SIGINFO 3-arg ABI `sig_fault_handler` expects — the same shape
     // `install`'s own arm block uses below.
     #[cfg(target_os = "macos")]
     unsafe {
@@ -1663,14 +1663,14 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
     let (lo, hi) = cache.bounds();
     register_with_probe(lo, hi, hu.base as u64, ha.base as u64, hp.base as u64);
 
-    // 3. Register THIS thread's own sigaltstack (per-thread â€” CG0), on EVERY
+    // 3. Register THIS thread's own sigaltstack (per-thread — CG0), on EVERY
     //    call, before the process-global sigaction arming below. Unlike the
     //    handler disposition (armed once, `HANDLER_ARMED`), the alt-stack is a
     //    per-thread kernel resource: a second JIT `VmState` booting on another
     //    thread needs its own, or its SA_ONSTACK handler has no stack to
     //    deliver on (the exact "arm once, process-wide leaves the 2nd thread
     //    with none" trap `arm_foreign_fault_handler`'s doc calls out). SA_ONSTACK
-    //    now actually means something â€” DBG0 installs the sigaltstack (previously
+    //    now actually means something — DBG0 installs the sigaltstack (previously
     //    none existed anywhere, making the flag inert).
     arm_this_threads_altstack();
 
@@ -1679,7 +1679,7 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
     if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
         // SAFETY: both handlers match the SA_SIGINFO 3-arg ABI; armed exactly
         // once (the swap above) with zeroed, fully-initialized structures.
-        // WINVM: nothing to arm on Windows yet â€” deopt traps cannot fire
+        // WINVM: nothing to arm on Windows yet — deopt traps cannot fire
         // before the x64 backend + Phase-2 VEH exist anyway.
         #[cfg(target_os = "macos")]
         unsafe {
@@ -1690,9 +1690,9 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
             let rc = libc::sigaction(libc::SIGTRAP, &sa, core::ptr::null_mut());
             assert_eq!(rc, 0, "deopt_trap::install: sigaction(SIGTRAP) failed");
 
-            // DBG0: the PROBE fault handlers (docs/DEBUGGER.md Â§4.1). Armed
+            // DBG0: the PROBE fault handlers (docs/DEBUGGER.md §4.1). Armed
             // with the JIT (interpreter-only runs have no code cache, so
-            // every fault there is foreign-by-definition â€” the v2 arming
+            // every fault there is foreign-by-definition — the v2 arming
             // decision recorded in the design doc).
             let mut sf: libc::sigaction = core::mem::zeroed();
             sf.sa_sigaction = sig_fault_handler as *const () as usize;
@@ -1711,19 +1711,19 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
     }
 }
 
-// â”€â”€ Test-only hooks: point the handler's redirect at a capture stub â”€â”€â”€â”€â”€â”€â”€
+// ── Test-only hooks: point the handler's redirect at a capture stub ───────
 //
 // `handler_redirect_smoke` (tests_s13.md) needs to exercise the
-// signalâ†’ucontext-rewriteâ†’trampoline path in ISOLATION, WITHOUT reaching the
-// real (fully implemented) `rt_uncommon_trap` â€” a hand-built test frame has
+// signal→ucontext-rewrite→trampoline path in ISOLATION, WITHOUT reaching the
+// real (fully implemented) `rt_uncommon_trap` — a hand-built test frame has
 // no genuine deopt record to materialize from. These hooks let
 // a test arm the handler + point `UNCOMMON_TRAMPOLINE` at its OWN benign
 // capture stub that records (pc, x16) and returns, then restore state.
 
 /// # Safety
-/// Test-only. Registers a single `[lo, hi)` range â†’ `uncommon_tramp` and arms
+/// Test-only. Registers a single `[lo, hi)` range → `uncommon_tramp` and arms
 /// the handler, so a test can drive the whole signal path against a hand-built
-/// stub. Serialize test use (`#[serial]`-style single-threaded runner) â€” the
+/// stub. Serialize test use (`#[serial]`-style single-threaded runner) — the
 /// registry + SIGTRAP disposition are process-global, shared with the real
 /// handler. `test_disarm_handler` restores `SIG_DFL` + retires the entry.
 #[cfg(all(test, target_os = "macos"))]
@@ -1749,10 +1749,10 @@ mod tests {
     /// entry the trampoline `blr`s), NOT via the safe runtime wrapper: install
     /// a real nmethod carrying a recorder scope blob + PcDesc, hand-build the
     /// trapped physical frame, and call `rt_uncommon_trap(vm, trap_pc, fp)`
-    /// directly â€” simulating exactly what `deopt_uncommon_trampoline` does
+    /// directly — simulating exactly what `deopt_uncommon_trampoline` does
     /// after sigreturn (minus the actual signal, which 7b's signal-driven
     /// differential test adds). Asserts the whole forwarder chain
-    /// (`find_by_pc` â†’ `deoptimize_frame` â†’ `interpret_active`) runs the
+    /// (`find_by_pc` → `deoptimize_frame` → `interpret_active`) runs the
     /// deoptee to completion and returns its result oop's raw bits.
     ///
     /// Deoptee: `push_smi_i8(0x2A); return_tos`; a re-execute uncommon-trap
@@ -1843,7 +1843,7 @@ mod tests {
         );
     }
 
-    /// S13 step 9 â€” `rt_deopt_on_return` END-TO-END, driven directly like
+    /// S13 step 9 — `rt_deopt_on_return` END-TO-END, driven directly like
     /// `rt_uncommon_trap_runs_to_completion` (the trampoline's own call, minus
     /// the native trampoline itself). Seeds `pending_deopts[fp]` with a Call
     /// (reexecute == false) deopt site at `orig_ret_pc`, hand-builds the victim
@@ -1854,7 +1854,7 @@ mod tests {
     ///
     /// Deoptee: `push_self; send #foo; return_tos`. The site is the RETURN of
     /// `send #foo` (reexecute == false, resume bci PAST the 2-byte send at bci
-    /// 1 â†’ bci 3), so the nested run does NOT re-run the send â€” it resumes at
+    /// 1 → bci 3), so the nested run does NOT re-run the send — it resumes at
     /// `return_tos` with `incoming_result` already on the stack and delivers it.
     #[test]
     fn rt_deopt_on_return_runs_to_completion() {
@@ -1918,11 +1918,11 @@ mod tests {
         let phys: [u64; 2] = [receiver_val.raw(), 0];
         let fp = (&phys[1]) as *const u64 as usize;
 
-        // The completed callee's result â€” what Â§2c's return path delivers as
+        // The completed callee's result — what §2c's return path delivers as
         // incoming_result and the deoptee's `return_tos` then returns.
         let result_val = SmallInt::new(0x5A).oop();
 
-        // Seed the pending deopt exactly as Â§2c's redirection walk would have.
+        // Seed the pending deopt exactly as §2c's redirection walk would have.
         vm.pending_deopts.insert(
             fp,
             PendingDeopt {
@@ -1961,7 +1961,7 @@ mod tests {
     }
 
     /// S13 step 9 (NLR fix): an NLR sentinel escaping through a redirected
-    /// frame is NOT a call result â€” `rt_deopt_on_return` hands it straight back
+    /// frame is NOT a call result — `rt_deopt_on_return` hands it straight back
     /// (the trampoline propagates it) instead of materializing a frame from the
     /// reserved-tag word. Without this, `Oop::from_raw(sentinel)` aborts (debug)
     /// or the sentinel is pushed as a bogus operand + the NLR is swallowed
@@ -1989,7 +1989,7 @@ mod tests {
         );
         let before = vm.stats.deopt_count;
 
-        // SAFETY: the NLR-sentinel arm returns before dereferencing nm/fp â€” the
+        // SAFETY: the NLR-sentinel arm returns before dereferencing nm/fp — the
         // dummy PendingDeopt is never read, so no real nmethod/frame is needed.
         let raw = unsafe {
             rt_deopt_on_return(
@@ -2014,16 +2014,16 @@ mod tests {
     }
 
     // NB: the "missing `pending_deopts[fp]` panics" guard in `rt_deopt_on_
-    // return` / `rt_deopt_return_pc` is deliberately NOT unit-tested â€” a panic
+    // return` / `rt_deopt_return_pc` is deliberately NOT unit-tested — a panic
     // out of an `extern "C"` fn ABORTS (it cannot unwind across the C ABI), so
     // `#[should_panic]` can't observe it. The guard is a documented VM-bug
-    // assertion (the trampoline only ever fires for a Â§2c-redirected slot, which
+    // assertion (the trampoline only ever fires for a §2c-redirected slot, which
     // always records the entry first); the safe walker's own analogue
     // (`resolve_redirected_lr`, a plain Rust fn) carries the same invariant.
 
     /// `brk_imm_decode` (tests_s13.md): the encoder for `brk #0xDE00..02`
-    /// round-trips through the handler's decode mask, and foreign brks â€”
-    /// notably Rust's `abort()` (`brk #1`) â€” are rejected (so SIG_DFL keeps
+    /// round-trips through the handler's decode mask, and foreign brks —
+    /// notably Rust's `abort()` (`brk #1`) — are rejected (so SIG_DFL keeps
     /// them fatal).
     #[test]
     fn brk_imm_decode() {
@@ -2074,7 +2074,7 @@ mod tests {
     /// `handler_redirect_smoke` (tests_s13.md): publish a stub that
     /// `brk #0xDE01`s; a test-mode trampoline records (pc, x16) and returns;
     /// assert the trap pc was stashed in x16 and the handler redirected into
-    /// the trampoline â€” i.e. the full signal â†’ ucontext-rewrite â†’ trampoline
+    /// the trampoline — i.e. the full signal → ucontext-rewrite → trampoline
     /// path fires in isolation, without reaching the step-6 seam.
     ///
     /// Runs on the CURRENT thread and installs a process-global SIGTRAP
@@ -2103,9 +2103,9 @@ mod tests {
         // machine state is: lr = the return address into `run_stub`'s caller
         // frame, fp = that caller's fp, x16 = trap pc. So a plain `ret` (after
         // recording x16) returns straight out of the stub as if it had done
-        // nothing â€” no frame was ever built by the brk-stub.
+        // nothing — no frame was ever built by the brk-stub.
         extern "C" fn capture_and_return() {
-            // These statics are plain atomics â€” the only "work" done, and safe
+            // These statics are plain atomics — the only "work" done, and safe
             // to touch here because control has already left signal context
             // (we are running normal code the handler resumed into).
             // We read x16 via inline read of the stashed value. Since we can't
@@ -2121,7 +2121,7 @@ mod tests {
 
         // Build a stub whose first instruction is `brk #0xDE01`, followed by a
         // `ret` (only reached if the handler somehow returns without
-        // redirecting â€” then the test's asserts fail cleanly rather than
+        // redirecting — then the test's asserts fail cleanly rather than
         // executing garbage).
         let mut cache = CodeCache::new(1 << 16).unwrap();
 
@@ -2186,11 +2186,11 @@ mod tests {
     }
 
     /// S21: the foreign-fault recovery path end to end, against a REAL,
-    /// deliberately-induced `SIGSEGV` (a bad-pointer read) â€” not simulated.
+    /// deliberately-induced `SIGSEGV` (a bad-pointer read) — not simulated.
     /// Proves `claim_jmp_slot`/`jmp_buf_ptr`/`sig_fault_handler`'s new
     /// branch/`take_last_crash_info` compose correctly: `sigsetjmp`,
     /// called DIRECTLY at this test closure's own call site (never through
-    /// a wrapper function â€” see `sigsetjmp`'s own doc for why that matters;
+    /// a wrapper function — see `sigsetjmp`'s own doc for why that matters;
     /// an earlier version of this code got exactly that wrong and this
     /// same test caught it), "returns twice" (once normally, once via
     /// `siglongjmp` after the real fault), and the crash info published
@@ -2200,7 +2200,7 @@ mod tests {
     /// design exists to prevent, made concrete rather than hidden.
     #[test]
     fn foreign_fault_recovers_via_registered_jmp_slot_on_a_real_segv() {
-        // Arms SIGTRAP/SIGSEGV/SIGBUS (idempotent â€” may already be armed by
+        // Arms SIGTRAP/SIGSEGV/SIGBUS (idempotent — may already be armed by
         // another test in this process; `install`'s own `HANDLER_ARMED`
         // guard makes re-calling it safe, matching this file's established
         // per-test convention above).
@@ -2211,15 +2211,15 @@ mod tests {
             let slot = claim_jmp_slot();
             // SAFETY: `slot` was just claimed by this exact thread; the
             // `sigsetjmp` call is inline, right here, at this closure's own
-            // call site â€” its frame stays live for the rest of the closure
+            // call site — its frame stays live for the rest of the closure
             // (the recovery window), never returning in between.
             let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
             if rc == 0 {
-                // First pass: cause a REAL SIGSEGV (address 8 â€” the null
+                // First pass: cause a REAL SIGSEGV (address 8 — the null
                 // page, always unmapped).
                 let bad = 8usize as *const u8;
                 unsafe { std::ptr::read_volatile(bad) };
-                panic!("unreachable â€” the segv should have recovered via siglongjmp");
+                panic!("unreachable — the segv should have recovered via siglongjmp");
             }
             // Resumed here via siglongjmp, not a normal return.
             let info = take_last_crash_info();
@@ -2240,9 +2240,9 @@ mod tests {
     /// work once": `sigsetjmp(env, 1)`'s own "save the signal mask"
     /// semantics must correctly un-block `SIGSEGV` after `siglongjmp`, or a
     /// SECOND real fault's behavior is undefined (plain `setjmp`/`longjmp`
-    /// do NOT restore the mask â€” this is exactly the distinction that made
+    /// do NOT restore the mask — this is exactly the distinction that made
     /// `sigsetjmp`/`siglongjmp` the right choice over the plain variants).
-    /// Two real, separately-induced SIGSEGVs, both recovered â€” `sigsetjmp`
+    /// Two real, separately-induced SIGSEGVs, both recovered — `sigsetjmp`
     /// is called FRESH each loop iteration, matching the real deployment
     /// shape (once per guest eval), each call still inline at this same
     /// closure's own call site.
@@ -2275,7 +2275,7 @@ mod tests {
     }
 
     /// `take_last_crash_info` must not falsely report a crash for a thread
-    /// that registered a slot but never actually faulted â€” `sigsetjmp`'s
+    /// that registered a slot but never actually faulted — `sigsetjmp`'s
     /// own `0` return (no recovery happened yet).
     #[test]
     fn take_last_crash_info_is_none_before_any_fault() {
@@ -2295,9 +2295,9 @@ mod tests {
 
     /// `arm_foreign_fault_handler` (S21, `embed::VmHandle::boot`'s
     /// `JitMode::Off` case) must recover a real SIGSEGV with NO `CodeCache`/
-    /// `install` involved at all â€” proving the foreign-fault path does not
+    /// `install` involved at all — proving the foreign-fault path does not
     /// secretly depend on the JIT-only `install` having run first. Confirms
-    /// the actual gap this function closes: SPEC Â§16.5 requires the GUI's
+    /// the actual gap this function closes: SPEC §16.5 requires the GUI's
     /// Browser accept path to run with `MACVM_JIT=off`, and `with_options`
     /// never calls `install` in that mode.
     #[test]
@@ -2309,7 +2309,7 @@ mod tests {
             if rc == 0 {
                 let bad = 8usize as *const u8;
                 unsafe { std::ptr::read_volatile(bad) };
-                panic!("unreachable â€” the segv should have recovered via siglongjmp");
+                panic!("unreachable — the segv should have recovered via siglongjmp");
             }
             let info = take_last_crash_info();
             deregister_setjmp();
@@ -2322,12 +2322,12 @@ mod tests {
         assert_eq!(far, 8);
     }
 
-    /// CG0 â€” the test the per-thread alt-stacks exist for. Two threads each
+    /// CG0 — the test the per-thread alt-stacks exist for. Two threads each
     /// arm the foreign-fault handler (each registering its OWN sigaltstack) and
     /// then fault IN LOCKSTEP, many times, synchronized on a `Barrier` so their
     /// two signal handlers run as close to simultaneously as the scheduler
     /// allows. With the pre-CG0 single shared alt-stack, the two handlers ran
-    /// on the same buffer and stomped each other's frames â€” a corrupted
+    /// on the same buffer and stomped each other's frames — a corrupted
     /// `siglongjmp` state, a wrong recorded fault address, or a hard crash.
     /// With per-thread alt-stacks both recoveries are independent: each thread
     /// must see ITS OWN fault address across every iteration, and the whole
@@ -2349,7 +2349,7 @@ mod tests {
                 let slot = claim_jmp_slot();
                 let mut recoveries = 0usize;
                 for _ in 0..ITERS {
-                    // Rendezvous so both threads fault together â€” the race the
+                    // Rendezvous so both threads fault together — the race the
                     // per-thread alt-stacks fix.
                     barrier.wait();
                     // SAFETY: `slot` was claimed by this exact thread; the
@@ -2359,16 +2359,16 @@ mod tests {
                     if rc == 0 {
                         let bad = addr as *const u8;
                         // SAFETY: a deliberate read of an always-unmapped low
-                        // address â€” a genuine SIGSEGV, recovered via siglongjmp.
+                        // address — a genuine SIGSEGV, recovered via siglongjmp.
                         unsafe { std::ptr::read_volatile(bad) };
-                        panic!("unreachable â€” the segv must recover via siglongjmp");
+                        panic!("unreachable — the segv must recover via siglongjmp");
                     }
                     let (sig, _pc, far) = take_last_crash_info()
                         .expect("a recovered foreign fault must have crash info");
                     assert_eq!(sig, libc::SIGSEGV);
                     assert_eq!(
                         far, addr as u64,
-                        "each thread must see ITS OWN fault address â€” a mismatch \
+                        "each thread must see ITS OWN fault address — a mismatch \
                          means the two handlers corrupted each other's state"
                     );
                     recoveries += 1;
@@ -2399,7 +2399,7 @@ mod tests {
     #[test]
     fn read_frame_slot_reads_offset() {
         // Low 2 bits = 0b00 (smi tag) so `Oop::from_raw`'s debug tag check is
-        // satisfied â€” real spill slots hold real oops, never raw junk words.
+        // satisfied — real spill slots hold real oops, never raw junk words.
         let slots: [u64; 4] = [0x1110, 0x2220, 0x3330, 0x4440];
         let fp = slots.as_ptr() as usize;
         // off 0, +8, +16 in bytes.
