@@ -226,7 +226,21 @@ pub(crate) fn fatal_exit(code: i32) -> ! {
             // skips, so `join()` panics and `is_finished()` never becomes
             // true; dropping an unjoined handle is safe, per the same
             // experiment).
-            unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+            #[cfg(unix)]
+            unsafe {
+                libc::pthread_exit(std::ptr::null_mut())
+            }
+            // WINVM: ExitThread is the exact analogue — terminates only the
+            // calling thread, runs no Rust Drop glue, never returns. The
+            // same never-join contract on the spawner applies.
+            #[cfg(windows)]
+            {
+                extern "system" {
+                    fn ExitThread(code: u32) -> !;
+                }
+                // SAFETY: terminates only the calling thread; never returns.
+                unsafe { ExitThread(code as u32) }
+            }
         }
     }
 }
@@ -504,7 +518,12 @@ pub fn format_vm_stats(vm: &VmState) -> String {
             // C2 (docs/cocoa_bridge_design.md §8): the DNU shape-cache
             // hit rate. Process-wide (the cache is shared by every VM in
             // the process), reported here so `__vmStats` shows it.
+            // WINVM: no Cocoa bridge — report zeros so the stats shape
+            // (and anything parsing it) stays identical across platforms.
+            #[cfg(target_os = "macos")]
             let (hits, misses) = crate::runtime::objc_bridge::shape_stats();
+            #[cfg(not(target_os = "macos"))]
+            let (hits, misses) = (0u64, 0u64);
             format!("[stats] cocoa_shape_hits={hits} cocoa_shape_misses={misses}")
         },
     ]

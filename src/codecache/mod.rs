@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use crate::compiler::assembler::CodeBlob;
-use crate::vendor::wfasm::native_macos::{jit_write_protect, MacJit};
+use crate::vendor::wfasm::native::{jit_write_protect, MacJit};
 use crate::vendor::wfasm::relocpatch::{abs_veneer, VENEER_LEN};
 use guard::JitWriteGuard;
 

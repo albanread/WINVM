@@ -271,6 +271,7 @@ pub fn execute_top_item(vm: &mut VmState, item: TopItem) -> Result<Option<Oop>, 
             // a doit boundary is the natural quiescent point to drain +
             // renew this thread's bottom autorelease pool. A cheap
             // thread-local no-op on threads that never touched Cocoa.
+            #[cfg(target_os = "macos")]
             crate::runtime::objc_bridge::drain_pool_at_doit_boundary();
             Ok(Some(r))
         }

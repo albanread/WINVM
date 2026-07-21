@@ -267,7 +267,7 @@ pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -
         let result = vm.ffi_stubs.invoke(ret_class, target, &argv_g, &argv_f);
         return unmarshal_ret(vm, ret_class, result, &name);
     }
-    let Some(target) = crate::vendor::wfasm::native_macos::dlsym_resolve(None, &name) else {
+    let Some(target) = crate::vendor::wfasm::native::dlsym_resolve(None, &name) else {
         // A `ffi_gen`-generated binding names only functions verified to
         // exist in the real ABI database (docs/FFI.md) — but bindings are
         // also HAND-authored every day (all of world/61's Posix surface, a

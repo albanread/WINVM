@@ -13,6 +13,47 @@
 
 use std::ffi::c_void;
 
+// WINVM: kernel32 address-space primitives, declared directly (the `libc`
+// crate exposes only CRT functions on Windows, not Win32). Same shape as
+// JASM's `native.rs`. `MEM_DECOMMIT`+re-`MEM_COMMIT` returns zeroed pages,
+// which satisfies (exceeds) the "contents unspecified" contract below.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const MEM_DECOMMIT: u32 = 0x4000;
+    pub const MEM_RELEASE: u32 = 0x8000;
+    pub const PAGE_NOACCESS: u32 = 0x01;
+    pub const PAGE_READWRITE: u32 = 0x04;
+
+    #[repr(C)]
+    pub struct SystemInfo {
+        pub processor_arch: u16,
+        pub reserved: u16,
+        pub page_size: u32,
+        pub min_app_addr: *mut c_void,
+        pub max_app_addr: *mut c_void,
+        pub active_processor_mask: usize,
+        pub number_of_processors: u32,
+        pub processor_type: u32,
+        pub allocation_granularity: u32,
+        pub processor_level: u16,
+        pub processor_revision: u16,
+    }
+
+    extern "system" {
+        pub fn VirtualAlloc(
+            addr: *mut c_void,
+            size: usize,
+            alloc_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        pub fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
+        pub fn GetSystemInfo(info: *mut SystemInfo);
+    }
+}
+
 /// A single `mmap` address-space reservation, OR (in test mode) a plain
 /// heap allocation standing in for one. Uncommitted pages are `PROT_NONE`
 /// and touching them faults; [`commit`](Reservation::commit) makes a
@@ -32,6 +73,7 @@ impl Reservation {
     /// if the OS refuses the reservation: the whole process for the CLI/
     /// tests, or just the calling thread for an embedded `VmHandle` (S21) —
     /// see `runtime::vm_state::fatal_exit`'s own doc.
+    #[cfg(unix)]
     pub fn reserve(size: usize) -> Reservation {
         let size = round_up(size, page_size());
         // SAFETY: a fixed-shape mmap call with a null hint address (the
@@ -48,6 +90,31 @@ impl Reservation {
             )
         };
         if ptr == libc::MAP_FAILED {
+            eprintln!(
+                "macvm: failed to reserve {size} bytes: {}",
+                std::io::Error::last_os_error()
+            );
+            crate::runtime::vm_state::fatal_exit(71);
+        }
+        Reservation {
+            base: ptr as usize,
+            size,
+            test_box: None,
+        }
+    }
+
+    /// WINVM: `VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)` — reserved-but-
+    /// uncommitted pages fault on touch, the exact `PROT_NONE` semantics
+    /// the unix path gets from `mmap`.
+    #[cfg(windows)]
+    pub fn reserve(size: usize) -> Reservation {
+        let size = round_up(size, page_size());
+        // SAFETY: null hint (kernel picks the base), size page-rounded;
+        // result checked for null before use.
+        let ptr = unsafe {
+            win::VirtualAlloc(std::ptr::null_mut(), size, win::MEM_RESERVE, win::PAGE_NOACCESS)
+        };
+        if ptr.is_null() {
             eprintln!(
                 "macvm: failed to reserve {size} bytes: {}",
                 std::io::Error::last_os_error()
@@ -95,8 +162,16 @@ impl Reservation {
         // SAFETY: `ptr` and `end - start` are within this reservation
         // (checked above); mprotect only changes protection, no memory is
         // read or written by this call itself.
-        let rc = unsafe { libc::mprotect(ptr, end - start, libc::PROT_READ | libc::PROT_WRITE) };
-        if rc != 0 {
+        #[cfg(unix)]
+        let ok = unsafe { libc::mprotect(ptr, end - start, libc::PROT_READ | libc::PROT_WRITE) } == 0;
+        // WINVM: committing an already-committed page with the same
+        // protection is an idempotent no-op, matching the unix contract.
+        #[cfg(windows)]
+        let ok = !unsafe {
+            win::VirtualAlloc(ptr, end - start, win::MEM_COMMIT, win::PAGE_READWRITE)
+        }
+        .is_null();
+        if !ok {
             eprintln!(
                 "macvm: failed to commit {len} bytes at offset {off}: {}",
                 std::io::Error::last_os_error()
@@ -127,11 +202,18 @@ impl Reservation {
         // SAFETY: as `commit` — range is within this reservation; madvise
         // is advisory (never a correctness requirement) and mprotect only
         // changes protection.
-        unsafe {
-            libc::madvise(ptr, end - start, libc::MADV_FREE);
-        }
-        let rc = unsafe { libc::mprotect(ptr, end - start, libc::PROT_NONE) };
-        if rc != 0 {
+        #[cfg(unix)]
+        let ok = {
+            unsafe {
+                libc::madvise(ptr, end - start, libc::MADV_FREE);
+            }
+            unsafe { libc::mprotect(ptr, end - start, libc::PROT_NONE) == 0 }
+        };
+        // WINVM: MEM_DECOMMIT both returns the pages AND makes the range
+        // fault on touch — one call covers madvise+mprotect(PROT_NONE).
+        #[cfg(windows)]
+        let ok = unsafe { win::VirtualFree(ptr, end - start, win::MEM_DECOMMIT) } != 0;
+        if !ok {
             eprintln!(
                 "macvm: failed to decommit {len} bytes at offset {off}: {}",
                 std::io::Error::last_os_error()
@@ -159,15 +241,32 @@ impl Drop for Reservation {
         // SAFETY: `self.base`/`self.size` describe exactly the mapping
         // created in `reserve`; nothing else can alias it (Reservation is
         // not Clone).
+        #[cfg(unix)]
         unsafe {
             libc::munmap(self.base as *mut c_void, self.size);
+        }
+        // WINVM: MEM_RELEASE frees the whole reservation; size must be 0.
+        #[cfg(windows)]
+        unsafe {
+            win::VirtualFree(self.base as *mut c_void, 0, win::MEM_RELEASE);
         }
     }
 }
 
+#[cfg(unix)]
 fn page_size() -> usize {
     // SAFETY: sysconf with a valid, static name; no memory access.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+#[cfg(windows)]
+fn page_size() -> usize {
+    // SAFETY: GetSystemInfo writes the whole struct; no other memory access.
+    unsafe {
+        let mut info = std::mem::zeroed::<win::SystemInfo>();
+        win::GetSystemInfo(&mut info);
+        info.page_size as usize
+    }
 }
 
 fn round_up(v: usize, align: usize) -> usize {

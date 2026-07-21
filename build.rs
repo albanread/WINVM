@@ -5,10 +5,15 @@
 //! inside `@try` and reports a caught exception as a status + description
 //! instead of unwinding.
 fn main() {
-    cc::Build::new()
-        .file("src/runtime/objc_shim.m")
-        .flag("-fobjc-exceptions")
-        .compile("macvm_objc_shim");
-    println!("cargo:rustc-link-lib=objc");
+    // WINVM: the Objective-C shim is macOS-only; on Windows there is no Cocoa
+    // bridge to protect, so the build script is a no-op.
+    #[cfg(target_os = "macos")]
+    {
+        cc::Build::new()
+            .file("src/runtime/objc_shim.m")
+            .flag("-fobjc-exceptions")
+            .compile("macvm_objc_shim");
+        println!("cargo:rustc-link-lib=objc");
+    }
     println!("cargo:rerun-if-changed=src/runtime/objc_shim.m");
 }

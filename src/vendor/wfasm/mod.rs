@@ -28,4 +28,16 @@ pub mod backend;
 mod corpus_replay;
 #[cfg(target_os = "macos")]
 pub mod native_macos;
+// WINVM: the Windows x86-64 sibling loader (VirtualAlloc RWX region,
+// FlushInstructionCache, LoadLibrary/GetProcAddress) — MIGRATION.md §2.2.
+#[cfg(windows)]
+pub mod native_windows;
 pub mod relocpatch;
+
+// WINVM: the per-OS loader under one portable name, so consumers
+// (`codecache`, `runtime::ffi`) need no per-OS import forests. The Cocoa
+// bridge keeps importing `native_macos` directly — it is macOS-only anyway.
+#[cfg(target_os = "macos")]
+pub use native_macos as native;
+#[cfg(windows)]
+pub use native_windows as native;

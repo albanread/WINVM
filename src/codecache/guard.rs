@@ -17,7 +17,7 @@ use std::cell::Cell;
 
 use smallvec::SmallVec;
 
-use crate::vendor::wfasm::native_macos::{icache_invalidate, jit_write_protect};
+use crate::vendor::wfasm::native::{icache_invalidate, jit_write_protect};
 
 thread_local! {
     /// P3: the write-protect toggle is per-thread, and nesting a second

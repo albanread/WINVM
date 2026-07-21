@@ -1,5 +1,8 @@
 [workspace]
-members = [".", "gui", "gui/mock_vm", "image_store", "ffi_gen", "abc_player", "cocoa_gui"]
+# WINVM: gui (WKWebView + MacGamePane path dep), cocoa_gui (AppKit), and
+# abc_player (AVFoundation) are macOS-only — dropped from the Windows
+# workspace until their WebView2/Win32 counterparts exist (MIGRATION.md §6).
+members = [".", "image_store", "ffi_gen"]
 # Per gui/PLAN.md §6 (SPEC A18): the repo root is a cargo workspace once GUI
 # implementation starts, root package included as a member (not just a
 # virtual manifest) so `cargo build`/`test` at the top still builds macvm

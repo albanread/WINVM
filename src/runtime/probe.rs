@@ -656,6 +656,7 @@ fn ring_dump(vm: &VmState, emit: &mut dyn FnMut(String)) {
 }
 
 /// The current thread's stack bounds (macOS): `[addr - size, addr)`.
+#[cfg(target_os = "macos")]
 fn thread_stack_bounds() -> (u64, u64) {
     unsafe {
         let t = libc::pthread_self();
@@ -663,6 +664,20 @@ fn thread_stack_bounds() -> (u64, u64) {
         let size = libc::pthread_get_stacksize_np(t) as u64;
         (hi - size, hi)
     }
+}
+
+/// WINVM: the current thread's stack bounds via
+/// `GetCurrentThreadStackLimits` (Windows 8+): `[low, high)`.
+#[cfg(windows)]
+fn thread_stack_bounds() -> (u64, u64) {
+    extern "system" {
+        fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
+    }
+    let (mut lo, mut hi) = (0usize, 0usize);
+    // SAFETY: writes two out-params for the calling thread; no other
+    // memory access.
+    unsafe { GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+    (lo as u64, hi as u64)
 }
 
 /// Zero-dep JSON assembly (house style: gui/vm_host.rs hand-rolls too).

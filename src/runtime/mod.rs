@@ -19,7 +19,12 @@ pub mod frames;
 pub mod globals;
 pub mod lookup;
 pub mod mop; // MOP object pickle — multi-Smalltalk workers M0 (docs/multi-smalltalk-worker.md §4)
+// WINVM: the Cocoa bridge is macOS-only by definition (objc_msgSend, the
+// objc_shim.m @try/@catch shim, AppKit delegates). Its Win32 counterpart
+// arrives with the Phase-6 native shell (MIGRATION.md §6).
+#[cfg(target_os = "macos")]
 pub mod objc_bridge; // Cocoa bridge C0 — ObjcRef + ownership + bottom pool (docs/cocoa_bridge_design.md)
+#[cfg(target_os = "macos")]
 pub mod objc_delegate; // Cocoa bridge C6 — reverse dispatch: delegates as top-level entries (cocoa_gui_design.md §4, CG3)
 pub mod osr;
 pub mod primitives;
