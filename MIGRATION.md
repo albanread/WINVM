@@ -367,15 +367,38 @@ relative-to-C ratios.
     be functionally correct and would quietly destroy scavenge
     performance, so the non-marking cases are the ones worth pinning.
   - 688 lib tests pass; world interpreter still 5891/0.
-- **Next (rest of Phase 3):** the ops that call into the runtime —
-  `Poll`, `Alloc`, `CallRuntime`, and `CallSend` + inline caches (the
-  `call_patchable` site shape is already in place) — plus
-  `ArrayAt/AtPut` and `oopmap.rs` register numbering. Then wiring
-  `compiled_call.rs` and `driver.rs` to select the x64 back end so
-  tier-up actually fires, plus `adapters.rs`. That wiring is what
-  re-enables the `target_arch = "aarch64"`-gated tier-1 tests and turns
-  the JIT on for real workloads; until it lands, the x64 back end is
-  proven piece-by-piece but not yet reached by a running program.
+- **2026-07-21 — Phase 3g: `Poll` and `CallRuntime`.** Plus the shared
+  `emit_runtime_call` helper and a `RuntimeAddrs` struct carrying the
+  entry points (pooled as `RuntimeAddr` words, so the GC leaves them
+  alone). `Emitted` now also reports `safepoints` — runtime-call *return*
+  addresses, contrasting with `trap_sites`, which key on the trapping
+  instruction itself.
+  - **Why clobbering volatiles is safe** (documented at the helper):
+    a Rust callee destroys `RAX RCX RDX R8–R11`, which includes four
+    *allocatable* registers. That is sound only because every op reaching
+    this helper is a safepoint, and the spill-all policy has already
+    spilled anything live across one. This is the third time the
+    spill-all invariant has paid for itself in this port — it also
+    removed the need for `idiv` and ABI precoloring.
+  - **Two different shadow-space numbers, both correct.** Compiled code
+    reserves 32; the call stub reserves 40. They sit at different
+    alignment phases (the stub has pushed an odd number of registers).
+    Noted explicitly so it doesn't read as an inconsistency later.
+  - `Poll` is tested in **both** directions against a call-counting probe
+    stub: a poll that never fired would hang the collector at a
+    safepoint, and one that always fired would call into the runtime on
+    every loop iteration, so neither direction alone is sufficient.
+  - 691 lib tests pass; world interpreter still 5891/0.
+- **Next (rest of Phase 3):** `Alloc` (inline eden-bump fast path plus
+  slow call), `CallSend` + inline caches (the `call_patchable` site shape
+  is already in place), `ArrayAt/AtPut`, and `oopmap.rs` register
+  numbering. Then wiring `compiled_call.rs` and `driver.rs` to select the
+  x64 back end so tier-up actually fires, plus `adapters.rs`.
+  **Status to be clear about:** the x64 back end is proven op-by-op by
+  execution tests, but no running Smalltalk program reaches it yet —
+  every benchmark and world-test number above is still the interpreter.
+  That wiring step is what closes the gap and re-enables the
+  `target_arch = "aarch64"`-gated tier-1 tests.
 
 ## 7. What deliberately does *not* change
 
