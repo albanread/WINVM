@@ -736,14 +736,22 @@ const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
 /// for the shuffle is the worst case, and paying it in register budget is
 /// better than a subtly wrong `subsd`.
 ///
-/// Three allocatable FP registers is tight but adequate: float kernels
-/// keep few values simultaneously live, and anything crossing a safepoint
-/// is spilled regardless. `xmm6`–`xmm15` are callee-saved on Win64 and
-/// would each cost a prologue `movsd` — deliberately unused until the
-/// residency tier claims them with an explicit save/restore, which the
-/// call stub asserts against (`fp_pool_is_empty_or_this_stub_must_save_xmm`).
+/// `xmm6`–`xmm15` are callee-saved on Win64, so they are usable ONLY
+/// because `build_call_stub_x64` preserves them (`SAVED_XMM`). That cost
+/// is paid once per interpreter-to-compiled transition, not per send —
+/// compiled-to-compiled calls never route through the call stub — which
+/// makes ten extra registers very cheap.
+///
+/// Note that AVX does NOT add to this. x86-64 has sixteen XMM registers
+/// under plain SSE2; AVX widens them to 256-bit `ymm` but the COUNT is
+/// unchanged. Only AVX-512 adds registers (`zmm0`–`zmm31`, and
+/// `xmm16`–`xmm31` for scalar use), and those are all volatile under
+/// Win64, so claiming them would need runtime detection but no extra
+/// save/restore. The two facts — pool membership and what the call stub
+/// saves — must always move together; `fp_pool_is_empty_or_this_stub_
+/// must_save_xmm` asserts exactly that.
 #[cfg(not(target_arch = "aarch64"))]
-const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2];
+const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// The FP allocatable pool, for cross-module invariant checks — the x64
 /// call stub asserts against it that it is not required to save any

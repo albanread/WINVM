@@ -37,7 +37,7 @@
 use crate::codecache::stubs::KIND_DEOPT_BRIDGE;
 use crate::compiler::assembler::{CodeBlob, RelocKind};
 use crate::compiler::assembler_x64::{
-    imm, incoming_stack_slot, mem, r64, Cond, X64Assembler, ARG_REGS, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX,
+    imm, incoming_stack_slot, mem, r64, xmm, Cond, X64Assembler, ARG_REGS, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX,
     RDI, RDX, RSI, RSP, R8, R9, VM_STATE,
 };
 
@@ -54,6 +54,22 @@ pub type CallStubFn = unsafe extern "C" fn(u64, u64, *const u64, u64) -> u64;
 /// reverse. `RBP` is handled separately by the frame prologue/epilogue.
 const SAVED: [u8; 7] = [RBX, RSI, RDI, R12, R13, R14, R15];
 
+/// The callee-saved XMM bank this stub preserves: `xmm6`-`xmm15`, the ten
+/// Win64 requires a callee to restore.
+///
+/// Saving them is what lets `regalloc` put them in the FP allocatable
+/// pool, taking it from 3 registers to 13. The cost is paid once per
+/// interpreter-to-compiled transition, NOT per send: compiled-to-compiled
+/// calls never route through this stub.
+///
+/// Full 128 bits each, not just the low double. Win64 requires the whole
+/// register preserved, and a future SIMD pool would use the upper half —
+/// saving 8 bytes would work perfectly until the day it silently didn't.
+const SAVED_XMM: std::ops::Range<u8> = 6..16;
+/// 16 bytes per register. A multiple of 16, so reserving it leaves `RSP`'s
+/// alignment phase exactly as the push sequence left it.
+const XMM_SAVE_BYTES: i64 = 16 * 10;
+
 /// Shadow space (32, mandatory on Win64) plus 8 bytes of realignment —
 /// see the module header's alignment arithmetic.
 const CALL_AREA: i64 = 40 + 8 * (crate::oops::layout::ROOTSPILL_SLOTS as i64 - 4);
@@ -67,6 +83,13 @@ pub fn build_call_stub_x64() -> CodeBlob {
     a.emit("mov", &[r64(RBP), r64(RSP)]);
     for r in SAVED {
         a.emit("push", &[r64(r)]);
+    }
+    // The callee-saved XMM bank. `movups`, not `movaps`: after the return
+    // address, `push rbp` and seven pushes, `RSP % 16 == 8`, so this area
+    // is deliberately NOT 16-byte aligned and an aligned move would fault.
+    a.emit("sub", &[r64(RSP), imm(XMM_SAVE_BYTES)]);
+    for (i, r) in SAVED_XMM.enumerate() {
+        a.emit("movups", &[mem(RSP, 16 * i as i64), xmm(r)]);
     }
 
     // ── Stash the parameters before their registers are reused ──────────
@@ -125,6 +148,10 @@ pub fn build_call_stub_x64() -> CodeBlob {
     // stub's return register — nothing to move.
 
     // ── Epilogue ────────────────────────────────────────────────────────
+    for (i, r) in SAVED_XMM.enumerate() {
+        a.emit("movups", &[xmm(r), mem(RSP, 16 * i as i64)]);
+    }
+    a.emit("add", &[r64(RSP), imm(XMM_SAVE_BYTES)]);
     for r in SAVED.iter().rev() {
         a.emit("pop", &[r64(*r)]);
     }
@@ -1626,17 +1653,134 @@ mod tests {
     /// them. Those two facts must move together: the day Phase 5 puts a
     /// callee-saved XMM into the pool, this stub starts corrupting the
     /// Rust caller's floats, silently. Fail here instead.
+    /// The XMM bank must actually SURVIVE a compiled call.
+    ///
+    /// `fp_pool_is_empty_or_this_stub_must_save_xmm` only checks that the
+    /// pool and `SAVED_XMM` agree with each other — both could be
+    /// consistent and the save/restore still be wrong (wrong offset,
+    /// wrong width, `movaps` on an unaligned area). This runs it: plant a
+    /// distinct sentinel in every callee-saved XMM, call through the real
+    /// stub into code that deliberately clobbers all of them, and require
+    /// every sentinel back.
+    ///
+    /// Only the low 64 bits are checked, which is all a `movsd` sentinel
+    /// can carry — but the save is 128-bit `movups`, so a width mistake
+    /// would still show up as a fault or a wrong low half.
+    #[cfg(windows)]
     #[test]
-    fn fp_pool_is_empty_or_this_stub_must_save_xmm() {
-        // Mirrors regalloc's FP_ALLOCATABLE_REGS; kept as a literal so the
-        // assertion is about the VALUE, not about importing the constant.
-        const FP_POOL_MAX_VOLATILE: u8 = 5; // xmm0..xmm5 are volatile on Win64
-        for r in crate::compiler::regalloc::fp_allocatable_regs() {
-            assert!(
-                *r <= FP_POOL_MAX_VOLATILE,
-                "xmm{r} is callee-saved on Win64 but is in the FP allocatable pool, and \
-                 build_call_stub_x64 does not save it — add the save/restore here first"
+    #[allow(unsafe_code)]
+    fn call_stub_preserves_the_callee_saved_xmm_bank() {
+        use crate::compiler::assembler_x64::xmm;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // The "compiled method": trash every callee-saved XMM, return 0.
+        let mut m = X64Assembler::new();
+        m.emit("push", &[r64(RBP)]);
+        m.emit("mov", &[r64(RBP), r64(RSP)]);
+        m.emit("mov", &[r64(RAX), imm(-1)]);
+        for r in SAVED_XMM {
+            m.emit("movq", &[xmm(r), r64(RAX)]);
+        }
+        m.emit("xor", &[r64(RAX), r64(RAX)]);
+        m.emit("mov", &[r64(RSP), r64(RBP)]);
+        m.emit("pop", &[r64(RBP)]);
+        m.emit("ret", &[]);
+        let method = m.finish();
+
+        let stub = build_call_stub_x64();
+
+        // Harness: load sentinels into xmm6-15 from a buffer, call the
+        // stub, then store them all back out for inspection.
+        let mut h = X64Assembler::new();
+        h.emit("push", &[r64(RBP)]);
+        h.emit("mov", &[r64(RBP), r64(RSP)]);
+        h.emit("push", &[r64(RBX)]);
+        h.emit("push", &[r64(RSI)]);
+        h.emit("sub", &[r64(RSP), imm(56)]);
+        h.emit("mov", &[r64(RBX), r64(RCX)]); // stub
+        h.emit("mov", &[r64(RSI), r64(R9)]); // sentinel buffer
+        for (i, r) in SAVED_XMM.enumerate() {
+            h.emit("movsd", &[xmm(r), mem(RSI, 8 * i as i64)]);
+        }
+        // call_stub(entry=RDX, vm=R8, argv=null, argc=0)
+        h.emit("mov", &[r64(RCX), r64(RDX)]);
+        h.emit("mov", &[r64(RDX), r64(R8)]);
+        h.emit("xor", &[r64(R8), r64(R8)]);
+        h.emit("xor", &[r64(R9), r64(R9)]);
+        h.emit("call", &[r64(RBX)]);
+        for (i, r) in SAVED_XMM.enumerate() {
+            h.emit("movsd", &[mem(RSI, 8 * i as i64), xmm(r)]);
+        }
+        h.emit("add", &[r64(RSP), imm(56)]);
+        h.emit("pop", &[r64(RSI)]);
+        h.emit("pop", &[r64(RBX)]);
+        h.emit("pop", &[r64(RBP)]);
+        h.emit("ret", &[]);
+        let harness = h.finish();
+
+        let total = stub.code.len() + method.code.len() + harness.code.len() + 4096;
+        let jit = WinJit::with_capacity(total).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        let hoff = (moff + method.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(method.code.as_ptr(), base.add(moff), method.code.len());
+            core::ptr::copy_nonoverlapping(
+                harness.code.as_ptr(),
+                base.add(hoff),
+                harness.code.len(),
             );
         }
+
+        let mut vmreg = [0u64; 16];
+        // Distinct, non-canonical sentinels so a swap is as visible as a loss.
+        let mut sentinels: Vec<u64> = (0..10).map(|i| 0xF00D_0000_u64 + i as u64).collect();
+        let expected = sentinels.clone();
+
+        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(base.add(hoff)) };
+        f(
+            base as u64,
+            base as u64 + moff as u64,
+            vmreg.as_mut_ptr() as u64,
+            sentinels.as_mut_ptr() as u64,
+        );
+
+        for (i, (got, want)) in sentinels.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got,
+                want,
+                "xmm{} was not restored by the call stub — the FP pool includes it, \
+                 so compiled code clobbering it corrupts the Rust caller's floats",
+                SAVED_XMM.start as usize + i
+            );
+        }
+    }
+
+    #[test]
+    fn fp_pool_is_empty_or_this_stub_must_save_xmm() {
+        // The pool and the save bank must stay consistent. Every FP
+        // register the allocator may hand out is either volatile under
+        // Win64 (xmm0-5, free to clobber) or inside SAVED_XMM (preserved
+        // by this stub). A register in neither set silently corrupts the
+        // Rust caller's floats.
+        const FP_MAX_VOLATILE: u8 = 5;
+        for r in crate::compiler::regalloc::fp_allocatable_regs() {
+            assert!(
+                *r <= FP_MAX_VOLATILE || SAVED_XMM.contains(r),
+                "xmm{r} is in the FP allocatable pool but is neither volatile nor saved \\
+                 by build_call_stub_x64 — add it to SAVED_XMM first"
+            );
+        }
+        // And the converse: the save bank must not have drifted past the
+        // 16 registers that exist, nor claim a volatile one it needn't.
+        assert_eq!(SAVED_XMM.end, 16, "x86-64 has xmm0-15");
+        assert!(SAVED_XMM.start > FP_MAX_VOLATILE, "saving a volatile register wastes work");
+        assert_eq!(
+            XMM_SAVE_BYTES,
+            16 * (SAVED_XMM.end - SAVED_XMM.start) as i64,
+            "the reserved area must match the number of registers saved"
+        );
     }
 }
