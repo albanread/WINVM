@@ -45,18 +45,53 @@
 //! the test that would fail loudly if the case were ever "simplified"
 //! away.
 
-use crate::compiler::assembler::{CodeBlob, Label, RelocKind};
+use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::assembler_x64::{
     imm, mem, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RSP, SCRATCH0, SCRATCH1,
 };
-use crate::compiler::ir::{BlockId, CmpOp, Ir, IrMethod, SmiOp, VReg};
+use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
 use crate::compiler::regalloc::{Assignment, RegallocResult, SpillSlot};
 
 /// The IR ops this slice lowers. Anything else panics in [`emit_x64`] —
 /// see the module header.
 pub const SUPPORTED_OPS: &[&str] = &[
-    "ConstSmi", "Move", "Param", "LoadField", "SmiArith", "SmiCmpBr", "Jump", "Ret", "Bailout",
+    "ConstSmi",
+    "ConstPool",
+    "Move",
+    "Param",
+    "LoadKlass",
+    "LoadField",
+    "GuardKlass",
+    "SmiArith",
+    "SmiCmpBr",
+    "Jump",
+    "UncommonTrap",
+    "Ret",
+    "Bailout",
 ];
+
+/// Byte offset of an object's klass word from its TAGGED pointer:
+/// `KLASS_OFFSET` (8) less `MEM_TAG` (1), because a heap oop's word is the
+/// address biased by the tag. The AArch64 emitter reaches it with an
+/// unscaled `ldur`; x86 addresses it directly with a disp8.
+const KLASS_OFF_FROM_TAGGED: i64 =
+    crate::oops::layout::KLASS_OFFSET as i64 - crate::oops::layout::MEM_TAG as i64;
+
+/// One safepoint the emitter recorded — currently only deopt trap sites.
+/// `pc_off` is the trapping instruction's OWN offset (for a trap site the
+/// trapping pc IS the `int3`), which is what the VEH reports in `Rip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrapSite {
+    pub pc_off: u32,
+    pub bci: usize,
+}
+
+/// What [`emit_x64`] produces: the blob plus the metadata the deopt
+/// machinery keys on.
+pub struct Emitted {
+    pub blob: CodeBlob,
+    pub trap_sites: Vec<TrapSite>,
+}
 
 /// Byte offset of spill slot `i` from the frame pointer: `[rbp − 8·(i+1)]`,
 /// the same numbering the AArch64 side uses against `x29`.
@@ -80,8 +115,12 @@ struct Emitter<'a> {
     assignment: Vec<Option<Assignment>>,
     /// One label per basic block.
     labels: Vec<Label>,
+    /// `PoolLit` index → the interned literal-pool entry.
+    literal_ids: Vec<LiteralId>,
     epilogue: Label,
     bailout: Label,
+    trap_sites: Vec<TrapSite>,
+    current_bci: usize,
     method: &'a IrMethod,
 }
 
@@ -163,6 +202,27 @@ impl<'a> Emitter<'a> {
         let target = self.labels[fail.0 as usize];
         self.asm.jcc(Cond::Ne, target);
     }
+
+    /// A klass guard (`GuardShape::KlassTest`): the object must be a heap
+    /// oop whose klass word equals the expected pool literal.
+    ///
+    /// The smi rejection comes FIRST and is not merely an optimization —
+    /// a smi has no header at all, so loading `[obj + 7]` from one would
+    /// dereference a small integer as an address. The AArch64 emitter
+    /// makes the same check for the same reason.
+    fn emit_klass_guard(&mut self, robj: u8, expect: PoolLit, fail: BlockId) {
+        let cold = self.labels[fail.0 as usize];
+        // A smi can never be an instance of a heap klass → straight to cold.
+        self.asm.emit("test", &[r64(robj), imm(3)]);
+        self.asm.jcc(Cond::E, cold);
+        // Klass word, then compare against the expected klass pool word.
+        self.asm
+            .emit("mov", &[r64(SCRATCH1), mem(robj, KLASS_OFF_FROM_TAGGED)]);
+        let lit = self.literal_ids[expect.0 as usize];
+        self.asm.load_literal(SCRATCH0, lit);
+        self.asm.emit("cmp", &[r64(SCRATCH1), r64(SCRATCH0)]);
+        self.asm.jcc(Cond::Ne, cold);
+    }
 }
 
 /// Map an IR comparison to the x86 condition for a SIGNED compare —
@@ -186,8 +246,18 @@ fn cmp_cond(op: CmpOp) -> Cond {
 /// is directly callable as an `extern "C" fn(u64, ...) -> u64`. Wiring the
 /// real call stub (which additionally establishes the pinned `&VmState` /
 /// receiver registers) is the next Phase-3 step.
-pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> CodeBlob {
+pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> Emitted {
     let mut asm = X64Assembler::new();
+
+    // Intern the method's constant pool first, so `PoolLit(i)` indexes
+    // `literal_ids[i]` 1:1 — the same contract the AArch64 emitter's
+    // `intern_pool` establishes, which `codecache::read_pool_oop` relies on
+    // when a deopt reads a pool word back by index.
+    let literal_ids: Vec<LiteralId> = method
+        .pool
+        .iter()
+        .map(|entry| asm.literal_u64(entry.value, entry.kind))
+        .collect();
 
     let mut assignment: Vec<Option<Assignment>> = vec![None; method.vregs.len()];
     for iv in &regalloc.intervals {
@@ -201,8 +271,11 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> CodeBlob {
         asm,
         assignment,
         labels,
+        literal_ids,
         epilogue,
         bailout,
+        trap_sites: Vec::new(),
+        current_bci: 0,
         method,
     };
 
@@ -227,6 +300,7 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> CodeBlob {
     for (bi, block) in method.blocks.iter().enumerate() {
         let l = e.labels[bi];
         e.asm.bind(l);
+        e.current_bci = block.bci;
         for op in &block.code {
             emit_op(&mut e, op);
         }
@@ -246,7 +320,11 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult) -> CodeBlob {
     e.asm.emit("pop", &[r64(RBP)]);
     e.asm.emit("ret", &[]);
 
-    e.asm.finish()
+    let trap_sites = std::mem::take(&mut e.trap_sites);
+    Emitted {
+        blob: e.asm.finish(),
+        trap_sites,
+    }
 }
 
 fn emit_op(e: &mut Emitter, op: &Ir) {
@@ -281,6 +359,49 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
                 e.asm.emit("mov", &[r64(d), r64(src)]);
             }
             e.store_def(*dst, d);
+        }
+
+        Ir::ConstPool { dst, lit } => {
+            let d = e.def_reg(*dst, SCRATCH0);
+            let id = e.literal_ids[lit.0 as usize];
+            e.asm.load_literal(d, id);
+            e.store_def(*dst, d);
+        }
+
+        Ir::LoadKlass { dst, obj } => {
+            let o = e.read_into(*obj, SCRATCH0);
+            let d = e.def_reg(*dst, SCRATCH1);
+            e.asm
+                .emit("mov", &[r64(d), mem(o, KLASS_OFF_FROM_TAGGED)]);
+            e.store_def(*dst, d);
+        }
+
+        Ir::GuardKlass {
+            obj,
+            expect,
+            fail,
+            kind,
+        } => {
+            let o = e.read_into(*obj, SCRATCH0);
+            match kind {
+                GuardShape::SmiTest => e.emit_smi_guard(o, *fail),
+                GuardShape::KlassTest => e.emit_klass_guard(o, *expect, *fail),
+            }
+        }
+
+        Ir::UncommonTrap { bci } => {
+            // The trapping pc IS this instruction's own offset (Windows
+            // reports a breakpoint with Rip pointing AT the 0xCC), so the
+            // site is recorded BEFORE the bytes go down — the same
+            // ordering rule the AArch64 `brk` path documents.
+            let pc_off = e.asm.offset();
+            e.trap_sites.push(TrapSite {
+                pc_off,
+                bci: *bci,
+            });
+            e.asm.emit_bytes(&crate::codecache::deopt_trap::deopt_int3_bytes(
+                crate::codecache::deopt_trap::TRAP_UNCOMMON,
+            ));
         }
 
         Ir::LoadField { dst, obj, byte_off } => {
@@ -504,7 +625,7 @@ mod tests {
     fn compile_and_run(method: &IrMethod, a: u64, b: u64) -> u64 {
         use crate::vendor::wfasm::native_windows::WinJit;
         let ra = regalloc(method);
-        let blob = emit_x64(method, &ra);
+        let blob = emit_x64(method, &ra).blob;
         let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX region");
         let (base, _cap) = jit.region_raw();
         // SAFETY: the region was just allocated with room for the blob.
@@ -801,8 +922,11 @@ mod tests {
                 asm,
                 assignment: Vec::new(),
                 labels: Vec::new(),
+                literal_ids: Vec::new(),
                 epilogue: Label(0),
                 bailout: Label(0),
+                trap_sites: Vec::new(),
+                current_bci: 0,
                 method: &hand_method(Vec::new(), Vec::new(), 0),
             };
             e.emit_two_address("sub", false, dst, a, b);
@@ -835,6 +959,180 @@ mod tests {
         assert_eq!(run(RCX, RCX, RDX, 100, 42), 58, "dst aliases a");
     }
 
+    /// A klass guard, executed against real memory: a hand-built object
+    /// whose header is `[mark][klass]` and whose tagged pointer is
+    /// `addr | MEM_TAG`. Matching klass falls through and returns 1;
+    /// a different klass, and a smi receiver, both take the cold edge.
+    ///
+    /// The smi case is the one worth having: a smi has no header at all,
+    /// so a guard that loaded `[obj + 7]` before rejecting smis would
+    /// dereference a small integer as an address.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_klass_guard_executes() {
+        use crate::compiler::ir::PoolEntry;
+        use crate::oops::layout::MEM_TAG;
+
+        // Two objects with distinct klass words, laid out as the VM does.
+        let mut obj_a = [0u64; 2];
+        let mut obj_b = [0u64; 2];
+        let klass_a = 0xAAAA_0000u64;
+        let klass_b = 0xBBBB_0000u64;
+        obj_a[1] = klass_a;
+        obj_b[1] = klass_b;
+        let tagged = |o: &[u64; 2]| o.as_ptr() as u64 | MEM_TAG;
+
+        let mut m = hand_method(
+            vec![
+                block(
+                    0,
+                    vec![
+                        Ir::Param {
+                            dst: VReg(0),
+                            index: 0,
+                        },
+                        Ir::GuardKlass {
+                            obj: VReg(0),
+                            expect: PoolLit(0),
+                            fail: BlockId(2),
+                            kind: GuardShape::KlassTest,
+                        },
+                        Ir::ConstSmi {
+                            dst: VReg(1),
+                            value: 1,
+                        },
+                        Ir::Ret { val: VReg(1) },
+                    ],
+                ),
+                block(1, vec![Ir::Jump { target: BlockId(2) }]),
+                block(
+                    2,
+                    vec![Ir::Bailout {
+                        reason: BailoutReason::SmiOpFailed,
+                    }],
+                ),
+            ],
+            oops(2),
+            1,
+        );
+        // The guard's expected klass is pool entry 0.
+        m.pool = vec![PoolEntry {
+            value: klass_a,
+            kind: Some(RelocKind::Oop),
+        }];
+
+        assert_eq!(
+            compile_and_run(&m, tagged(&obj_a), 0),
+            smi(1),
+            "matching klass falls through the guard"
+        );
+        assert_eq!(
+            compile_and_run(&m, tagged(&obj_b), 0),
+            BAILOUT_SENTINEL,
+            "different klass takes the cold edge"
+        );
+        assert_eq!(
+            compile_and_run(&m, smi(7), 0),
+            BAILOUT_SENTINEL,
+            "a smi receiver is rejected BEFORE any header load"
+        );
+    }
+
+    /// `LoadKlass` reads the klass word through the same tagged-pointer
+    /// bias the guard uses — if the two ever disagreed, guards would pass
+    /// while the loaded klass was garbage.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_load_klass_reads_the_header_word() {
+        let obj = [0u64, 0x1234_5678_0000_0000u64];
+        let tagged = obj.as_ptr() as u64 | crate::oops::layout::MEM_TAG;
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::LoadKlass {
+                        dst: VReg(1),
+                        obj: VReg(0),
+                    },
+                    Ir::Ret { val: VReg(1) },
+                ],
+            )],
+            oops(2),
+            1,
+        );
+        assert_eq!(compile_and_run(&m, tagged, 0), 0x1234_5678_0000_0000);
+    }
+
+    /// **The Phase-2/Phase-3 seam, closed.** An `UncommonTrap` emitted by
+    /// the compiler must be the exact byte pattern the Phase-2 VEH
+    /// decodes. This compiles a method containing a trap, registers the
+    /// blob's range with a capture trampoline, arms the real VEH, and
+    /// calls it: the trap must be recognized, the trap pc stashed in R10,
+    /// and control redirected — returning that pc.
+    ///
+    /// The two halves were written days apart against a written contract
+    /// (`int3` + imm16, `Rip` points AT the `0xCC`); this is the test that
+    /// proves they actually meet.
+    #[cfg(windows)]
+    #[test]
+    fn emitted_uncommon_trap_round_trips_through_the_veh() {
+        use crate::codecache::deopt_trap;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        let m = hand_method(
+            vec![block(0, vec![Ir::UncommonTrap { bci: 7 }])],
+            oops(1),
+            0,
+        );
+        let ra = regalloc(&m);
+        let out = emit_x64(&m, &ra);
+
+        // The emitter recorded the site, keyed by the trap's own offset.
+        assert_eq!(out.trap_sites.len(), 1);
+        assert_eq!(out.trap_sites[0].bci, 7);
+        let trap_off = out.trap_sites[0].pc_off;
+        assert_eq!(
+            out.blob.code[trap_off as usize],
+            0xCC,
+            "the recorded pc_off must point AT the int3, not past it"
+        );
+
+        // Place it, plus a capture trampoline that returns R10 (the stash).
+        let blob = &out.blob;
+        let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX region");
+        let (base, _cap) = jit.region_raw();
+        unsafe {
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base, blob.code.len());
+        }
+        let entry = base as u64;
+        let tramp_off = (blob.code.len() + 15) & !15;
+        let tramp = entry + tramp_off as u64;
+        // mov rax, r10 ; mov rsp, rbp ; pop rbp ; ret  — unwind the frame
+        // the compiled prologue established, then hand back the trap pc.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                [0x4C, 0x89, 0xD0, 0x48, 0x89, 0xEC, 0x5D, 0xC3].as_ptr(),
+                base.add(tramp_off),
+                8,
+            );
+        }
+
+        deopt_trap::test_register_range(entry, entry + blob.code.len() as u64, tramp);
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(entry) };
+        let got = f();
+        deopt_trap::deregister(entry);
+
+        assert_eq!(
+            got,
+            entry + trap_off as u64,
+            "the VEH must decode the emitted trap site and stash its pc in R10"
+        );
+    }
+
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
@@ -853,8 +1151,11 @@ mod tests {
             asm: X64Assembler::new(),
             assignment: vec![Some(Assignment::Reg(1)); 1],
             labels: vec![Label(0)],
+            literal_ids: Vec::new(),
             epilogue: Label(0),
             bailout: Label(0),
+            trap_sites: Vec::new(),
+            current_bci: 0,
             method: &m,
         };
         let _ = &ra;

@@ -99,6 +99,19 @@ pub fn emit_brk(a: &mut dyn Assembler, imm16: u16) {
     a.emit_u32(brk_word(imm16));
 }
 
+/// WINVM: the x86-64 deopt trap site — `int3` (`0xCC`) followed by the
+/// same imm16 the AArch64 `brk` carries, little-endian. Three bytes, of
+/// which only the first ever executes: the VEH ([`veh_trap_handler`])
+/// reads the imm at `Rip + 1` and redirects, so control never reaches the
+/// two immediate bytes. [`decode_deopt_int3`] is the reader.
+///
+/// The site's own offset IS the trapping pc (Windows reports a breakpoint
+/// with `Rip` pointing AT the `0xCC`), so an emitter records its safepoint
+/// **before** calling this — the same rule the AArch64 `brk` path follows.
+pub const fn deopt_int3_bytes(imm16: u16) -> [u8; 3] {
+    [0xCC, imm16 as u8, (imm16 >> 8) as u8]
+}
+
 // ── The code-cache registry (D3 step 2, multi-VmState-safe) ───────────────
 //
 // The handler cannot safely reach a `&CodeCache` from signal context, so each
@@ -1233,6 +1246,22 @@ unsafe extern "system" fn veh_trap_handler(info: *mut WinExceptionPointers) -> i
         (*ctx).R10 = pc;
         (*ctx).Rip = tramp;
         EXCEPTION_CONTINUE_EXECUTION
+    }
+}
+
+/// WINVM test hook: register `[lo, hi)` → `tramp` and arm the VEH, so a
+/// test can drive a real emitted trap site through the real handler
+/// without a full `CodeCache`/`VmState`. The x64 counterpart of
+/// [`test_arm_handler`], and `pub(crate)` rather than module-private
+/// because the compiler-side test that matters (`emit_x64`'s
+/// `emitted_uncommon_trap_round_trips_through_the_veh`) lives in another
+/// module — that seam between emitter and handler is exactly what needs
+/// covering. Retire the entry with [`deregister`].
+#[cfg(all(test, windows))]
+pub(crate) fn test_register_range(lo: u64, hi: u64, tramp: u64) {
+    register_with_probe(lo, hi, tramp, 0, 0);
+    if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
+        arm_veh();
     }
 }
 
