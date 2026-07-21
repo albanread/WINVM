@@ -467,6 +467,11 @@ impl X64Assembler {
         // E8 rel32, displacement 0 == "call the next instruction", the
         // placeholder the patcher overwrites.
         self.emit_bytes(&[0xE8, 0x00, 0x00, 0x00, 0x00]);
+        // `offset` names the INSTRUCTION, matching `Reloc`'s documented
+        // convention for `InlineCache` ("the offset of the `bl`
+        // instruction word itself") and what `IcSite::off` means. The
+        // patcher for these sites is `CodeCache::patch_call_site_at`,
+        // which knows the host's instruction shape.
         self.relocs.push(Reloc { offset, kind });
         offset
     }
@@ -714,7 +719,9 @@ mod tests {
     }
 
     /// `call_patchable` lays the exact 5-byte `E8 rel32` shape the code
-    /// cache patches, and records the reloc at the instruction's start.
+    /// cache patches. The returned site offset names the INSTRUCTION (what
+    /// the IC machinery identifies a site by); the reloc names the
+    /// DISPLACEMENT FIELD one byte later (what the patcher writes).
     #[test]
     fn call_patchable_shape_and_reloc() {
         let mut a = X64Assembler::new();
@@ -730,7 +737,10 @@ mod tests {
         );
         assert_eq!(blob.relocs.len(), 1);
         assert_eq!(blob.relocs[0].kind, RelocKind::InlineCache);
-        assert_eq!(blob.relocs[0].offset, site);
+        assert_eq!(
+            blob.relocs[0].offset, site,
+            "the reloc names the instruction, per Reloc's InlineCache contract"
+        );
     }
 
     /// `call_far` loads the pool word into the scratch register and calls

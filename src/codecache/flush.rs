@@ -87,10 +87,10 @@ pub fn make_not_entrant_lazy(vm: &mut VmState, id: NmethodId) {
     vm.code_table.set_not_entrant(id); // §2a
     let not_entrant_addr = vm.stubs.not_entrant_addr(); // §2b
     vm.code_cache
-        .write_branch26_at(code, entry_off, not_entrant_addr);
+        .write_jump_at(code, entry_off, not_entrant_addr);
     if verified_entry_off != entry_off {
         vm.code_cache
-            .write_branch26_at(code, verified_entry_off, not_entrant_addr);
+            .write_jump_at(code, verified_entry_off, not_entrant_addr);
     }
     // §2d: the poll arm (the 10c sweep disarms once drained). NO §2c walk.
     vm.pending_deopt_flag = true;
@@ -118,10 +118,10 @@ pub fn make_not_entrant(vm: &mut VmState, id: NmethodId) {
     // its own guard/flush cycle (no guard nesting in v1).
     let not_entrant_addr = vm.stubs.not_entrant_addr();
     vm.code_cache
-        .write_branch26_at(code, entry_off, not_entrant_addr);
+        .write_jump_at(code, entry_off, not_entrant_addr);
     if verified_entry_off != entry_off {
         vm.code_cache
-            .write_branch26_at(code, verified_entry_off, not_entrant_addr);
+            .write_jump_at(code, verified_entry_off, not_entrant_addr);
     }
 
     // §2c: redirect the saved-LR slot of every in-flight callee whose caller is
@@ -246,7 +246,7 @@ pub fn flush_nmethod(vm: &mut VmState, id: NmethodId) {
         // nothing worth batching against (this project's own "perf work
         // is out of scope before S15" stance, `memory::fullgc`'s doc).
         vm.code_cache
-            .patch_branch26_at(p.caller_code, p.site_off, resolve_addr);
+            .patch_call_site_at(p.caller_code, p.site_off, resolve_addr);
         vm.code_table
             .get_mut(p.caller_id)
             .expect("still installed -- we're mid-flush of a DIFFERENT nmethod entirely")
@@ -349,8 +349,19 @@ mod tests {
             .code_cache
             .alloc(len)
             .expect("code cache alloc for test blob");
+        // These fixtures stand in for compiled methods whose IcSites get
+        // repointed, so the bytes at a site must look like the host's
+        // patchable call — `patch_call_rel32_at` refuses to patch
+        // anything that is not an `E8`, precisely so it can never corrupt
+        // a real instruction. Filling with `E8` makes every offset a
+        // valid site, which is what these tests want and what an
+        // all-zero buffer silently was not.
+        #[cfg(target_arch = "aarch64")]
+        let fill = 0u8;
+        #[cfg(not(target_arch = "aarch64"))]
+        let fill = 0xE8u8;
         let blob = CodeBlob {
-            code: vec![0u8; len],
+            code: vec![fill; len],
             literal_off: len as u32,
             relocs: Vec::new(),
             listing: Vec::new(),

@@ -1470,7 +1470,7 @@ fn compile_method_full(
     let resolve_addr = vm.stubs.resolve_addr();
     for (site, resolved) in emitted_ic_sites.iter().zip(&super_resolutions) {
         let patch_target = resolved.map_or(resolve_addr, |(_, target)| target);
-        vm.code_cache.patch_branch26_at(h, site.off, patch_target);
+        vm.code_cache.patch_call_site_at(h, site.off, patch_target);
     }
     vm.stats.compilations += 1; // S15 A8 tier-balance counter
     let has_osr = nm.osr_map.is_some();

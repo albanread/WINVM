@@ -87,7 +87,19 @@ impl AdapterTable {
                 return a.handle.base as u64;
             }
         }
+        // WINVM (Phase 3y): arch-selected, like `stubs::install` and
+        // `deopt_trap::install` before it. This is the THIRD place the
+        // same bug lived — the emitters were ported but only the two
+        // static installs were rewired, leaving the three *dynamic* code
+        // producers (adapters, mega trampolines, PICs) still building
+        // AArch64 blobs at runtime on Windows.
+        #[cfg(target_arch = "aarch64")]
         let blob = build_c2i_adapter(method, c2i_shared_addr);
+        #[cfg(not(target_arch = "aarch64"))]
+        let blob = crate::codecache::thunks_x64::build_c2i_adapter_x64(
+            method.oop().raw(),
+            c2i_shared_addr,
+        );
         let method_pool_off = blob.literal_off; // method oop is the FIRST literal interned
         let h = cache
             .alloc(blob.code.len())
@@ -221,6 +233,21 @@ mod tests {
         assert!(cache.contains(a2));
     }
 
+    /// The host's own c2i adapter blob, so a test recomputing
+    /// `method_pool_off` independently matches what `get_or_make`
+    /// actually built. (Reaching for the AArch64 builder here passed on
+    /// macOS and compared against the wrong blob on Windows.)
+    fn host_c2i_adapter(m: MethodOop, shared: u64) -> crate::compiler::assembler::CodeBlob {
+        #[cfg(target_arch = "aarch64")]
+        {
+            build_c2i_adapter(m, shared)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::codecache::thunks_x64::build_c2i_adapter_x64(m.oop().raw(), shared)
+        }
+    }
+
     #[test]
     fn adapter_listing_shape() {
         let mut vm = test_vm();
@@ -265,7 +292,7 @@ mod tests {
         // private `method_pool_off`) -- `build_c2i_adapter` is
         // deterministic, so a fresh build's own `literal_off` is exactly
         // where the cached adapter's method-oop pool word lives too.
-        let method_pool_off = build_c2i_adapter(m, 0xC0FFEE).literal_off;
+        let method_pool_off = host_c2i_adapter(m, 0xC0FFEE).literal_off;
         let pool_addr = unsafe { (addr as *const u8).add(method_pool_off as usize) as *const u64 };
         assert_eq!(unsafe { *pool_addr }, new_bits);
     }
@@ -288,7 +315,7 @@ mod tests {
 
         crate::memory::scavenge::scavenge(&mut vm).expect("scavenge must succeed");
 
-        let method_pool_off = build_c2i_adapter(m, 0xC0FFEE).literal_off;
+        let method_pool_off = host_c2i_adapter(m, 0xC0FFEE).literal_off;
         let pool_addr = unsafe { (addr as *const u8).add(method_pool_off as usize) as *const u64 };
         let new_bits = unsafe { *pool_addr };
         assert_ne!(
@@ -317,7 +344,7 @@ mod tests {
 
         crate::memory::fullgc::full_gc(&mut vm).expect("full gc must succeed");
 
-        let method_pool_off = build_c2i_adapter(m, 0xC0FFEE).literal_off;
+        let method_pool_off = host_c2i_adapter(m, 0xC0FFEE).literal_off;
         let pool_addr = unsafe { (addr as *const u8).add(method_pool_off as usize) as *const u64 };
         let new_bits = unsafe { *pool_addr };
         assert_ne!(

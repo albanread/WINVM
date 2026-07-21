@@ -30,6 +30,14 @@ use super::{CodeCache, CodeHandle};
 /// never needs the anchor), so this kind is never actually written --
 /// `frames.rs` keeps a `Poll` variant only for `AdapterKind`'s own
 /// completeness, provably dead on this specific path.
+/// Byte width of the patchable call an IC site occupies — how far back
+/// from a return address the call instruction starts. AArch64 `bl` is one
+/// 4-byte word; x86-64 `E8 rel32` is 5 bytes.
+#[cfg(target_arch = "aarch64")]
+pub const CALL_INSN_LEN: u64 = 4;
+#[cfg(not(target_arch = "aarch64"))]
+pub const CALL_INSN_LEN: u64 = 5;
+
 pub const KIND_RESOLVE: u64 = 0;
 pub const KIND_C2I: u64 = 1;
 pub const KIND_MEGA: u64 = 2;
@@ -936,7 +944,12 @@ fn find_caller_site(
         .get(caller_id)
         .expect("find_by_pc just returned this id");
     let caller_code = caller_nm.code;
-    let site_off = (ret_addr - 4 - caller_code.base as u64) as u32;
+    // Back up from the return address to the call instruction's own
+    // offset — the width of the call, which is ISA-specific: a 4-byte
+    // AArch64 `bl` against a 5-byte x86-64 `E8 rel32`. Getting this wrong
+    // does not read a wrong site, it fails to find one at all (the
+    // `position` lookup below panics), so it is at least loud.
+    let site_off = (ret_addr - CALL_INSN_LEN - caller_code.base as u64) as u32;
     let site_idx = caller_nm
         .ic_sites
         .iter()
@@ -1045,7 +1058,7 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
         let target = resolve_super_target_entry(vm, sk, selector, method);
         if !force_cold {
             vm.code_cache
-                .patch_branch26_at(caller_code, site_off, target);
+                .patch_call_site_at(caller_code, site_off, target);
             vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
                 IcState::Mono { klass: sk, target };
         }
@@ -1237,7 +1250,7 @@ pub unsafe extern "C" fn rt_resolve_send(vm: *mut VmState, ret_addr: u64, argv: 
     // deliberately BEFORE this poly machinery (see §1 rationale there).
     if let Some((patch_target, new_state)) = patch {
         vm.code_cache
-            .patch_branch26_at(caller_code, site_off, patch_target);
+            .patch_call_site_at(caller_code, site_off, patch_target);
         vm.code_table
             .get_mut(caller_id)
             .expect("caller nmethod is still installed -- this call is running ON it")
@@ -1712,7 +1725,7 @@ pub unsafe extern "C" fn rt_interpret_call(
                         let nm = vm.code_table.get(id).expect("just compiled/looked up");
                         let target = nm.code.base as u64 + nm.entry_off as u64;
                         vm.code_cache
-                            .patch_branch26_at(caller_code, site_off, target);
+                            .patch_call_site_at(caller_code, site_off, target);
                         vm.code_table.get_mut(caller_id).unwrap().ic_sites[site_idx].state =
                             IcState::Mono { klass: k, target };
                     } else if let (IcState::Pic { stub }, None) = (site_state, site_super) {
@@ -1754,7 +1767,7 @@ pub unsafe extern "C" fn rt_interpret_call(
                                     ) {
                                         vm.stats.c2i_pic_rekeys += 1;
                                         vm.pic_table.free(&mut vm.code_cache, stub);
-                                        vm.code_cache.patch_branch26_at(
+                                        vm.code_cache.patch_call_site_at(
                                             caller_code,
                                             site_off,
                                             new_stub.base as u64,

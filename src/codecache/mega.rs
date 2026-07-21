@@ -46,7 +46,13 @@ impl MegaTable {
         if let Some(m) = self.by_selector.get(&key) {
             return Some(m.handle);
         }
+        #[cfg(target_arch = "aarch64")]
         let blob = build_mega_trampoline(selector, stub_mega_shared_addr);
+        #[cfg(not(target_arch = "aarch64"))]
+        let blob = crate::codecache::thunks_x64::build_mega_trampoline_x64(
+            selector.oop().raw(),
+            stub_mega_shared_addr,
+        );
         let selector_pool_off = blob.literal_off; // selector is the first literal interned
         let h = cache.alloc(blob.code.len())?;
         cache.publish(h, &blob);

@@ -285,6 +285,86 @@ impl CodeCache {
     /// under the crate-root `#![deny(unsafe_code)]`) that only ever have an
     /// `Nmethod`'s `(code, ic_site.off)` pair — never a raw address of their
     /// own — go through this instead of computing the pointer themselves.
+    /// Repoint the call site at `(handle, off)` to `target`, where `off`
+    /// names the *instruction*, per `Reloc`'s `InlineCache` convention.
+    ///
+    /// This exists because "patch a call site" is not one operation
+    /// across ISAs, and pretending it was cost a full debugging cycle:
+    /// every x64 IC site went through [`Self::patch_branch26_at`], which
+    /// read-modify-writes a 4-byte AArch64 word — keeping the top six
+    /// opcode bits and OR-ing in a 26-bit displacement. Applied to
+    /// `E8 rel32` that overwrites the `0xE8` opcode with the low byte of
+    /// the displacement, leaving `0c fd ff 03 00` where a call belonged.
+    /// Nothing faulted at patch time; the method executed garbage on its
+    /// first call, and the fault surfaced far from the cause.
+    ///
+    /// The two forms differ in more than encoding, which is why one
+    /// function could never have served both:
+    ///
+    /// | | AArch64 `bl` | x86-64 `E8 rel32` |
+    /// |---|---|---|
+    /// | width | 4 bytes | 5 bytes |
+    /// | field | imm26, bits 0–25 of the word | bytes 1–4 |
+    /// | displacement base | the instruction's own address | the address *after* the instruction |
+    /// | scale | `>> 2` (word-aligned targets) | none (byte displacement) |
+    /// | reach | ±128 MB, veneer beyond | ±2 GB, and the code cache is reserved inside that (MIGRATION.md §2.2) |
+    pub fn patch_call_site_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.patch_branch26_at(handle, off, target);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.patch_call_rel32_at(handle, off, target);
+        }
+    }
+
+    /// Write the `rel32` field of the `E8` call at `(handle, off)`.
+    ///
+    /// The opcode byte is left untouched — only bytes 1..5 are written —
+    /// and the displacement is measured from the END of the five-byte
+    /// instruction, which is what `rel32` means.
+    ///
+    /// Out-of-range is an assert, not a veneer: the code cache is
+    /// deliberately reserved within `rel32` reach of the host image
+    /// (`alloc_near`, MIGRATION.md §2.2), and both site and target live
+    /// in it. If this ever fires, that reservation failed and silently
+    /// veneering would hide the real problem.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn patch_call_rel32_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
+        debug_assert!(
+            (off as usize) + 5 <= handle.len,
+            "patch_call_rel32_at: offset {off} + 5 exceeds the handle's own length {}",
+            handle.len
+        );
+        let site = unsafe { handle.base.add(off as usize) };
+        debug_assert_eq!(
+            unsafe { core::ptr::read(site) },
+            0xE8,
+            "patch_call_rel32_at: site {:#x} is not an E8 call — patching it \
+             would corrupt whatever instruction is really there",
+            site as u64
+        );
+        let insn_end = site as i64 + 5;
+        let disp = target as i64 - insn_end;
+        let disp32 = i32::try_from(disp).unwrap_or_else(|_| {
+            panic!(
+                "patch_call_rel32_at: target {target:#x} is {disp:#x} from site {:#x} — \
+                 outside rel32 reach, so the code cache was not reserved near the host \
+                 image as MIGRATION.md §2.2 requires",
+                site as u64
+            )
+        });
+        let mut g = JitWriteGuard::new();
+        g.note(site, 5);
+        // SAFETY: `site` is a live, writable code-cache address (the guard
+        // is in write mode) and the five bytes are within the handle.
+        unsafe {
+            let field = std::slice::from_raw_parts_mut(site.add(1) as *mut u8, 4);
+            field.copy_from_slice(&disp32.to_le_bytes());
+        }
+    }
+
     pub fn patch_branch26_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
         debug_assert!(
             (off as usize) + 4 <= handle.len,
@@ -312,6 +392,58 @@ impl CodeCache {
     /// not arise here). The write is W^X-correct by construction: it happens
     /// inside one [`JitWriteGuard`] whose `Drop` flips back to exec mode and
     /// THEN flushes the icache over the noted word (guard.rs's own P9 order).
+    /// Stamp an unconditional jump to `target` OVER whatever instruction
+    /// begins at `(handle, off)` — how `make_not_entrant` redirects an
+    /// invalidated nmethod's entry.
+    ///
+    /// Unlike [`Self::patch_call_site_at`] there are no opcode bits to
+    /// preserve: the site currently holds a prologue instruction, not a
+    /// branch, so the whole thing is replaced.
+    pub fn write_jump_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.write_branch26_at(handle, off, target);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.write_jmp_rel32_at(handle, off, target);
+        }
+    }
+
+    /// Overwrite five bytes at `(handle, off)` with `E9 rel32` — an
+    /// unconditional near jump.
+    ///
+    /// Five bytes, not four: an x64 jump that can reach anywhere in the
+    /// code cache needs a full `rel32`. That means this clobbers more of
+    /// the prologue than the AArch64 form does, which is safe only
+    /// because nothing ever returns to those bytes — an nmethod stamped
+    /// not-entrant is only ever *entered*, and always at `off`.
+    #[cfg(not(target_arch = "aarch64"))]
+    pub fn write_jmp_rel32_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
+        debug_assert!(
+            (off as usize) + 5 <= handle.len,
+            "write_jmp_rel32_at: offset {off} + 5 exceeds the handle's own length {}",
+            handle.len
+        );
+        let site = unsafe { handle.base.add(off as usize) };
+        let disp = target as i64 - (site as i64 + 5);
+        let disp32 = i32::try_from(disp).unwrap_or_else(|_| {
+            panic!(
+                "write_jmp_rel32_at: not_entrant stub {target:#x} is out of rel32 reach \
+                 of site {:#x} — it must live in the same code cache",
+                site as u64
+            )
+        });
+        let mut g = JitWriteGuard::new();
+        g.note(site, 5);
+        // SAFETY: five writable bytes inside the handle, guard in write mode.
+        unsafe {
+            let s = std::slice::from_raw_parts_mut(site as *mut u8, 5);
+            s[0] = 0xE9;
+            s[1..5].copy_from_slice(&disp32.to_le_bytes());
+        }
+    }
+
     pub fn write_branch26_at(&mut self, handle: CodeHandle, off: u32, target: u64) {
         debug_assert!(
             (off as usize) + 4 <= handle.len,
@@ -382,6 +514,64 @@ fn patch_branch26_field(site: *const u8, disp: i64) {
 mod tests {
     use super::*;
     use crate::compiler::assembler::Reloc as AsmReloc;
+
+    /// The test that was missing, and whose absence let every compiled
+    /// call site be corrupted: emit a real patchable call, patch it with
+    /// the real patcher, and **execute it**.
+    ///
+    /// `assembler_x64`'s own test checked the emitted shape and
+    /// `codecache`'s checked the patch arithmetic, and both passed while
+    /// the IC path ran x64 sites through the AArch64 word patcher — which
+    /// overwrote the `0xE8` opcode with the low byte of a 26-bit
+    /// displacement. Neither component could see it, because the bug was
+    /// in neither component; it was in the assumption they shared about
+    /// what "patch a call site" means. Only running the result finds that.
+    #[cfg(all(windows, not(target_arch = "aarch64")))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_patched_call_site_actually_calls_its_target() {
+        use crate::compiler::assembler::RelocKind;
+        use crate::compiler::assembler_x64::{r64, X64Assembler, RAX};
+
+        let mut cc = CodeCache::new(1 << 16).unwrap();
+
+        // The callee: return a sentinel.
+        let mut c = X64Assembler::new();
+        c.emit("mov", &[r64(RAX), crate::compiler::assembler_x64::imm(0xABC)]);
+        c.emit("ret", &[]);
+        let callee = c.finish();
+        let hc = cc.alloc(callee.code.len()).unwrap();
+        cc.publish(hc, &callee);
+
+        // The caller: an unresolved patchable call, then return whatever
+        // the callee answered.
+        let mut a = X64Assembler::new();
+        a.emit("push", &[r64(crate::compiler::assembler_x64::RBP)]);
+        a.emit("sub", &[r64(crate::compiler::assembler_x64::RSP), crate::compiler::assembler_x64::imm(32)]);
+        let site = a.call_patchable(RelocKind::InlineCache);
+        a.emit("add", &[r64(crate::compiler::assembler_x64::RSP), crate::compiler::assembler_x64::imm(32)]);
+        a.emit("pop", &[r64(crate::compiler::assembler_x64::RBP)]);
+        a.emit("ret", &[]);
+        let caller = a.finish();
+        let hr = cc.alloc(caller.code.len()).unwrap();
+        cc.publish(hr, &caller);
+
+        cc.patch_call_site_at(hr, site, hc.base as u64);
+
+        // SAFETY: `hr.base` is published, patched, executable code with
+        // the C ABI (no arguments, integer return).
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(hr.base) };
+        assert_eq!(
+            f(),
+            0xABC,
+            "the patched site must actually reach the callee — a corrupted \
+             opcode byte would execute the displacement as instructions"
+        );
+
+        // SAFETY: reading back five published bytes we just wrote.
+        let opcode = unsafe { core::ptr::read(hr.base.add(site as usize)) };
+        assert_eq!(opcode, 0xE8, "the E8 opcode survives patching");
+    }
 
     /// D3.1: alloc 64/128/64, free the middle, alloc 96 reuses that hole
     /// with a 32-byte remainder retained (the split threshold is `>= 32`).

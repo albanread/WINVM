@@ -82,7 +82,14 @@ impl PicTable {
             },
             "PicTable::build: duplicate klass in PIC pairs"
         );
+        #[cfg(target_arch = "aarch64")]
         let (blob, klass_pool_offs) = build_pic_stub(&pairs, smi_klass_bits, resolve_addr);
+        #[cfg(not(target_arch = "aarch64"))]
+        let (blob, klass_pool_offs) = crate::codecache::pics_x64::build_pic_stub_x64(
+            &pairs,
+            smi_klass_bits,
+            resolve_addr,
+        );
         let h = cache.alloc(blob.code.len())?;
         cache.publish(h, &blob);
         self.by_handle.insert(
