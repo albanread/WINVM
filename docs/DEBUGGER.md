@@ -595,6 +595,25 @@ dossier:
   and useless. The listing knows the emitter's own trap convention, prints
   `int3 0xde00  ; deopt trap`, and SKIPS the immediate bytes.
 
+**`pcdescs` is two different things, and the listing must say which.**
+An `Nmethod`'s `pcdescs` concatenates block-start descs (one per basic
+block, carrying `OopMap::empty()`, for the trace path only) with the
+genuine safepoints. `disasm-native` labelled every one of them
+`; safepoint`, which claims the GC may run there and that a live oop map
+applies — the opposite of true for a block start. In `SmallInteger>>max:`
+five of six were block starts.
+
+`oopmap == 0` does NOT discriminate: `oopmap::intern` dedupes by content,
+so a real safepoint whose live set happens to be empty also interns to
+index 0. The genuine deopt sites are the ones carrying a scope —
+`deopt_pcdescs`. The listing now prints `; deopt safepoint` for those and
+`; block start bci=N` for the rest, which doubles as a cross-check of the
+block_pcs pipeline: the bcis should match an `MACVM_DBG_IR` block dump
+one for one.
+
+This mislabel is INHERITED — the AArch64 verb had it too — so the fix
+applies to both hosts.
+
 **Not yet ported, and known-broken rather than merely untested.** §4.6's
 live compiled-send auditor fails on x64 today —
 `it_debugger::step_call_stops_at_compiled_send_and_inspects_without_

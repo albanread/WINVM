@@ -624,18 +624,42 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
     // ic-site + safepoint offsets, for annotating the listing lines.
     let ic_offs: std::collections::HashSet<usize> =
         nm.ic_sites.iter().map(|s| s.off as usize).collect();
-    let sp_offs: std::collections::HashSet<usize> =
-        nm.pcdescs.iter().map(|p| p.pc_off as usize).collect();
+    // `pcdescs` is TWO different things concatenated, and conflating them
+    // was a real (and inherited) mislabel: most entries are block-start
+    // descs carrying `OopMap::empty()` for the trace path, and only the
+    // rest are genuine safepoints. Calling them all "; safepoint" claims
+    // the GC may run there and that an oop map is live — the opposite of
+    // true for a block start. `SmallInteger>>max:` shows it at full
+    // strength: 6 pcdescs, of which 5 are block starts.
+    //
+    // `oopmap == 0` cannot tell them apart, because `oopmap::intern`
+    // dedupes by CONTENT — a real safepoint whose live set happens to be
+    // empty also interns to index 0. The genuine deopt sites are the ones
+    // carrying a scope, i.e. `deopt_pcdescs`.
+    let deopt_offs: std::collections::HashSet<usize> =
+        nm.deopt_pcdescs.iter().map(|p| p.code_off as usize).collect();
+    let sp_bci: std::collections::HashMap<usize, usize> = nm
+        .pcdescs
+        .iter()
+        .map(|p| (p.pc_off as usize, p.bci))
+        .collect();
     // Disassemble the CODE region only (up to the literal pool).
     let code = &nm.code.as_bytes()[..nm.literal_off as usize];
     let mut rows: Vec<String> = vec![format!(
-        "nmethod #{} v{} entry+{:#x} verified+{:#x} ({} code bytes, {} pool)",
+        "nmethod #{} v{} entry+{:#x} verified+{:#x} ({} code bytes, {} pool, {} ic sites, {} pcdescs at [{}])",
         id.0,
         nm.version,
         nm.entry_off,
         nm.verified_entry_off,
         nm.literal_off,
-        nm.code.len - nm.literal_off as usize
+        nm.code.len - nm.literal_off as usize,
+        nm.ic_sites.len(),
+        nm.pcdescs.len(),
+        nm.pcdescs
+            .iter()
+            .map(|p| format!("{:#x}", p.pc_off))
+            .collect::<Vec<_>>()
+            .join(" ")
     )];
     // Whole-blob bytes: a pool load's target lands PAST literal_off.
     let all = nm.code.as_bytes();
@@ -662,8 +686,10 @@ fn verb_disasm_native(_vm: &mut Vm<'_>, args: &[Value]) -> TclResult<Value> {
         if ic_offs.contains(&off) {
             a.push_str("  ; IC send site");
         }
-        if sp_offs.contains(&off) {
-            a.push_str("  ; safepoint");
+        if deopt_offs.contains(&off) {
+            a.push_str("  ; deopt safepoint");
+        } else if let Some(bci) = sp_bci.get(&off) {
+            a.push_str(&format!("  ; block start bci={bci}"));
         }
         if let Some(t) = pool_target {
             if t + 8 <= all.len() {
