@@ -27,6 +27,7 @@ pub mod pics;
 pub mod stubs;
 // WINVM (Phase 3): the x86-64 call stub — the interpreter's door into
 // compiled code, sibling of `stubs::build_call_stub`.
+pub mod pics_x64;
 pub mod stubs_x64;
 
 use std::collections::BTreeMap;
