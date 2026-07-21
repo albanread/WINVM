@@ -66,6 +66,13 @@ smallvec = "1"
 # binary. Decoder + Intel formatter only.
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 
+# WINVM (docs/FFI.md): the Windows API knowledge base is a SQLite file, so
+# the resolver needs a driver. Windows-only, so a macOS build is unaffected;
+# `bundled` for the same reason image_store bundles it — no dependence on
+# whatever libsqlite3 happens to be on a given machine.
+[target.'cfg(windows)'.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Codegen backend is an OPEN DECISION (see docs/DESIGN.md §4). Backends are
 # selected by feature so the compiler front end never hard-depends on one.
 [dev-dependencies]

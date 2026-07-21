@@ -134,6 +134,7 @@ dependencies = [
  "cc",
  "iced-x86",
  "libc",
+ "rusqlite",
  "smallvec",
 ]
 

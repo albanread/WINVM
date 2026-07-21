@@ -15,6 +15,9 @@ pub mod deopt;
 pub mod deps;
 pub mod error;
 pub mod ffi;
+// WINVM (docs/FFI.md): the Windows API knowledge-base resolver — the
+// substitution of cocoa_data as the FFI's source of truth.
+pub mod winkb;
 pub mod frames;
 pub mod globals;
 pub mod lookup;
