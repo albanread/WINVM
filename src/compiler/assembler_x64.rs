@@ -442,6 +442,19 @@ impl X64Assembler {
         );
     }
 
+    /// `cmp reg, qword ptr [rip + litN]` — compare against a pool word
+    /// without spending a register to hold it. x86's register-memory
+    /// forms are what make this possible; the AArch64 side has to load
+    /// the literal into a scratch first, which is precisely the scratch
+    /// pressure the x64 emitter's guard sequences avoid.
+    pub fn cmp_literal(&mut self, reg: u8, lit: LiteralId) {
+        self.emit_inner(
+            "cmp",
+            &[r64(reg), mem_rip(literal_sym(lit))],
+            Some(Target::Literal(lit)),
+        );
+    }
+
     // ── calls ───────────────────────────────────────────────────────────
 
     /// A patchable `call rel32` placeholder (self-call, displacement 0)

@@ -48,10 +48,11 @@
 use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::emit::EmittedIcSite;
 use crate::compiler::assembler_x64::{
-    imm, mem, mem_byte, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
+    imm, mem, mem_byte, mem_index, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
     SCRATCH0, SCRATCH1, SHADOW_SPACE, VM_STATE,
 };
 use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
+use crate::vendor::wfasm::rasm::parse::Operand;
 use crate::compiler::regalloc::{Assignment, RegallocResult, SpillSlot};
 
 /// The IR ops this slice lowers. Anything else panics in [`emit_x64`] —
@@ -68,6 +69,8 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "SmiCmpBr",
     "SmiCmpVal",
     "StoreField",
+    "ArrayAt",
+    "ArrayAtPut",
     "BoolBr",
     "Poll",
     "Alloc",
@@ -86,6 +89,20 @@ pub const SUPPORTED_OPS: &[&str] = &[
 /// unscaled `ldur`; x86 addresses it directly with a disp8.
 const KLASS_OFF_FROM_TAGGED: i64 =
     crate::oops::layout::KLASS_OFFSET as i64 - crate::oops::layout::MEM_TAG as i64;
+
+/// An indexable object's length word, from its tagged pointer: the first
+/// body word (past the 2-word header), less the tag bias. Holds a TAGGED
+/// smi count.
+const ARRAY_LENGTH_OFF: i64 = (crate::oops::layout::HEADER_WORDS
+    * crate::oops::layout::WORD_SIZE) as i64
+    - crate::oops::layout::MEM_TAG as i64;
+
+/// Displacement of element 1 in the `[arr + idx*2 + disp]` addressing the
+/// array ops use. Elements start one word past the length word; scaling a
+/// tagged index (`i << 2`) by 2 yields `i * 8`, which already counts one
+/// element too far for a 1-based index, so the base is the LENGTH word's
+/// own offset rather than the first element's.
+const ARRAY_ELEM_BASE: i64 = ARRAY_LENGTH_OFF;
 
 /// One safepoint the emitter recorded — currently only deopt trap sites.
 /// `pc_off` is the trapping instruction's OWN offset (for a trap site the
@@ -385,16 +402,22 @@ impl<'a> Emitter<'a> {
     ///
     /// `biased` is the already-tag-adjusted field displacement, so the
     /// card index is computed from the true field address.
-    fn emit_write_barrier(&mut self, robj: u8, rval: u8, biased: i64) {
+    /// `field` is a memory operand naming the STORED FIELD's address,
+    /// suitable for `lea` — a constant displacement for `StoreField`, a
+    /// scaled-index form for `ArrayAtPut`.
+    ///
+    /// Uses `RAX` as its only temporary. That is deliberate and slightly
+    /// subtle: `RAX` holds `old_start` for the three early-out compares,
+    /// and is only reused for the card address AFTER the last of them, at
+    /// which point `old_start` is dead. Keeping the barrier off `SCRATCH0`
+    /// /`SCRATCH1` is what lets both callers hold their object and value
+    /// in the scratch pair across it.
+    fn emit_write_barrier(&mut self, robj: u8, rval: u8, field: Operand) {
+        use crate::oops::layout::{VMREG_CARD_BASE_BIASED_OFFSET, VMREG_OLD_START_OFFSET};
         let skip = self.asm.new_label();
         // old_start, read live from the VM register block.
-        self.asm.emit(
-            "mov",
-            &[
-                r64(RAX),
-                mem(VM_STATE, crate::oops::layout::VMREG_OLD_START_OFFSET as i64),
-            ],
-        );
+        self.asm
+            .emit("mov", &[r64(RAX), mem(VM_STATE, VMREG_OLD_START_OFFSET as i64)]);
         self.asm.emit("cmp", &[r64(robj), r64(RAX)]);
         self.asm.jcc(Cond::B, skip); // obj younger than old_start
         self.asm.emit("test", &[r64(rval), imm(3)]);
@@ -402,26 +425,61 @@ impl<'a> Emitter<'a> {
         self.asm.emit("cmp", &[r64(rval), r64(RAX)]);
         self.asm.jcc(Cond::Ae, skip); // val is old too
 
-        // card_index = (obj + biased) >> CARD_SHIFT, then dirty the byte
-        // at card_base_biased + card_index.
-        self.asm.emit("lea", &[r64(SCRATCH0), mem(robj, biased)]);
+        // `old_start` is dead from here, so RAX becomes the card address:
+        // card_base_biased + (field_addr >> CARD_SHIFT).
+        self.asm.emit("lea", &[r64(RAX), field]);
         self.asm.emit(
             "shr",
-            &[r64(SCRATCH0), imm(crate::memory::cards::CARD_SHIFT as i64)],
+            &[r64(RAX), imm(crate::memory::cards::CARD_SHIFT as i64)],
         );
         self.asm.emit(
-            "mov",
-            &[
-                r64(RAX),
-                mem(
-                    VM_STATE,
-                    crate::oops::layout::VMREG_CARD_BASE_BIASED_OFFSET as i64,
-                ),
-            ],
+            "add",
+            &[r64(RAX), mem(VM_STATE, VMREG_CARD_BASE_BIASED_OFFSET as i64)],
         );
-        self.asm.emit("add", &[r64(RAX), r64(SCRATCH0)]);
         self.asm.emit("mov", &[mem_byte(RAX, 0), imm(0)]); // CARD_DIRTY == 0
         self.asm.bind(skip);
+    }
+
+    /// The four checks every indexed access makes before touching memory,
+    /// in the AArch64 emitter's order. Any failure branches to the cold
+    /// block, which re-executes the send in the interpreter.
+    ///
+    /// Uses only `RAX` as a temporary, so both operands stay in the
+    /// scratch pair — see [`emit_write_barrier`] for the same discipline.
+    /// `cmp reg, [rip+lit]` is what makes the klass check register-free;
+    /// the AArch64 side must load the literal into a scratch first.
+    fn emit_array_guards(&mut self, rarr: u8, ridx: u8, klass: PoolLit, fail: BlockId) {
+        use crate::oops::layout::MEM_TAG;
+        let cold = self.labels[fail.0 as usize];
+
+        // 1. The receiver is a heap oop (tag bits == MEM_TAG), not a smi
+        //    and not a reserved sentinel.
+        self.asm.emit("mov", &[r64(RAX), r64(rarr)]);
+        self.asm.emit("and", &[r64(RAX), imm(3)]);
+        self.asm.emit("cmp", &[r64(RAX), imm(MEM_TAG as i64)]);
+        self.asm.jcc(Cond::Ne, cold);
+
+        // 2. It is an instance of the expected array klass.
+        self.asm
+            .emit("mov", &[r64(RAX), mem(rarr, KLASS_OFF_FROM_TAGGED)]);
+        let lit = self.literal_ids[klass.0 as usize];
+        self.asm.cmp_literal(RAX, lit);
+        self.asm.jcc(Cond::Ne, cold);
+
+        // 3. The index is a smi.
+        self.asm.emit("test", &[r64(ridx), imm(3)]);
+        self.asm.jcc(Cond::Ne, cold);
+
+        // 4. It is in range. Both index and length are TAGGED, so the
+        //    comparison happens in tagged units and needs no untagging:
+        //    `idx - 4` is `(i-1) << 2`, and an UNSIGNED compare against
+        //    the tagged length rejects `i < 1` in the same instruction
+        //    that rejects `i > length` (a zero or negative index wraps to
+        //    a huge unsigned value). One compare, both bounds.
+        self.asm.emit("lea", &[r64(RAX), mem(ridx, -4)]);
+        self.asm
+            .emit("cmp", &[r64(RAX), mem(rarr, ARRAY_LENGTH_OFF)]);
+        self.asm.jcc(Cond::Ae, cold);
     }
 
     /// A klass guard (`GuardShape::KlassTest`): the object must be a heap
@@ -735,7 +793,7 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             let biased = *byte_off as i64 - crate::oops::layout::MEM_TAG as i64;
             e.asm.emit("mov", &[mem(o, biased), r64(v)]);
             if *barrier {
-                e.emit_write_barrier(o, v, biased);
+                e.emit_write_barrier(o, v, mem(o, biased));
             }
         }
 
@@ -795,6 +853,54 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.emit("mov", &[r64(RAX), r64(RECEIVER)]);
             let ep = e.epilogue;
             e.asm.jmp(ep);
+        }
+
+        Ir::ArrayAt {
+            dst,
+            arr,
+            idx,
+            klass,
+            fail,
+        } => {
+            let a = e.read_into(*arr, SCRATCH0);
+            let i = e.read_into(*idx, SCRATCH1);
+            e.emit_array_guards(a, i, *klass, *fail);
+            let d = e.def_reg(*dst, RAX);
+            // element(i) = [arr + idx*2 + ELEM_BASE]. `idx` is a tagged
+            // smi (i<<2), so scaling by 2 gives i*8 — exactly one element
+            // stride. x86's SIB does the whole address in one operand;
+            // the AArch64 emitter needs two `add`s to build it.
+            e.asm
+                .emit("mov", &[r64(d), mem_index(a, i, 2, ARRAY_ELEM_BASE)]);
+            e.store_def(*dst, d);
+        }
+
+        Ir::ArrayAtPut {
+            dst,
+            arr,
+            idx,
+            val,
+            klass,
+            fail,
+        } => {
+            let a = e.read_into(*arr, SCRATCH0);
+            let i = e.read_into(*idx, SCRATCH1);
+            e.emit_array_guards(a, i, *klass, *fail);
+            // The value is the third live operand, and both scratches are
+            // taken — read it into RAX, which the guards have finished
+            // with by now.
+            let v = e.read_into(*val, RAX);
+            e.asm
+                .emit("mov", &[mem_index(a, i, 2, ARRAY_ELEM_BASE), r64(v)]);
+            // Storing an oop into a possibly-old array needs the same
+            // card marking a StoreField does.
+            e.emit_write_barrier(a, v, mem_index(a, i, 2, ARRAY_ELEM_BASE));
+            // `at:put:` answers the stored value.
+            let d = e.def_reg(*dst, RAX);
+            if d != v {
+                e.asm.emit("mov", &[r64(d), r64(v)]);
+            }
+            e.store_def(*dst, d);
         }
 
         Ir::CallSend { dst, site, args } => {
@@ -2492,10 +2598,191 @@ mod tests {
         );
     }
 
+    /// Build a fake indexable object: `[mark][klass][length][elems...]`,
+    /// with `length` a tagged smi. Returns its tagged pointer.
+    #[cfg(windows)]
+    fn fake_array(words: &mut Vec<u64>, klass: u64, elems: &[u64]) -> u64 {
+        words.clear();
+        words.push(0); // mark
+        words.push(klass);
+        words.push((elems.len() as u64) << 2); // tagged length
+        words.extend_from_slice(elems);
+        words.as_ptr() as u64 | crate::oops::layout::MEM_TAG
+    }
+
+    /// `ArrayAt` executed: correct element for a valid 1-based index, and
+    /// the cold edge for every way the access can be invalid.
+    ///
+    /// The bounds cases are the point. The guard does ONE unsigned compare
+    /// to reject both `i < 1` and `i > length` — a zero or negative index
+    /// wraps to a huge unsigned value — so index 0 and index -1 are as
+    /// important to test as index length+1. A signed compare would pass
+    /// them and read outside the object.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_array_at_executes_and_bounds_check_is_unsigned() {
+        use crate::compiler::ir::PoolEntry;
+        const KLASS: u64 = 0x4444_0001;
+
+        let mut storage = Vec::new();
+        let arr = fake_array(&mut storage, KLASS, &[smi(10), smi(20), smi(30)]);
+
+        let mut m = hand_method(
+            vec![
+                block(
+                    0,
+                    vec![
+                        Ir::Param {
+                            dst: VReg(0),
+                            index: 0,
+                        },
+                        Ir::Param {
+                            dst: VReg(1),
+                            index: 1,
+                        },
+                        Ir::ArrayAt {
+                            dst: VReg(2),
+                            arr: VReg(0),
+                            idx: VReg(1),
+                            klass: PoolLit(0),
+                            fail: BlockId(1),
+                        },
+                        Ir::Ret { val: VReg(2) },
+                    ],
+                ),
+                block(
+                    1,
+                    vec![Ir::Bailout {
+                        reason: BailoutReason::SmiOpFailed,
+                    }],
+                ),
+            ],
+            oops(3),
+            2,
+        );
+        m.pool = vec![PoolEntry {
+            value: KLASS,
+            kind: Some(RelocKind::Oop),
+        }];
+
+        // Valid, 1-based.
+        assert_eq!(compile_and_run(&m, arr, smi(1)), smi(10));
+        assert_eq!(compile_and_run(&m, arr, smi(2)), smi(20));
+        assert_eq!(compile_and_run(&m, arr, smi(3)), smi(30));
+        // Out of range, both directions — the single unsigned compare.
+        assert_eq!(compile_and_run(&m, arr, smi(4)), BAILOUT_SENTINEL, "past end");
+        assert_eq!(compile_and_run(&m, arr, smi(0)), BAILOUT_SENTINEL, "index 0");
+        assert_eq!(
+            compile_and_run(&m, arr, smi(-1)),
+            BAILOUT_SENTINEL,
+            "negative index must not wrap into the object"
+        );
+        // Bad receiver / bad index shapes.
+        assert_eq!(compile_and_run(&m, smi(7), smi(1)), BAILOUT_SENTINEL, "smi recv");
+        assert_eq!(compile_and_run(&m, arr, arr), BAILOUT_SENTINEL, "non-smi index");
+        // Wrong klass.
+        let mut other = Vec::new();
+        let arr2 = fake_array(&mut other, 0x5555_0001, &[smi(99)]);
+        assert_eq!(
+            compile_and_run(&m, arr2, smi(1)),
+            BAILOUT_SENTINEL,
+            "a different klass must not match the guard"
+        );
+        let _ = (&storage, &other);
+    }
+
+    /// `ArrayAtPut` writes the element, answers the stored value, and
+    /// leaves the neighbouring elements untouched (which is what catches a
+    /// wrong element stride or base offset).
+    #[cfg(windows)]
+    #[test]
+    fn compiled_array_at_put_writes_the_right_element() {
+        use crate::compiler::ir::PoolEntry;
+        const KLASS: u64 = 0x4444_0001;
+
+        let mut storage = Vec::new();
+        let arr = fake_array(&mut storage, KLASS, &[smi(0), smi(0), smi(0)]);
+
+        let mut m = hand_method(
+            vec![
+                block(
+                    0,
+                    vec![
+                        Ir::Param {
+                            dst: VReg(0),
+                            index: 0,
+                        },
+                        Ir::Param {
+                            dst: VReg(1),
+                            index: 1,
+                        },
+                        Ir::Param {
+                            dst: VReg(2),
+                            index: 2,
+                        },
+                        Ir::ArrayAtPut {
+                            dst: VReg(3),
+                            arr: VReg(0),
+                            idx: VReg(1),
+                            val: VReg(2),
+                            klass: PoolLit(0),
+                            fail: BlockId(1),
+                        },
+                        Ir::Ret { val: VReg(3) },
+                    ],
+                ),
+                block(
+                    1,
+                    vec![Ir::Bailout {
+                        reason: BailoutReason::SmiOpFailed,
+                    }],
+                ),
+            ],
+            oops(4),
+            3,
+        );
+        m.pool = vec![PoolEntry {
+            value: KLASS,
+            kind: Some(RelocKind::Oop),
+        }];
+
+        // The barrier reads through R15; a null VM would fault, so run
+        // through the stub with a real (zeroed) register block. old_start
+        // of 0 makes every object "old", and a smi value takes the
+        // second early-out, so no card is marked.
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::vendor::wfasm::native_windows::WinJit;
+        let vmreg = [0u64; 8];
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default()).blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let vm = vmreg.as_ptr() as u64;
+
+        let argv = [arr, smi(2), smi(77)];
+        assert_eq!(
+            unsafe { stub_fn(entry, vm, argv.as_ptr(), 3) },
+            smi(77),
+            "at:put: answers the stored value"
+        );
+        // Element 2 changed; its neighbours did not.
+        assert_eq!(storage[3], smi(0), "element 1 untouched");
+        assert_eq!(storage[4], smi(77), "element 2 written");
+        assert_eq!(storage[5], smi(0), "element 3 untouched");
+        assert_eq!(storage[2], smi(3), "the length word was not overwritten");
+    }
+
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
-    #[should_panic(expected = "ArrayAt is not in the Phase-3 vertical slice")]
+    #[should_panic(expected = "FArith is not in the Phase-3 vertical slice")]
     fn unsupported_op_panics_by_name() {
         let m = hand_method(
             vec![block(
@@ -2525,12 +2812,11 @@ mod tests {
         let _ = &ra;
         emit_op(
             &mut e,
-            &Ir::ArrayAt {
+            &Ir::FArith {
+                op: crate::compiler::ir::FArithOp::Add,
                 dst: VReg(0),
-                arr: VReg(0),
-                idx: VReg(0),
-                klass: crate::compiler::ir::PoolLit(0),
-                fail: BlockId(0),
+                a: VReg(0),
+                b: VReg(0),
             },
         );
     }
