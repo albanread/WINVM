@@ -348,13 +348,34 @@ relative-to-C ratios.
     Phase 5 ever adds a callee-saved XMM to the FP pool without teaching
     this stub to save it.
   - 684 lib tests pass; world interpreter still 5891/0.
-- **Next (rest of Phase 3):** `CallSend` + inline caches (the
-  `call_patchable` site shape is already in place), `Alloc`, `Poll`,
-  `CallRuntime`, `StoreField` with its write barrier, `ArrayAt/AtPut`,
-  and `oopmap.rs` register numbering — then wiring `compiled_call.rs` and
-  `driver.rs` to select the x64 back end so tier-up actually fires, plus
-  `adapters.rs`. That is what re-enables the `target_arch = "aarch64"`-
-  gated tier-1 tests and turns the JIT on for real workloads.
+- **2026-07-21 — Phase 3 continued: the call-free op set is complete.**
+  `StoreField` with the generational card-marking write barrier (three
+  early-outs, cheapest first: young `obj`, smi `val`, old `val`),
+  `SmiCmpVal` via branchless `cmovcc` (the `csel` analogue), `BoolBr`
+  against the canonical true/false oops with a `not_bool` edge for
+  everything else, and `RetSelf`. `assembler_x64` gained `Cond::cmov()`
+  and `mem_byte()`.
+  - **A real bug, caught by a test rather than by review:** `LoadField`
+    was not applying the `MEM_TAG` displacement bias that `StoreField`
+    and `LoadKlass` apply, so every compiled field read was one byte off.
+    The store-then-read-back test returned 1 instead of 308 — a value
+    shifted by a single byte. Worth recording as evidence for the
+    execution-testing discipline: the op had been "supported" and
+    compiling cleanly since Phase 3c.
+  - The write-barrier test asserts the three *negative* cases as well as
+    the positive one. A barrier that marked unconditionally would still
+    be functionally correct and would quietly destroy scavenge
+    performance, so the non-marking cases are the ones worth pinning.
+  - 688 lib tests pass; world interpreter still 5891/0.
+- **Next (rest of Phase 3):** the ops that call into the runtime —
+  `Poll`, `Alloc`, `CallRuntime`, and `CallSend` + inline caches (the
+  `call_patchable` site shape is already in place) — plus
+  `ArrayAt/AtPut` and `oopmap.rs` register numbering. Then wiring
+  `compiled_call.rs` and `driver.rs` to select the x64 back end so
+  tier-up actually fires, plus `adapters.rs`. That wiring is what
+  re-enables the `target_arch = "aarch64"`-gated tier-1 tests and turns
+  the JIT on for real workloads; until it lands, the x64 back end is
+  proven piece-by-piece but not yet reached by a running program.
 
 ## 7. What deliberately does *not* change
 
