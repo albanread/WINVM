@@ -236,7 +236,29 @@ relative-to-C ratios.
 
 ---
 
-## 6. What deliberately does *not* change
+## 6. Status log
+
+- **2026-07-21 — M0 done.** `cargo build` clean (zero warnings) on
+  x86-64 Windows. OS seams ported: `memory/reservation.rs` (VirtualAlloc),
+  `runtime/probe.rs` (thread stack bounds), `runtime/vm_state.rs`
+  (ExitThread), `codecache/deopt_trap.rs` (Mach/signal layer gated to
+  macOS; portable thread ids; recovery-jump stubs pending the Phase-2
+  VEH), new `vendor/wfasm/native_windows.rs` (`WinJit`), Cocoa bridge +
+  prims gated with clean-fail Windows stubs. The entire compiler/JIT
+  middle end compiles unmodified — it is pure Rust emitting A64 bytes.
+- **2026-07-21 — M1 done.** World boots (107 classes) from `.mst` +
+  SQLite on Windows; DeltaBlue + Richards produce correct results
+  interpreted; world test suite minus the four FFI-dependent files
+  (ffi_alien, posix_io, socket, accel): **5891 run, 0 failed**.
+  Interpreted release timings on this machine: DeltaBlue ×10 = 126 ms,
+  Richards ×10 = 1135 ms — the tier-1 x64 backend (Phase 3) is where the
+  Mac's 30–53× lives. FFI `dispatch_ffi_primitive` guest-fatals cleanly
+  on non-ARM64 until then.
+- **Next (Phase 2):** re-vendor JASM's x64 `rasm` encoder + Windows
+  `NativeJit`, VEH-based trap plumbing from `seh.rs`, code-cache region
+  on the x64 reloc kinds.
+
+## 7. What deliberately does *not* change
 
 - Bytecode ISA, `.mst` format, world sources, SQLite image store — **identical**,
   so worlds and tests are shared verbatim with MACVM.
