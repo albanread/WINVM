@@ -48,7 +48,7 @@
 use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::emit::{EmittedIcSite, EntryGuard};
 use crate::compiler::assembler_x64::{
-    imm, mem, mem_byte, mem_index, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
+    imm, mem, mem_byte, mem_index, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RSP,
     incoming_stack_slot, outgoing_arg_bytes, outgoing_stack_slot, MAX_REG_ARGS,
     OUTGOING_ARG_BYTES, SCRATCH0,
     SCRATCH1, SHADOW_SPACE, VM_STATE,
@@ -56,6 +56,11 @@ use crate::compiler::assembler_x64::{
 use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
 use crate::vendor::wfasm::rasm::parse::Operand;
 use crate::compiler::regalloc::{Assignment, RegallocResult, SpillSlot};
+
+/// `self` is always `VReg(0)` by `ir::convert`'s construction — the same
+/// documented convention `emit.rs` names, restated here rather than
+/// shared so neither back end reaches into the other.
+const SELF_VREG: VReg = VReg(0);
 
 /// The IR ops this slice lowers. Anything else panics in [`emit_x64`] —
 /// see the module header.
@@ -989,9 +994,24 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
         }
 
         Ir::RetSelf => {
-            // The receiver lives in its pinned register for the whole
-            // activation, so returning self is just a move.
-            e.asm.emit("mov", &[r64(RAX), r64(RECEIVER)]);
+            // Read the receiver from wherever the ALLOCATOR put it, which
+            // is what the AArch64 emitter does (`resolve(SELF_VREG, 0)`).
+            //
+            // This previously read the pinned `RECEIVER` register on the
+            // strength of a comment claiming "the receiver lives in its
+            // pinned register for the whole activation". Nothing ever
+            // wrote that register: not the prologue, not the call stub,
+            // not `Ir::Param`. `RetSelf` therefore returned whatever junk
+            // R14 happened to hold — so `OrderedCollection>>init`, whose
+            // whole body is `^self`, handed back garbage, and the caller's
+            // next send to it died as a doesNotUnderstand far from here.
+            //
+            // `self` is `VReg(0)` by `ir::convert`'s construction, the
+            // same documented convention the A64 side relies on.
+            let rv = e.read_into(SELF_VREG, RAX);
+            if rv != RAX {
+                e.asm.emit("mov", &[r64(RAX), r64(rv)]);
+            }
             let ep = e.epilogue;
             e.asm.jmp(ep);
         }
@@ -1927,6 +1947,63 @@ mod tests {
     /// Driven through the call stub because the barrier reads `old_start`
     /// and `card_base` through the pinned `R15`, which is exactly what the
     /// stub establishes.
+    /// `RetSelf` must answer the RECEIVER, and only running it proves so.
+    ///
+    /// This lowered to `mov rax, R14` — the pinned RECEIVER register —
+    /// on the strength of a comment saying the receiver lives there for
+    /// the whole activation. Nothing ever wrote R14: not the prologue,
+    /// not the call stub, not `Ir::Param`. So `^self` returned junk.
+    ///
+    /// It went unnoticed because `RetSelf`'s existing coverage only
+    /// checked the emitted SHAPE (a move then a jump to the epilogue),
+    /// which was right the whole time. A method whose whole body is
+    /// `^self` (`OrderedCollection>>init`) is where it bites, and it
+    /// surfaces far away as a doesNotUnderstand on the object the caller
+    /// thought it had just built.
+    #[cfg(windows)]
+    #[test]
+    fn ret_self_answers_the_receiver() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // `^self`, with a second parameter so the receiver is provably
+        // not just 'whatever happened to be in the first register'.
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param { dst: VReg(0), index: 0 },
+                    Ir::Param { dst: VReg(1), index: 1 },
+                    Ir::RetSelf,
+                ],
+            )],
+            oops(2),
+            1,
+        );
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None).blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+
+        const RECV: u64 = 0x1234_5678;
+        const ARG: u64 = 0x9ABC_DEF0;
+        let argv = [RECV, ARG];
+        let got = unsafe { stub_fn(entry, vm, argv.as_ptr(), 2) };
+        assert_eq!(
+            got, RECV,
+            "^self must answer the receiver, not the argument and not \
+             whatever a never-initialized pinned register holds"
+        );
+    }
     #[cfg(windows)]
     #[test]
     fn write_barrier_marks_only_old_to_young_stores() {
