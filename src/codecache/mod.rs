@@ -19,6 +19,10 @@
 pub mod adapters;
 pub mod deopt_trap;
 pub mod ffi_stubs;
+// WINVM (docs/FFI.md §5): the Win64 trampolines. A different SHAPE from
+// the AArch64 pair, not a transliteration — see the module doc.
+#[cfg(not(target_arch = "aarch64"))]
+pub mod ffi_stubs_x64;
 pub mod flush;
 pub mod guard;
 pub mod mega;
