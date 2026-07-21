@@ -682,17 +682,73 @@ pub fn compute_intervals(
     )
 }
 
+// ── The register file (the ONLY architecture-specific part of this module;
+//    the scan, spill policy, oop-map bookkeeping, and every public type are
+//    arch-neutral and shared verbatim between targets — WINVM MIGRATION.md
+//    §2.1). Pools are explicit lists of ARCHITECTURAL register numbers, not
+//    a dense `0..N` count, because x86-64's allocatable set has holes (RSP
+//    and RBP sit in the middle of the numbering).
+
 /// x0–x15 (`arm64.md` §3); x16/x17 scratch, x18 platform, x19/x20 alloc
 /// scratch, x21–x27 the S14 residency pool (below), x28 = &VmState,
 /// x29/x30/sp — none of those are linear-scan allocatable.
-const NUM_ALLOCATABLE_REGS: u8 = 16;
+#[cfg(target_arch = "aarch64")]
+const ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// WINVM x86-64: RCX, RDX, RBX, RSI, RDI, R8, R9 — seven, against
+/// AArch64's sixteen. Excluded and why:
+/// - **RAX (0)** — emit's third scratch: the two-address fixup temp and
+///   the fixed operand of `imul`/`idiv`, plus the ABI return register.
+/// - **RSP (4) / RBP (5)** — stack and frame pointer; spill slots are
+///   `[rbp − 8·(i+1)]` and the GC/debugger walk the RBP chain.
+/// - **R10 (10) / R11 (11)** — emit's spill-reload scratches, the x16/x17
+///   analogues. R10 is additionally the VEH's deopt trap-pc stash.
+/// - **R12–R15** — the pinned VM registers (method, bcp, receiver,
+///   &VmState).
+///
+/// The pressure this creates is real and expected (MIGRATION.md §2.1
+/// flags it): more spills than AArch64. It is survivable because the
+/// spill-all-at-safepoints policy below already keeps the register file
+/// idle across calls, and the residency tier reclaims what the scan
+/// leaves unused.
+#[cfg(not(target_arch = "aarch64"))]
+const ALLOCATABLE_REGS: &[u8] = &[1, 2, 3, 6, 7, 8, 9];
+
 /// Float fast-path FP pool: `d0`–`d7`, caller-saved scratch — zero
 /// prologue/epilogue cost, clobbered by any call, which is safe because a
 /// crossing-safepoint fp interval is spilled (spill-all) exactly like a GPR
 /// one. `d8`–`d15` (callee-saved; the write-through residency tier) and
 /// `d16`/`d17` (emit's fp spill scratch, mirroring x16/x17) stay out of the
 /// pool.
-const NUM_FP_ALLOCATABLE_REGS: u8 = 8;
+#[cfg(target_arch = "aarch64")]
+const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
+
+/// WINVM x86-64: `xmm0`–`xmm4`, all volatile under Win64 — the same
+/// "zero prologue cost, clobbered by any call, safe because crossing
+/// intervals are spilled" rationale as the AArch64 pool. `xmm5` is left
+/// out as emit's FP scratch (the `d16`/`d17` analogue, and volatile so it
+/// needs no save); `xmm6`–`xmm15` are callee-saved on Win64 and would each
+/// cost a prologue `movsd` — they are deliberately unused until float
+/// regions are ported (Phase 5), when the residency tier can claim them
+/// with an explicit save/restore.
+#[cfg(not(target_arch = "aarch64"))]
+const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4];
+
+/// Allocatable registers the residency tier may claim when the main scan
+/// leaves them globally unused. Excludes the ABI argument/result registers
+/// (written mid-body by call marshalling and the allocation slow path):
+/// x0–x5 on AArch64; RAX/RCX/RDX/R8/R9 on x86-64, which leaves exactly the
+/// callee-saved allocatable three (RBX, RSI, RDI).
+#[cfg(target_arch = "aarch64")]
+const RESIDENCY_CANDIDATES: &[u8] = &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+#[cfg(not(target_arch = "aarch64"))]
+const RESIDENCY_CANDIDATES: &[u8] = &[3, 6, 7];
+
+/// One past the highest architectural register number either file uses —
+/// the size of the `reg_used` marking array. Register NUMBERS index it, so
+/// it is emphatically not `ALLOCATABLE_REGS.len()` (on x86-64 the pool has
+/// 7 entries but numbers run up to 9).
+const MAX_REG_NUM: usize = 16;
 
 /// D3.5's policy, in order: (1) every `crosses_safepoint` interval spills
 /// unconditionally, whole-lifetime, before the main scan even starts — the
@@ -719,8 +775,20 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     // for, nearly all of them (the whole point is that spill-all left the
     // register file idle). x0–x5 stay out (ABI argument/result/alloc-slow
     // paths write them mid-body).
+    // WINVM: on AArch64 this base pool is DISJOINT from the allocatable
+    // file — x21–x27 are callee-saved registers with no other role, free
+    // for the taking. x86-64 has no such surplus: every callee-saved
+    // register is either pinned (R12–R15, RBP) or already allocatable
+    // (RBX, RSI, RDI). So the x64 base pool is EMPTY and residency draws
+    // purely from the extension below — the registers the main scan left
+    // globally unused. That is sound for exactly the reason the AArch64
+    // extension is: residency only ever claims `!crosses_call` intervals,
+    // so a volatile register is as good as a callee-saved one here.
+    #[cfg(target_arch = "aarch64")]
     let mut pool: Vec<u8> = vec![21, 22, 23, 24, 25, 26, 27];
-    let mut reg_used = [false; NUM_ALLOCATABLE_REGS as usize];
+    #[cfg(not(target_arch = "aarch64"))]
+    let mut pool: Vec<u8> = Vec::new();
+    let mut reg_used = [false; MAX_REG_NUM];
     for iv in intervals.iter() {
         // An fp interval's Reg(n) names dN, not xN — a different file
         // entirely; it neither occupies nor frees a GPR here.
@@ -731,7 +799,7 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
             reg_used[r as usize] = true;
         }
     }
-    for r in 6..NUM_ALLOCATABLE_REGS {
+    for &r in RESIDENCY_CANDIDATES {
         if !reg_used[r as usize] {
             pool.push(r);
         }
@@ -745,7 +813,16 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     // compiled callees can't clobber it; the Poll/Alloc/FBox SLOW paths
     // (`bl` into Rust, which uses d8–d15 freely) already re-load residents.
     // Floats need no GC resync at all beyond that — a raw f64 never moves.
+    // WINVM x86-64: empty. Win64's callee-saved XMMs (xmm6–xmm15) each
+    // cost a prologue/epilogue save, which the AArch64 tier never had to
+    // pay (d8–d15 are saved by the call stub's own bank). Wiring that is
+    // Phase 5 work, alongside the float regions themselves; until then no
+    // fp interval gets a resident and the canonical slot is simply read
+    // back. Correctness is unaffected — residency is a pure optimization.
+    #[cfg(target_arch = "aarch64")]
     let fp_pool: Vec<u8> = (8..16).collect();
+    #[cfg(not(target_arch = "aarch64"))]
+    let fp_pool: Vec<u8> = Vec::new();
     let mut fp_taken: Vec<Vec<(u32, u32)>> = vec![Vec::new(); fp_pool.len()];
     let mut order: Vec<usize> = (0..intervals.len())
         .filter(|&i| {
@@ -798,8 +875,8 @@ pub fn allocate(intervals: &mut [LiveInterval]) -> (u16, Vec<bool>) {
     // the same class (a d-reg can't satisfy a GPR interval or vice versa).
     let mut active: Vec<usize> = Vec::new();
     let mut active_fp: Vec<usize> = Vec::new();
-    let mut free_regs: Vec<u8> = (0..NUM_ALLOCATABLE_REGS).rev().collect();
-    let mut free_fp_regs: Vec<u8> = (0..NUM_FP_ALLOCATABLE_REGS).rev().collect();
+    let mut free_regs: Vec<u8> = ALLOCATABLE_REGS.iter().rev().copied().collect();
+    let mut free_fp_regs: Vec<u8> = FP_ALLOCATABLE_REGS.iter().rev().copied().collect();
 
     for i in order {
         let start = intervals[i].start;
@@ -1236,11 +1313,66 @@ mod tests {
         verify_spill_all(&intervals); // must not panic
     }
 
-    /// Linear-scan core: with only 16 allocatable registers, 17 mutually
+    /// WINVM: the x86-64 register file must never offer a register that
+    /// has another job. Handing out RSP or RBP would corrupt the stack or
+    /// the frame chain the GC and debugger walk; handing out R12–R15 would
+    /// silently clobber `&VmState`/receiver/bcp/method; handing out
+    /// R10/R11 would collide with emit's spill-reload scratches (and R10
+    /// with the VEH's trap-pc stash); handing out RAX would collide with
+    /// emit's two-address fixup temp and `imul`/`idiv`. Each of those is a
+    /// silent-corruption bug, not a crash, so the pools are asserted
+    /// directly rather than left to be discovered downstream.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    fn x64_register_file_excludes_every_reserved_register() {
+        use crate::compiler::assembler_x64 as x64;
+        for (num, name) in [
+            (x64::RSP, "RSP (stack pointer)"),
+            (x64::RBP, "RBP (frame pointer / spill base)"),
+            (x64::R12, "R12 (method)"),
+            (x64::R13, "R13 (bytecode pointer)"),
+            (x64::R14, "R14 (receiver)"),
+            (x64::R15, "R15 (&VmState)"),
+            (x64::R10, "R10 (emit scratch / VEH trap-pc stash)"),
+            (x64::R11, "R11 (emit scratch)"),
+            (x64::RAX, "RAX (emit two-address temp / imul / idiv / ABI return)"),
+        ] {
+            assert!(
+                !ALLOCATABLE_REGS.contains(&num),
+                "{name} must never be linear-scan allocatable"
+            );
+            assert!(
+                !RESIDENCY_CANDIDATES.contains(&num),
+                "{name} must never be a residency candidate"
+            );
+        }
+        // And the pool is exactly the seven MIGRATION.md §2.1 names.
+        assert_eq!(
+            ALLOCATABLE_REGS,
+            &[x64::RCX, x64::RDX, x64::RBX, x64::RSI, x64::RDI, x64::R8, x64::R9]
+        );
+        // Residency candidates must themselves be allocatable (the tier
+        // reclaims scan leftovers) and callee-saved (never an ABI arg).
+        for r in RESIDENCY_CANDIDATES {
+            assert!(ALLOCATABLE_REGS.contains(r));
+            assert!(
+                !x64::ARG_REGS.contains(r),
+                "an ABI argument register is written mid-body; it cannot host a resident"
+            );
+        }
+    }
+
+    /// Linear-scan core: with N allocatable registers, N+1 mutually
     /// overlapping (call-free) intervals force exactly one spill — the
     /// furthest-ending one, whether it's encountered first or last.
+    ///
+    /// WINVM: expressed in terms of [`ALLOCATABLE_REGS`] rather than the
+    /// old hardcoded 16/17, so it states the *invariant* (one more live
+    /// value than registers costs exactly one spill, and it's the furthest-
+    /// ending one) on every target instead of AArch64's register count.
     #[test]
     fn furthest_end_spilled_under_pressure() {
+        let n = ALLOCATABLE_REGS.len() as u32;
         let mut intervals = vec![LiveInterval {
             vreg: VReg(0),
             start: 0,
@@ -1252,7 +1384,7 @@ mod tests {
             resident_reg: None,
             assignment: None,
         }];
-        for i in 1..17u32 {
+        for i in 1..=n {
             intervals.push(LiveInterval {
                 vreg: VReg(i),
                 start: 0,
@@ -1265,7 +1397,7 @@ mod tests {
                 assignment: None,
             });
         }
-        assert_eq!(intervals.len(), 17);
+        assert_eq!(intervals.len(), n as usize + 1);
 
         let (frame_slots, _slot_is_oop) = allocate(&mut intervals);
         assert_eq!(frame_slots, 1, "exactly one spill");
@@ -1288,7 +1420,16 @@ mod tests {
                 _ => panic!("expected every other interval to hold a register"),
             })
             .collect();
-        assert_eq!(regs.len(), 16, "all 16 registers used, none double-booked");
+        assert_eq!(
+            regs.len(),
+            ALLOCATABLE_REGS.len(),
+            "every allocatable register used, none double-booked"
+        );
+        assert!(
+            regs.iter().all(|r| ALLOCATABLE_REGS.contains(r)),
+            "the allocator only ever hands out registers from the pool — \
+             a number outside it would be a wrong (or reserved) register: {regs:?}"
+        );
     }
 
     /// Sanity check that `reverse_postorder`/`compute_intervals` don't
