@@ -320,15 +320,41 @@ relative-to-C ratios.
     registers across a call, so emit may clobber freely at call
     boundaries — no ABI precoloring needed either.
   - 676 lib tests pass; world interpreter still 5891/0.
-- **Next (rest of Phase 3):** the remaining IR surface — `CallSend` +
-  inline caches, `Alloc`, `Poll`, `GuardKlass`, `CallRuntime`,
-  `UncommonTrap` (emitting the `int3`+imm16 site the Phase-2 VEH already
-  decodes), deopt scopes and `oopmap.rs` register numbering — then the
-  x64 **call stub** in `stubs.rs` (which establishes the pinned
-  `&VmState`/receiver registers) to wire tier-up through
-  `compiled_call.rs`, and `adapters.rs`. That is what re-enables the
-  `target_arch = "aarch64"`-gated tier-1 tests and turns the JIT on for
-  real workloads.
+- **2026-07-21 — Phase 3 continued: guards, traps, and the call stub.**
+  - **`GuardKlass`/`LoadKlass`/`ConstPool`/`UncommonTrap`** in
+    `emit_x64`, plus literal-pool interning so `PoolLit(i)` indexes
+    `literal_ids[i]` 1:1 — the contract `codecache::read_pool_oop` relies
+    on when a deopt reads a pool word back by index. `emit_x64` now
+    returns `Emitted { blob, trap_sites }`; a trap site is keyed by its
+    **own** offset, because the trapping pc *is* the `int3`.
+    The klass guard rejects smis *before* loading the header — a smi has
+    no header, so the reverse order would dereference a small integer as
+    an address.
+  - **The Phase-2/Phase-3 seam is closed.**
+    `emitted_uncommon_trap_round_trips_through_the_veh` compiles a method
+    containing a trap, registers its range with a capture trampoline, arms
+    the **real** VEH, and calls it: the handler decodes the emitted site,
+    stashes the trap pc in R10, and redirects. The emitter and the handler
+    were written days apart against a written contract; this test proves
+    they actually meet.
+  - **`stubs_x64.rs` — the x64 call stub**, `call_stub(entry, vm, argv,
+    argc)`. Saves `RBX RSI RDI R12–R15`; subtracts **40** (32 shadow + 8
+    realignment, since `RSP % 16 == 8` after the return address, `push
+    rbp`, and seven pushes); moves `entry`/`argv` to scratch before the
+    argument registers — which are its own parameter registers — are
+    overwritten. Verified by a machine-code harness that plants a sentinel
+    in every callee-saved register and XORs them after the call, by an
+    R15-dereferencing callee, and by a coupling assertion that fires if
+    Phase 5 ever adds a callee-saved XMM to the FP pool without teaching
+    this stub to save it.
+  - 684 lib tests pass; world interpreter still 5891/0.
+- **Next (rest of Phase 3):** `CallSend` + inline caches (the
+  `call_patchable` site shape is already in place), `Alloc`, `Poll`,
+  `CallRuntime`, `StoreField` with its write barrier, `ArrayAt/AtPut`,
+  and `oopmap.rs` register numbering — then wiring `compiled_call.rs` and
+  `driver.rs` to select the x64 back end so tier-up actually fires, plus
+  `adapters.rs`. That is what re-enables the `target_arch = "aarch64"`-
+  gated tier-1 tests and turns the JIT on for real workloads.
 
 ## 7. What deliberately does *not* change
 
