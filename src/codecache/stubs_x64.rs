@@ -135,11 +135,11 @@ pub fn build_call_stub_x64() -> CodeBlob {
 /// case-by-case about which are live.
 const VOLATILES: [u8; 7] = [RAX, RCX, RDX, R8, R9, R10, R11];
 
-/// Stub frame layout, from `RSP` after the prologue's `sub`:
-/// `[0,32)` shadow space for the outgoing call, `[32,48)` the
-/// `PollOutcome` return buffer, `[48,104)` the saved volatiles.
-/// 112 keeps `RSP` 16-aligned (see the module header's arithmetic).
-const STUB_FRAME: i64 = 112;
+/// The POLL stub's own frame (it has no RootSpill — it passes no oops to
+/// the runtime — but does need a return buffer and a full volatile save):
+/// `[0,32)` shadow space, `[32,48)` the `PollOutcome` return buffer,
+/// `[48,104)` the saved volatiles. 112 keeps `RSP` 16-aligned.
+const POLL_FRAME: i64 = 112;
 const SHADOW_OFF: i64 = 0;
 const RETBUF_OFF: i64 = 32;
 const SAVE_OFF: i64 = 48;
@@ -154,7 +154,7 @@ pub fn build_stub_poll_x64(rt_poll_addr: u64) -> CodeBlob {
     let mut a = X64Assembler::new();
     a.emit("push", &[r64(RBP)]);
     a.emit("mov", &[r64(RBP), r64(RSP)]);
-    a.emit("sub", &[r64(RSP), imm(STUB_FRAME)]);
+    a.emit("sub", &[r64(RSP), imm(POLL_FRAME)]);
     for (i, r) in VOLATILES.iter().enumerate() {
         a.emit("mov", &[mem(RSP, SAVE_OFF + 8 * i as i64), r64(*r)]);
     }
@@ -190,7 +190,7 @@ pub fn build_stub_poll_x64(rt_poll_addr: u64) -> CodeBlob {
     for (i, r) in VOLATILES.iter().enumerate() {
         a.emit("mov", &[r64(*r), mem(RSP, SAVE_OFF + 8 * i as i64)]);
     }
-    a.emit("add", &[r64(RSP), imm(STUB_FRAME)]);
+    a.emit("add", &[r64(RSP), imm(POLL_FRAME)]);
     a.emit("pop", &[r64(RBP)]);
     a.emit("ret", &[]);
     a.finish()
@@ -199,40 +199,135 @@ pub fn build_stub_poll_x64(rt_poll_addr: u64) -> CodeBlob {
 /// A stub for a runtime entry of the shape `rt_x(vm, a, b) -> u64`: the
 /// emitter has already placed the real arguments in the first argument
 /// registers, so this shifts them right by one and prepends `&VmState`.
-///
-/// Shared by `must_be_boolean` (one argument) and `alloc_slow` (two) —
-/// they differ only in arity, and shifting a register that holds nothing
-/// is harmless.
-fn build_shift_and_call_stub(rt_addr: u64, argc: usize) -> CodeBlob {
+fn build_shift_and_call_stub(rt_addr: u64, argc: usize, kind: u64) -> CodeBlob {
     assert!(argc <= ARG_REGS.len() - 1, "no room to prepend &VmState");
-    let mut a = X64Assembler::new();
-    a.emit("push", &[r64(RBP)]);
-    a.emit("mov", &[r64(RBP), r64(RSP)]);
-    a.emit("sub", &[r64(RSP), imm(STUB_FRAME)]);
-
-    // Shift right-to-left so no argument is overwritten before it moves.
-    for i in (0..argc).rev() {
-        a.emit("mov", &[r64(ARG_REGS[i + 1]), r64(ARG_REGS[i])]);
-    }
-    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
-    let lit = a.literal_u64(rt_addr, Some(RelocKind::RuntimeAddr));
-    a.call_far(lit);
-    // The result is already in RAX, which is where compiled code reads it.
-
-    a.emit("add", &[r64(RSP), imm(STUB_FRAME)]);
-    a.emit("pop", &[r64(RBP)]);
-    a.emit("ret", &[]);
-    a.finish()
+    build_stub(rt_addr, kind, argc, None, StubTail::Return)
 }
 
 /// `stub_must_be_boolean` — `rt_must_be_boolean(vm, val) -> u64`.
 pub fn build_stub_must_be_boolean_x64(rt_addr: u64) -> CodeBlob {
-    build_shift_and_call_stub(rt_addr, 1)
+    build_shift_and_call_stub(rt_addr, 1, crate::codecache::stubs::KIND_MUST_BE_BOOLEAN)
 }
 
 /// `stub_alloc_slow` — `rt_alloc_slow(vm, klass_bits, size_bytes) -> u64`.
 pub fn build_stub_alloc_slow_x64(rt_addr: u64) -> CodeBlob {
-    build_shift_and_call_stub(rt_addr, 2)
+    build_shift_and_call_stub(rt_addr, 2, crate::codecache::stubs::KIND_ALLOC_SLOW)
+}
+
+
+// ── Shared stub frame (the RootSpill contract) ──────────────────────────────
+//
+// Every stub that can reach Rust — and therefore a GC — must leave the
+// argument oops somewhere the collector can find and UPDATE them. That
+// place is the RootSpill: `memory::roots` scans slot `i` at
+// `[fp - ROOTSPILL_BYTES + 8*i]` for a stub frame, taking the live count
+// from the call site's own arity. So the offsets below are not an
+// arbitrary frame layout — they are an interface with the collector, and
+// arguments are RELOADED from those slots after the call because a moving
+// GC may have rewritten them in place.
+//
+// (An earlier version of `must_be_boolean`/`alloc_slow` here skipped this
+// entirely and just shuffled registers. That is a latent GC bug:
+// `rt_alloc_slow` can scavenge, and a klass oop living only in a register
+// would neither be found as a root nor updated when the object moved.)
+
+const ROOTSPILL: i64 = crate::oops::layout::ROOTSPILL_BYTES as i64;
+/// RootSpill + 32 bytes of outgoing shadow space. At stub entry `RSP % 16
+/// == 8` (the return address); `push rbp` makes it 0 and this keeps it 0.
+const STUB_FRAME: i64 = ROOTSPILL + 32;
+
+fn emit_stub_prologue_x64(a: &mut X64Assembler, kind: u64) {
+    use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+    a.emit("sub", &[r64(RSP), imm(STUB_FRAME)]);
+    for (i, r) in ARG_REGS.iter().enumerate() {
+        a.emit("mov", &[mem(RBP, -ROOTSPILL + 8 * i as i64), r64(*r)]);
+    }
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)],
+    );
+    a.emit("mov", &[r64(R10), imm(kind as i64)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R10)],
+    );
+}
+
+/// Clears the walker record and RELOADS the arguments from the RootSpill
+/// — deliberately not from registers, since a GC during the call may have
+/// relocated the oops those slots hold.
+fn emit_stub_epilogue_x64(a: &mut X64Assembler) {
+    use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
+    a.emit("mov", &[r64(R10), imm(0)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(R10)],
+    );
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R10)],
+    );
+    for (i, r) in ARG_REGS.iter().enumerate() {
+        a.emit("mov", &[r64(*r), mem(RBP, -ROOTSPILL + 8 * i as i64)]);
+    }
+    a.emit("mov", &[r64(RSP), r64(RBP)]);
+    a.emit("pop", &[r64(RBP)]);
+}
+
+/// The two stub shapes, sharing the frame above. Both park the runtime's
+/// answer in `R11`, which the epilogue never touches.
+///
+/// - [`StubTail::Return`] — hand the answer back to the caller in `RAX`.
+/// - [`StubTail::Jump`] — TAIL-jump to it. The frame is fully unwound
+///   first, so `RSP` is back on the original return address and the
+///   target's own `ret` reaches the original caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StubTail {
+    Return,
+    Jump,
+}
+
+/// Build a stub: prologue, shift the emitter's arguments right to make
+/// room for `&VmState`, call, then the chosen tail.
+///
+/// `argc` counts the emitter-supplied arguments. `extra` optionally names
+/// a register whose value becomes the LAST argument (the `argv` pointer
+/// for the lookup stubs, or a selector carried in a scratch register).
+fn build_stub(
+    rt_addr: u64,
+    kind: u64,
+    argc: usize,
+    argv_arg: Option<usize>,
+    tail: StubTail,
+) -> CodeBlob {
+    let mut a = X64Assembler::new();
+    emit_stub_prologue_x64(&mut a, kind);
+
+    // Shift right-to-left so nothing is overwritten before it moves.
+    for i in (0..argc).rev() {
+        a.emit("mov", &[r64(ARG_REGS[i + 1]), r64(ARG_REGS[i])]);
+    }
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    // A stub that hands the runtime an `argv` points it at the RootSpill,
+    // which is exactly where the arguments now live.
+    if let Some(slot) = argv_arg {
+        a.emit("lea", &[r64(ARG_REGS[slot]), mem(RBP, -ROOTSPILL)]);
+    }
+    let lit = a.literal_u64(rt_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(lit);
+    a.emit("mov", &[r64(R11), r64(RAX)]);
+
+    emit_stub_epilogue_x64(&mut a);
+    match tail {
+        StubTail::Return => {
+            a.emit("mov", &[r64(RAX), r64(R11)]);
+            a.emit("ret", &[]);
+        }
+        StubTail::Jump => a.emit("jmp", &[r64(R11)]),
+    }
+    a.finish()
 }
 
 // ── Send stubs: resolve and DNU ─────────────────────────────────────────────
@@ -274,58 +369,19 @@ const SEND_ARGV_OFF: i64 = 32;
 /// Shared body of `stub_resolve` and `stub_dnu`; they differ only in the
 /// runtime function called and the kind tag recorded for the stack walker.
 fn build_send_stub(rt_addr: u64, kind: u64) -> CodeBlob {
-    use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
+    // rt_x(vm, ret_addr, argv). The return address is the SECOND argument
+    // and comes off the stack, not a link register — so it is placed by
+    // hand rather than shifted, and `argv` (slot 2) points at the
+    // RootSpill the prologue just filled.
     let mut a = X64Assembler::new();
-
-    a.emit("push", &[r64(RBP)]);
-    a.emit("mov", &[r64(RBP), r64(RSP)]);
-    a.emit("sub", &[r64(RSP), imm(SEND_FRAME)]);
-
-    // Spill the arguments: the runtime's `argv`, and GC roots.
-    for (i, r) in SEND_SPILL.iter().enumerate() {
-        a.emit("mov", &[mem(RSP, SEND_ARGV_OFF + 8 * i as i64), r64(*r)]);
-    }
-    // Publish this frame so a GC that runs inside the lookup can walk it.
-    a.emit(
-        "mov",
-        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)],
-    );
-    a.emit("mov", &[r64(R10), imm(kind as i64)]);
-    a.emit(
-        "mov",
-        &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R10)],
-    );
-
-    // rt_x(vm, ret_addr, argv). The return address is on the stack, not in
-    // a link register — read it BEFORE the call overwrites anything.
+    emit_stub_prologue_x64(&mut a, kind);
     a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
     a.emit("mov", &[r64(ARG_REGS[1]), mem(RBP, 8)]);
-    a.emit("lea", &[r64(ARG_REGS[2]), mem(RSP, SEND_ARGV_OFF)]);
+    a.emit("lea", &[r64(ARG_REGS[2]), mem(RBP, -ROOTSPILL)]);
     let lit = a.literal_u64(rt_addr, Some(RelocKind::RuntimeAddr));
     a.call_far(lit);
-    // Park the resolved target in R11: it must survive the argument
-    // restore below, so it cannot live in any register that restore
-    // touches.
     a.emit("mov", &[r64(R11), r64(RAX)]);
-
-    // Clear the walker's record now the runtime call is done.
-    a.emit("mov", &[r64(R10), imm(0)]);
-    a.emit(
-        "mov",
-        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(R10)],
-    );
-
-    // Restore the arguments the resolved target is entitled to receive —
-    // from the spill slots, since the runtime may have relocated oops
-    // there during a GC.
-    for (i, r) in SEND_SPILL.iter().enumerate() {
-        a.emit("mov", &[r64(*r), mem(RSP, SEND_ARGV_OFF + 8 * i as i64)]);
-    }
-
-    // Drop this frame entirely, then TAIL-jump: RSP is back to the
-    // original return address, so the target returns to the real caller.
-    a.emit("mov", &[r64(RSP), r64(RBP)]);
-    a.emit("pop", &[r64(RBP)]);
+    emit_stub_epilogue_x64(&mut a);
     a.emit("jmp", &[r64(R11)]);
     a.finish()
 }
@@ -446,6 +502,50 @@ pub fn build_deopt_return_trampoline_x64(
     a.emit("pop", &[r64(RBP)]);
     a.emit("ret", &[]);
     a.finish()
+}
+
+
+/// `stub_mega_shared` — the megamorphic lookup tail. Reached from a
+/// per-selector `mega_<sel>` thunk that carries the selector in a scratch
+/// register (the `x16` role, so `R10` here), and tail-jumps to whatever
+/// the lookup resolves.
+pub fn build_stub_mega_shared_x64(rt_mega_lookup_addr: u64) -> CodeBlob {
+    let mut a = X64Assembler::new();
+    // The selector must be read BEFORE the prologue, whose kind-tag store
+    // uses R10 as its scratch.
+    a.emit("mov", &[r64(R11), r64(R10)]);
+    emit_stub_prologue_x64(&mut a, crate::codecache::stubs::KIND_MEGA);
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(R11)]); // selector_bits
+    a.emit("lea", &[r64(ARG_REGS[2]), mem(RBP, -ROOTSPILL)]); // argv
+    let lit = a.literal_u64(rt_mega_lookup_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(lit);
+    a.emit("mov", &[r64(R11), r64(RAX)]);
+    emit_stub_epilogue_x64(&mut a);
+    a.emit("jmp", &[r64(R11)]);
+    a.finish()
+}
+
+/// `stub_box_double` — `rt_box_double(vm, bits) -> u64`. Allocates, so it
+/// needs the full RootSpill frame like any other GC-reaching stub.
+pub fn build_stub_box_double_x64(rt_box_double_addr: u64) -> CodeBlob {
+    build_shift_and_call_stub(
+        rt_box_double_addr,
+        1,
+        crate::codecache::stubs::KIND_BOX_DOUBLE,
+    )
+}
+
+/// `stub_call_primitive` — `rt_call_primitive(vm, prim_id, argc_plus_recv)`.
+pub fn build_stub_call_primitive_x64(rt_call_primitive_addr: u64, kind: u64) -> CodeBlob {
+    build_shift_and_call_stub(rt_call_primitive_addr, 2, kind)
+}
+
+/// `stub_nlr_originate` — `rt_nlr_originate(vm, closure, value)`, which
+/// returns nothing; the stub simply returns to its caller, whose emitted
+/// NLR check then propagates the sentinel.
+pub fn build_stub_nlr_originate_x64(rt_nlr_originate_addr: u64, kind: u64) -> CodeBlob {
+    build_shift_and_call_stub(rt_nlr_originate_addr, 2, kind)
 }
 
 #[cfg(test)]
@@ -802,39 +902,47 @@ mod tests {
     }
 
     /// `must_be_boolean` and `alloc_slow` stubs shift the emitter's
-    /// arguments right and prepend `&VmState`. The probes below check the
-    /// exact positions, because an off-by-one shift would still "work"
-    /// for any call whose arguments happen to be interchangeable.
+    /// arguments right and prepend `&VmState`. The probes record each
+    /// argument by position, so an off-by-one shift or a missing
+    /// `&VmState` shows up as a specific wrong slot rather than a value
+    /// that happens to still work.
+    ///
+    /// The `vm` here is a REAL block, not a sentinel: since these stubs
+    /// gained the RootSpill frame they publish `last_compiled_fp` through
+    /// `R15`, so a fake pointer is an access violation. (That is exactly
+    /// how this test caught the change.)
     #[cfg(windows)]
     #[test]
     fn shift_and_call_stubs_prepend_vm_state() {
         use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Positional arithmetic: the result is only correct when every
-        // argument landed in its own slot, so a shift that is off by one
-        // (or that forgot to prepend vm) produces a different number
-        // rather than accidentally passing.
+        static A0: AtomicU64 = AtomicU64::new(0);
+        static A1: AtomicU64 = AtomicU64::new(0);
+        static A2: AtomicU64 = AtomicU64::new(0);
+
         extern "C" fn mbb(vm: u64, val: u64) -> u64 {
-            vm.wrapping_mul(1000).wrapping_add(val)
+            A0.store(vm, Ordering::Relaxed);
+            A1.store(val, Ordering::Relaxed);
+            0xB001
         }
         extern "C" fn alloc(vm: u64, klass: u64, size: u64) -> u64 {
-            vm.wrapping_mul(1_000_000)
-                .wrapping_add(klass.wrapping_mul(1000))
-                .wrapping_add(size)
+            A0.store(vm, Ordering::Relaxed);
+            A1.store(klass, Ordering::Relaxed);
+            A2.store(size, Ordering::Relaxed);
+            0xA110C
         }
 
         let run = |blob: CodeBlob, vm: u64, a0: u64, a1: u64| -> u64 {
             let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX");
             let (base, _cap) = jit.region_raw();
             unsafe { core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base, blob.code.len()) };
-            // Drive the stub with R15 (vm) set, the way compiled code
-            // would: a tiny harness that plants R15 then calls.
             let mut h = X64Assembler::new();
             h.emit("push", &[r64(RBP)]);
             h.emit("mov", &[r64(RBP), r64(RSP)]);
             h.emit("push", &[r64(R15)]);
             h.emit("sub", &[r64(RSP), imm(40)]);
-            h.emit("mov", &[r64(R10), r64(RCX)]); // stub address
+            h.emit("mov", &[r64(R10), r64(RCX)]); // stub
             h.emit("mov", &[r64(R15), r64(RDX)]); // vm
             h.emit("mov", &[r64(RCX), r64(R8)]); // emitter arg0
             h.emit("mov", &[r64(RDX), r64(R9)]); // emitter arg1
@@ -852,23 +960,27 @@ mod tests {
             hf(base as u64, vm, a0, a1)
         };
 
-        // must_be_boolean: emitter passes (val); stub must call (vm, val).
-        let got = run(
-            build_stub_must_be_boolean_x64(mbb as usize as u64),
-            7,
-            42,
-            0,
-        );
-        assert_eq!(got, 7 * 1000 + 42, "vm then val");
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+
+        // must_be_boolean: emitter passes (val); stub calls (vm, val).
+        let got = run(build_stub_must_be_boolean_x64(mbb as usize as u64), vm, 42, 0);
+        assert_eq!(got, 0xB001, "the runtime's result is returned");
+        assert_eq!(A0.load(Ordering::Relaxed), vm, "&VmState prepended");
+        assert_eq!(A1.load(Ordering::Relaxed), 42, "val shifted to slot 1");
 
         // alloc_slow: emitter passes (klass, size); stub calls (vm, klass, size).
-        let got = run(
-            build_stub_alloc_slow_x64(alloc as usize as u64),
-            3,
-            5,
-            9,
+        let got = run(build_stub_alloc_slow_x64(alloc as usize as u64), vm, 5, 9);
+        assert_eq!(got, 0xA110C);
+        assert_eq!(A0.load(Ordering::Relaxed), vm, "&VmState prepended");
+        assert_eq!(A1.load(Ordering::Relaxed), 5, "klass in slot 1");
+        assert_eq!(A2.load(Ordering::Relaxed), 9, "size in slot 2");
+
+        // The walker record is cleared before returning to compiled code.
+        assert_eq!(
+            vmreg[crate::oops::layout::VMREG_LAST_COMPILED_FP_OFFSET / 8],
+            0
         );
-        assert_eq!(got, 3 * 1_000_000 + 5 * 1000 + 9, "vm, klass, size");
     }
 
     /// A send stub end to end: a call site invokes the stub, the stub
