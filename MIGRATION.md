@@ -483,7 +483,7 @@ Surveyed rather than guessed:
 
 | Component | A64 generators to port | Notes |
 |---|---|---|
-| `codecache/stubs.rs` | **13** `build_*` functions | **12 done** (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `box_double`, `call_primitive`, `nlr_originate` — `stubs_x64.rs`); still needed: **`value_dispatch`** (a two-call stub: `rt_value_target` then `rt_value_fallback`) |
+| `codecache/stubs.rs` | ~~13 `build_*` functions~~ | **DONE — 13/13** (`call_stub`, `stub_poll`, `must_be_boolean`, `alloc_slow`, `stub_resolve`, `dnu`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `box_double`, `call_primitive`, `nlr_originate`, `value_dispatch` — all in `stubs_x64.rs`) |
 | `codecache/deopt_trap.rs` | ~~3 trampolines~~ | **DONE** — `uncommon`, `assert`, `probe`. The deopt loop is now closed end to end and tested against the real VEH. |
 | `codecache/pics.rs`, `mega.rs`, `adapters.rs` | PIC/megamorphic/adapter emitters | patch-site shapes already fixed by `call_patchable` |
 | `compiler/driver.rs` | back-end selection | the `emit::emit` call site takes 15 parameters and returns a 6-tuple; `emit_x64` returns an `Emitted` struct. Needs a seam, plus `prim_shim` and OSR support, and `SafepointPc`-vs-`TrapSite` reconciliation for `build_deopt_metadata` |
