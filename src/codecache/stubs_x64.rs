@@ -234,6 +234,113 @@ pub fn build_stub_alloc_slow_x64(rt_addr: u64) -> CodeBlob {
     build_shift_and_call_stub(rt_addr, 2)
 }
 
+// ── Send stubs: resolve and DNU ─────────────────────────────────────────────
+//
+// Both land on an inline-cache site that could not be satisfied — an
+// unlinked one (`stub_resolve`) or one whose lookup found nothing
+// (`stub_dnu`) — and both have the same shape:
+//
+//   spill the argument registers → call `rt_*(vm, ret_addr, argv)` →
+//   restore the arguments → TAIL-JUMP to whatever the runtime resolved.
+//
+// Three x86-64 specifics, each a place a literal translation goes wrong:
+//
+// * **There is no link register.** AArch64 reads the return address out of
+//   `x30`; on x64 the `call` pushed it, so after the prologue it lives at
+//   `[rbp + 8]`. That address is what identifies WHICH site missed, so
+//   getting it wrong sends the runtime to patch someone else's cache.
+// * **The spilled arguments are the `argv` the runtime reads** — it needs
+//   the receiver and arguments to do the lookup — and they double as GC
+//   roots, which is why they go to a known frame offset rather than being
+//   left in registers.
+// * **The tail-jump must leave the stack exactly as the stub found it.**
+//   Unwinding to `[rbp]` and popping leaves `RSP` pointing at the original
+//   return address, so `jmp` (never `call`) hands the resolved target a
+//   frame indistinguishable from the one the send site set up: its `ret`
+//   goes straight back to the original caller, with this stub gone.
+
+/// Argument registers spilled by a send stub, in slot order. These ARE the
+/// `argv` array the runtime reads, so the order is the calling
+/// convention's, not an arbitrary one.
+const SEND_SPILL: [u8; 4] = ARG_REGS;
+
+/// Send-stub frame: `[0,32)` outgoing shadow space, `[32,64)` the spilled
+/// argument registers (the `argv` the runtime is handed). 64 keeps `RSP`
+/// 16-aligned after `push rbp`.
+const SEND_FRAME: i64 = 64;
+const SEND_ARGV_OFF: i64 = 32;
+
+/// Shared body of `stub_resolve` and `stub_dnu`; they differ only in the
+/// runtime function called and the kind tag recorded for the stack walker.
+fn build_send_stub(rt_addr: u64, kind: u64) -> CodeBlob {
+    use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET};
+    let mut a = X64Assembler::new();
+
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+    a.emit("sub", &[r64(RSP), imm(SEND_FRAME)]);
+
+    // Spill the arguments: the runtime's `argv`, and GC roots.
+    for (i, r) in SEND_SPILL.iter().enumerate() {
+        a.emit("mov", &[mem(RSP, SEND_ARGV_OFF + 8 * i as i64), r64(*r)]);
+    }
+    // Publish this frame so a GC that runs inside the lookup can walk it.
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)],
+    );
+    a.emit("mov", &[r64(R10), imm(kind as i64)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R10)],
+    );
+
+    // rt_x(vm, ret_addr, argv). The return address is on the stack, not in
+    // a link register — read it BEFORE the call overwrites anything.
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), mem(RBP, 8)]);
+    a.emit("lea", &[r64(ARG_REGS[2]), mem(RSP, SEND_ARGV_OFF)]);
+    let lit = a.literal_u64(rt_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(lit);
+    // Park the resolved target in R11: it must survive the argument
+    // restore below, so it cannot live in any register that restore
+    // touches.
+    a.emit("mov", &[r64(R11), r64(RAX)]);
+
+    // Clear the walker's record now the runtime call is done.
+    a.emit("mov", &[r64(R10), imm(0)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(R10)],
+    );
+
+    // Restore the arguments the resolved target is entitled to receive —
+    // from the spill slots, since the runtime may have relocated oops
+    // there during a GC.
+    for (i, r) in SEND_SPILL.iter().enumerate() {
+        a.emit("mov", &[r64(*r), mem(RSP, SEND_ARGV_OFF + 8 * i as i64)]);
+    }
+
+    // Drop this frame entirely, then TAIL-jump: RSP is back to the
+    // original return address, so the target returns to the real caller.
+    a.emit("mov", &[r64(RSP), r64(RBP)]);
+    a.emit("pop", &[r64(RBP)]);
+    a.emit("jmp", &[r64(R11)]);
+    a.finish()
+}
+
+/// `stub_resolve` — an inline-cache site that has never been linked, and
+/// the target the entry guard tail-jumps to on a customization miss.
+pub fn build_stub_resolve_x64(rt_resolve_send_addr: u64) -> CodeBlob {
+    build_send_stub(rt_resolve_send_addr, crate::codecache::stubs::KIND_RESOLVE)
+}
+
+/// `stub_dnu` — lookup found no method; the runtime builds and dispatches
+/// `doesNotUnderstand:`.
+pub fn build_stub_dnu_x64(rt_dnu_addr: u64, kind: u64) -> CodeBlob {
+    build_send_stub(rt_dnu_addr, kind)
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {
@@ -655,6 +762,124 @@ mod tests {
             9,
         );
         assert_eq!(got, 3 * 1_000_000 + 5 * 1000 + 9, "vm, klass, size");
+    }
+
+    /// A send stub end to end: a call site invokes the stub, the stub
+    /// hands the runtime `(vm, ret_addr, argv)`, and then TAIL-jumps to
+    /// whatever the runtime resolved — which must run with the original
+    /// arguments and return straight to the original caller, with the
+    /// stub's own frame gone.
+    ///
+    /// Every one of those is a place a literal AArch64 translation breaks:
+    /// - `ret_addr` comes from the STACK, not a link register. The test
+    ///   requires it to be the address immediately after the call site,
+    ///   because that is what identifies which IC missed — a wrong value
+    ///   would send the runtime to patch someone else's cache.
+    /// - `argv` must expose the receiver and arguments in slot order.
+    /// - the tail-jump must be `jmp`, not `call`: the resolved target's
+    ///   `ret` has to return to the ORIGINAL caller. If the stub left its
+    ///   frame on the stack, control would come back into the stub and
+    ///   run off the end.
+    #[cfg(windows)]
+    #[test]
+    fn send_stub_hands_off_and_tail_jumps_to_the_resolved_target() {
+        use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEEN_VM: AtomicU64 = AtomicU64::new(0);
+        static SEEN_RET: AtomicU64 = AtomicU64::new(0);
+        static SEEN_ARG0: AtomicU64 = AtomicU64::new(0);
+        static SEEN_ARG1: AtomicU64 = AtomicU64::new(0);
+        static TARGET: AtomicU64 = AtomicU64::new(0);
+
+        // Stands in for rt_resolve_send: records what it was handed and
+        // answers the address of the "resolved method".
+        extern "C" fn resolve_probe(vm: u64, ret_addr: u64, argv: *mut u64) -> u64 {
+            SEEN_VM.store(vm, Ordering::Relaxed);
+            SEEN_RET.store(ret_addr, Ordering::Relaxed);
+            unsafe {
+                SEEN_ARG0.store(*argv, Ordering::Relaxed);
+                SEEN_ARG1.store(*argv.add(1), Ordering::Relaxed);
+            }
+            TARGET.load(Ordering::Relaxed)
+        }
+        // The "resolved method": proves it received the original
+        // arguments, and its `ret` must reach the original caller.
+        extern "C" fn resolved(a: u64, b: u64) -> u64 {
+            a.wrapping_mul(100).wrapping_add(b)
+        }
+
+        let stub = build_stub_resolve_x64(resolve_probe as usize as u64);
+
+        // Caller: set R15 (vm), call the stub with two arguments, return
+        // whatever comes back. If the tail-jump were a `call`, or the
+        // frame were left behind, this would not return cleanly at all.
+        let mut h = X64Assembler::new();
+        h.emit("push", &[r64(RBP)]);
+        h.emit("mov", &[r64(RBP), r64(RSP)]);
+        h.emit("push", &[r64(R15)]);
+        h.emit("sub", &[r64(RSP), imm(40)]);
+        h.emit("mov", &[r64(R10), r64(RCX)]); // stub
+        h.emit("mov", &[r64(R15), r64(RDX)]); // vm
+        h.emit("mov", &[r64(RCX), r64(R8)]); // arg0
+        h.emit("mov", &[r64(RDX), r64(R9)]); // arg1
+        h.emit("call", &[r64(R10)]);
+        h.emit("add", &[r64(RSP), imm(40)]);
+        h.emit("pop", &[r64(R15)]);
+        h.emit("pop", &[r64(RBP)]);
+        h.emit("ret", &[]);
+        let harness = h.finish();
+
+        let total = stub.code.len() + harness.code.len() + 4096;
+        let jit = WinJit::with_capacity(total).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let hoff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(
+                harness.code.as_ptr(),
+                base.add(hoff),
+                harness.code.len(),
+            );
+        }
+        TARGET.store(resolved as usize as u64, Ordering::Relaxed);
+
+        // A real, writable VM register block — NOT a sentinel value. The
+        // stub publishes its frame pointer through R15 so a GC running
+        // inside the lookup can walk it, so R15 must be a genuine
+        // pointer. (Passing a fake one here is an instant access
+        // violation, which is how this test first failed.)
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+        let hf: extern "C" fn(u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(base.add(hoff)) };
+        let got = hf(base as u64, vm, 7, 9);
+
+        // The resolved target ran, with the ORIGINAL arguments, and its
+        // return reached the original caller through the harness.
+        assert_eq!(got, 7 * 100 + 9, "tail-jumped target's result reached the caller");
+        // The runtime saw the pinned VM register...
+        assert_eq!(SEEN_VM.load(Ordering::Relaxed), vm, "vm from R15");
+        // ...the arguments, in slot order, through argv...
+        assert_eq!(SEEN_ARG0.load(Ordering::Relaxed), 7, "argv[0]");
+        assert_eq!(SEEN_ARG1.load(Ordering::Relaxed), 9, "argv[1]");
+        // ...and a return address that points INTO the harness, just past
+        // its call instruction — which is what identifies the IC site.
+        // The walker record is cleared once the runtime call is done, so
+        // a later GC does not walk a frame that no longer exists.
+        use crate::oops::layout::VMREG_LAST_COMPILED_FP_OFFSET;
+        assert_eq!(
+            vmreg[VMREG_LAST_COMPILED_FP_OFFSET / 8], 0,
+            "last_compiled_fp must be cleared before the tail-jump"
+        );
+
+        let ret = SEEN_RET.load(Ordering::Relaxed);
+        let h_lo = base as u64 + hoff as u64;
+        let h_hi = h_lo + harness.code.len() as u64;
+        assert!(
+            ret > h_lo && ret < h_hi,
+            "ret_addr {ret:#x} must point inside the calling code              ({h_lo:#x}..{h_hi:#x}), not into a link register's stale value"
+        );
     }
 
     /// The stub saves the Win64 callee-saved GPRs but deliberately not
