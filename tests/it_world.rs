@@ -27,6 +27,24 @@ fn load_tests_list(vm: &mut macvm::runtime::VmState) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // WINVM: a `posix-only:` entry exercises POSIX syscalls with no
+        // Windows equivalent (`30_ffi_alien_tests` calls `getpid` and
+        // `mmap` through the FFI). It is excluded here rather than left
+        // to fail, because on Windows the FFI stub raises a GUEST FATAL —
+        // which `fatal_exit` turns into `process::exit`, killing the test
+        // harness outright. The whole 5891-assertion suite was
+        // unreportable because of seven POSIX assertions.
+        //
+        // Announced, never silent: a skipped file that says nothing is
+        // how a suite quietly stops covering something.
+        let line = match line.strip_prefix("posix-only:") {
+            Some(rest) if cfg!(windows) => {
+                eprintln!("[tests.list] SKIP {rest} — POSIX-only, not available on this host");
+                continue;
+            }
+            Some(rest) => rest,
+            None => line,
+        };
         world::load_file(vm, &dir.join(line)).unwrap_or_else(|e| panic!("{line}: {e}"));
         if vm.exit_requested {
             break;

@@ -33,7 +33,6 @@ TestRunner run: IdentityCollectionsTests.
 TestRunner run: DateTimeTests.
 TestRunner run: ReadWriteStreamTests.
 TestRunner run: ObjectProtocolGapsTests.
-TestRunner run: FFIAlienTests.
 TestRunner run: NilMacroTests.
 TestRunner run: NumberExtTests.
 TestRunner run: CollectionExtTests.
@@ -48,9 +47,5 @@ TestRunner run: ReflectionTests.
 TestRunner run: CurtailmentTests.
 TestRunner run: RopeTests.
 TestRunner run: EditorSessionTests.
-TestRunner run: PosixIoTests.
-TestRunner run: IoStreamTests.
 TestRunner run: ScaledDecimalTests.
-TestRunner run: SocketTests.
-TestRunner run: AccelTests.
 TestRunner report.

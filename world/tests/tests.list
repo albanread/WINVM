@@ -33,7 +33,7 @@ tier1.mst
 27_date_time_tests.mst
 28_readwritestream_tests.mst
 29_object_protocol_gaps_tests.mst
-30_ffi_alien_tests.mst
+posix-only:30_ffi_alien_tests.mst
 31_nil_macro_tests.mst
 32_number_ext_tests.mst
 33_collection_ext_tests.mst
@@ -47,9 +47,9 @@ tier1.mst
 41_reflection_tests.mst
 42_curtailment_tests.mst
 43_rope_tests.mst
-44_posix_io_tests.mst
-45_iostream_tests.mst
+posix-only:44_posix_io_tests.mst
+posix-only:45_iostream_tests.mst
 46_scaleddecimal_tests.mst
-47_socket_tests.mst
-48_accel_tests.mst
+posix-only:47_socket_tests.mst
+posix-only:48_accel_tests.mst
 99_run_all.mst

@@ -254,3 +254,10 @@ TestCase subclass: AccelTests [
         region free.
     ]
 ]
+
+"Registers its own run rather than being named from 99_run_all.mst.
+ The two must travel together: tests.list can exclude this whole file
+ on a host without POSIX (see `posix-only:`), and a static
+ `TestRunner run:` in the shared runner would then reference a class
+ that was never declared."
+TestRunner run: AccelTests.
