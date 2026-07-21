@@ -922,7 +922,8 @@ pub(crate) fn resolve_super_target_entry(
 }
 
 /// Finds the caller nmethod and its own `IcSite` from a send site's return
-/// address. `ret_addr - 4` is always the `bl`/guard-miss site itself —
+/// address. `ret_addr - CALL_INSN_LEN` is always the call/guard-miss site
+/// itself —
 /// D4.1's own invariant, true through every door a compiled send can be
 /// re-entered from (a fresh `bl`, a guard's own `b`, a PIC's own indirect
 /// tail-call): none of them ever touch x30 except the original `bl`
@@ -1020,7 +1021,7 @@ fn find_caller_site(
 /// after, on its way to the tail-jump).
 ///
 /// D4.1's full state machine: finds the caller nmethod and its `IcSite`
-/// from `ret_addr` (`ret_addr - 4` is always the `bl`/guard-miss site
+/// from `ret_addr` (`ret_addr - CALL_INSN_LEN` is always the call/guard-miss site
 /// itself — D4.1's own invariant, true through EITHER door), resolves the
 /// real target the SAME two-step way an interpreted send does (`klass_of`
 /// + `runtime::lookup::lookup`), then transitions:

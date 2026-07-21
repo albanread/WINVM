@@ -643,7 +643,19 @@ fn real_oop_rootspill_slots(vm: &VmState, kind: AdapterKind, caller_pc: u64) -> 
             let site = nmethod
                 .ic_sites
                 .iter()
-                .find(|s| s.off + 4 == off)
+                // `+ CALL_INSN_LEN`, not `+ 4`: `caller_pc` is a RETURN
+                // address, so the site it names starts one call
+                // instruction earlier — 4 bytes for an AArch64 `bl`, 5
+                // for an x86-64 `E8 rel32`.
+                //
+                // Same hardcoded width that was wrong in
+                // `stubs::find_caller_site`. When that one was fixed the
+                // constant was introduced but the codebase was not swept
+                // for other instances, and this is the other instance:
+                // the GC's own root scanner, where a miss means the
+                // collector cannot determine a stub frame's live
+                // argument count.
+                .find(|s| s.off as u64 + crate::codecache::stubs::CALL_INSN_LEN == off as u64)
                 .unwrap_or_else(|| {
                     panic!(
                         "each_code_root: {kind:?}'s own caller_pc {caller_pc:#x} (blob offset \

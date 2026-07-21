@@ -475,21 +475,37 @@ impl<'a> Emitter<'a> {
     /// instead — it is at a different alignment phase, having pushed an
     /// odd number of registers. The two numbers are both correct and the
     /// difference is not an inconsistency.)
-    fn emit_runtime_call(&mut self, target: LiteralId) {
+    fn emit_runtime_call(&mut self, target: LiteralId) -> u32 {
         // The full outgoing area, not just the shadow space: these
         // callees are the same stubs a send reaches, and their epilogue
         // writes the RootSpill's stack slots back into this reservation.
         self.asm
             .emit("sub", &[r64(RSP), imm(OUTGOING_ARG_BYTES)]);
         self.asm.call_far(target);
+        // The return address, captured BEFORE the stack is released —
+        // see `record_safepoint_at`.
+        let ret_pc = self.asm.offset();
         self.asm
             .emit("add", &[r64(RSP), imm(OUTGOING_ARG_BYTES)]);
+        ret_pc
     }
 
     /// Record a deopt safepoint at the CURRENT offset — used right after
     /// a runtime call returns, so the recorded pc is the return address.
-    fn record_safepoint(&mut self) {
-        let pc_off = self.asm.offset();
+    /// Record a deopt safepoint at an explicitly-supplied return address.
+    ///
+    /// The pc is passed in rather than read from `asm.offset()` because
+    /// on x64 the call is not the last thing emitted: the outgoing
+    /// argument area has to be released afterwards, so by the time
+    /// control returns here the offset has already moved past the
+    /// return address by the width of an `add rsp, imm`.
+    ///
+    /// The AArch64 emitter has no such instruction — its `bl` is the last
+    /// thing before the safepoint — so `offset()` there IS the return
+    /// address. Porting that shape literally put every x64 safepoint a
+    /// few bytes late, and the GC found no PcDesc at the true return
+    /// address of a frame it had to scan.
+    fn record_safepoint_at(&mut self, pc_off: u32) {
         let bci = self.current_bci;
         let position = self.pos;
         self.safepoints.push(TrapSite {
@@ -1077,9 +1093,11 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             // It sits INSIDE the outgoing reservation, because the callee
             // is ordinary Win64 code like any other.
             let off = e.asm.call_patchable(RelocKind::InlineCache);
+            // A send is a deopt safepoint, keyed on the RETURN address —
+            // captured here, before the outgoing area is released.
+            let ret_pc = e.asm.offset();
             e.asm.emit("add", &[r64(RSP), imm(outgoing)]);
-            // A send is a deopt safepoint, keyed on the return address.
-            e.record_safepoint();
+            e.record_safepoint_at(ret_pc);
             let info = e.method.call_sites[*site as usize];
             e.ic_sites.push(EmittedIcSite {
                 off,
@@ -1167,9 +1185,9 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm
                 .emit("mov", &[r64(ARG_REGS[1]), imm(size_bytes)]);
             let lit = e.alloc_slow_lit;
-            e.emit_runtime_call(lit);
+            let ret_pc = e.emit_runtime_call(lit);
             // A real allocation may scavenge, so this is a safepoint.
-            e.record_safepoint();
+            e.record_safepoint_at(ret_pc);
             if d != RAX {
                 e.asm.emit("mov", &[r64(d), r64(RAX)]);
             }
@@ -1193,12 +1211,15 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.emit("test", &[r32(RAX), r32(RAX)]);
             e.asm.jcc(Cond::E, skip);
             let lit = e.stub_poll_lit;
-            e.emit_runtime_call(lit);
-            // The poll is a deopt safepoint keyed on the RETURN address —
-            // which is exactly where `skip` binds, since a dormant flag
-            // also lands here. Recording before the bind makes that
-            // coincidence explicit rather than accidental.
-            e.record_safepoint();
+            // The poll is a deopt safepoint keyed on the RETURN address.
+            //
+            // That is NOT where `skip` binds, despite what this comment
+            // used to claim: the outgoing area has to be released between
+            // the call and the merge point, so the return address sits an
+            // `add rsp, imm` earlier. The dormant-flag path lands on the
+            // merge; the safepoint belongs to the call.
+            let ret_pc = e.emit_runtime_call(lit);
+            e.record_safepoint_at(ret_pc);
             e.asm.bind(skip);
         }
 
@@ -1219,8 +1240,8 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
                 e.asm.emit("mov", &[r64(ARG_REGS[0]), r64(a0)]);
             }
             let lit = e.must_be_boolean_lit;
-            e.emit_runtime_call(lit);
-            e.record_safepoint();
+            let ret_pc = e.emit_runtime_call(lit);
+            e.record_safepoint_at(ret_pc);
             let dst = dst.expect("MUST_BE_BOOLEAN always produces a coerced boolean");
             let d = e.def_reg(dst, RAX);
             if d != RAX {
