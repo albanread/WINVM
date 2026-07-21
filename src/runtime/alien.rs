@@ -857,6 +857,7 @@ mod tests {
     /// indirect Alien via `forAddress:size:`, genuinely reads and writes
     /// REAL mapped memory through this module's raw-pointer path — not a
     /// mock, not a direct-mode-only round trip.
+    #[cfg(target_os = "macos")] // WINVM: calls real mmap via FFI; needs the Phase-3 x64 stubs
     #[test]
     fn mmap_capstone_indirect_alien_reads_writes_real_mapped_memory() {
         let mut vm = test_vm();

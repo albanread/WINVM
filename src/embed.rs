@@ -1321,7 +1321,14 @@ fn fragment_bytes(result: Oop) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-#[cfg(test)]
+// WINVM: this module is the embedded-VmHandle integration suite — it boots
+// full worlds and drives FFI demos, workers, the game channel, and the
+// Cocoa bridge, plus it relies on `sigsetjmp`-based guest-fatal recovery
+// (stubbed on Windows until the Phase-2 follow-up). All of that is
+// macOS/aarch64 until Phase 3 (FFI + tier-1 x64) lands; gated wholesale so
+// the Windows lib-test binary doesn't abort mid-run on a demo's `mmap`.
+// The substrate this phase delivered has its own tests (wfasm, deopt_trap).
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::runtime::JitMode;

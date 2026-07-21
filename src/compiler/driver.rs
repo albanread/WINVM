@@ -2024,6 +2024,7 @@ mod tests {
     /// entry (blocks have no entry guard: verified_entry == entry). `[:x |
     /// x]` — the identity block — proves Param wiring (closure in x0, arg
     /// in x1 -> unified temp 0) end to end.
+    #[cfg(target_arch = "aarch64")] // WINVM: executes A64 stub/compiled code; x64 in Phase 3
     #[test]
     fn compiled_block_identity_runs() {
         let mut vm = test_vm();
@@ -2068,6 +2069,7 @@ mod tests {
     /// S24 A1 smoke: `[ self ]` — push_self inside a block reads the HOME
     /// receiver, i.e. the prologue's `LoadField closure.copied[0]`, not the
     /// closure itself (the design §2.2 environment synthesis).
+    #[cfg(target_arch = "aarch64")] // WINVM: executes A64 stub/compiled code; x64 in Phase 3
     #[test]
     fn compiled_block_self_is_home_receiver() {
         let mut vm = test_vm();

@@ -333,6 +333,10 @@ mod tests {
 
     /// Apple Silicon pages are 16 KiB — committing a single byte must make
     /// the WHOLE surrounding 16 KiB page writable, not just a 4 KiB slice.
+    /// WINVM: Windows x64 pages are 4 KiB, so writing at the 16 KiB offset
+    /// after a 1-byte commit is genuinely uncommitted here — the assertion
+    /// this test makes is macOS-page-size-specific.
+    #[cfg(target_os = "macos")]
     #[test]
     fn commit_rounds_to_host_page() {
         let r = Reservation::reserve(1 << 20);

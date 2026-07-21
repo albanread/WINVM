@@ -1053,6 +1053,206 @@ extern "C" fn sig_fault_handler(
     }
 }
 
+// ── WINVM: the x86-64 Windows trap layer (Phase 2, MIGRATION.md §2.2) ──────
+//
+// The macOS layer above rewrites a signal's ucontext; here a process-wide
+// Vectored Exception Handler rewrites the exception CONTEXT — same
+// classify → capture → redirect discipline, same registry.
+//
+// **x64 trap-site encoding** (the Phase-3 emitter must honor this): `int3`
+// (one byte, 0xCC) followed by the same imm16 the A64 `brk` carries, as two
+// little-endian bytes — a 3-byte site whose trailing bytes never execute
+// (the handler redirects; the trampoline never returns into the site).
+// Windows reports a breakpoint with `CONTEXT.Rip` pointing AT the 0xCC (the
+// kernel rewinds the hardware trap), so the imm16 lives at `Rip + 1`.
+// x16's redirect role (the stashed trap pc) maps to R10 (MIGRATION.md §2.1
+// — volatile, never an argument register, the canonical Win64 scratch).
+//
+// CONTEXT layout notes (and the missing-Dr4/Dr5 trap) follow JASM's proven
+// `rust/src/seh.rs` — including its compile-time `offset_of!(Rip) == 0xF8`
+// assertion, which once caught a 16-byte layout drift that landed Rip
+// writes in the XMM save area.
+
+/// Decode the bytes at `pc` as one of our x64 deopt trap sites: `0xCC`
+/// followed by an imm16 in `TRAP_UNCOMMON..=TRAP_ASSERT`. The x64 sibling
+/// of [`decode_deopt_brk`].
+///
+/// # Safety
+/// `pc` must point into a live, readable code region (the handler only
+/// calls this after the registry bounds-check).
+#[cfg(windows)]
+unsafe fn decode_deopt_int3(pc: u64) -> Option<u16> {
+    if unsafe { core::ptr::read(pc as *const u8) } != 0xCC {
+        return None;
+    }
+    let imm = unsafe { core::ptr::read_unaligned((pc + 1) as *const u16) };
+    if (TRAP_UNCOMMON..=TRAP_ASSERT).contains(&imm) {
+        Some(imm)
+    } else {
+        None
+    }
+}
+
+/// x64 `CONTEXT` from `winnt.h`, fields through `Rip` (Windows writes the
+/// rest; we never construct one — the kernel hands us a `*mut`). AMD64 has
+/// no Dr4/Dr5: the debug-register block is six qwords, not eight.
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct WinContext {
+    _p_home: [u64; 6],
+    ContextFlags: u32,
+    MxCsr: u32,
+    _seg: [u16; 6],
+    EFlags: u32,
+    _dr: [u64; 6],
+    Rax: u64,
+    Rcx: u64,
+    Rdx: u64,
+    Rbx: u64,
+    Rsp: u64,
+    Rbp: u64,
+    Rsi: u64,
+    Rdi: u64,
+    R8: u64,
+    R9: u64,
+    R10: u64,
+    R11: u64,
+    R12: u64,
+    R13: u64,
+    R14: u64,
+    R15: u64,
+    Rip: u64,
+    // (tail omitted — XMM save area, vector state)
+}
+
+// The load-bearing layout check (see the section comment above).
+#[cfg(windows)]
+const _: () = assert!(core::mem::offset_of!(WinContext, Rip) == 0xF8);
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct WinExceptionRecord {
+    ExceptionCode: u32,
+    ExceptionFlags: u32,
+    ExceptionRecord: *mut WinExceptionRecord,
+    ExceptionAddress: *mut core::ffi::c_void,
+    NumberParameters: u32,
+    _pad: u32,
+    ExceptionInformation: [usize; 15],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct WinExceptionPointers {
+    ExceptionRecord: *mut WinExceptionRecord,
+    ContextRecord: *mut WinContext,
+}
+
+#[cfg(windows)]
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+#[cfg(windows)]
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+#[cfg(windows)]
+const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+
+/// In-handler capture of the x64 integer register file into [`CAPTURED`] —
+/// the Windows sibling of [`capture_regs`]. Slot mapping: `x[0..16]` hold
+/// the GPRs in canonical x64 numbering (RAX, RCX, RDX, RBX, RSP, RBP, RSI,
+/// RDI, R8..R15); the named specials mirror their roles (`fp`=RBP,
+/// `sp`=RSP, `pc`=RIP, `cpsr`=EFLAGS; `lr`=0, x64 has no link register).
+/// `sig` carries the NT status code's low bits — no POSIX signo exists here.
+#[cfg(windows)]
+unsafe fn capture_regs_win(ctx: &WinContext, far: u64, code: u32) {
+    let gprs = [
+        ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9,
+        ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+    ];
+    for (slot, &v) in CAPTURED.iter().zip(gprs.iter()) {
+        slot.store(v, Ordering::Relaxed);
+    }
+    CAPTURED[CAP_FP].store(ctx.Rbp, Ordering::Relaxed);
+    CAPTURED[CAP_LR].store(0, Ordering::Relaxed);
+    CAPTURED[CAP_SP].store(ctx.Rsp, Ordering::Relaxed);
+    CAPTURED[CAP_PC].store(ctx.Rip, Ordering::Relaxed);
+    CAPTURED[CAP_CPSR].store(ctx.EFlags as u64, Ordering::Relaxed);
+    CAPTURED[CAP_FAR].store(far, Ordering::Relaxed);
+    CAPTURED[CAP_SIG].store(code as u64, Ordering::Relaxed);
+}
+
+/// The VEH — the Windows sibling of [`sigtrap_handler`], same steps:
+/// classify the pc against the registry, decode the trap site, and
+/// redirect `Rip` into the owning cache's trampoline with the trap pc
+/// stashed in R10. Everything else returns `CONTINUE_SEARCH` so debuggers
+/// and the default handler still see foreign exceptions — including a
+/// foreign `int3` (a debugger's own breakpoint, a Rust abort), which the
+/// macOS layer had to actively restore `SIG_DFL` for; VEH pass-through
+/// gives that behavior for free.
+///
+/// # Safety
+/// Installed only via `AddVectoredExceptionHandler`; the kernel guarantees
+/// `info` and both records are valid for this delivery.
+#[cfg(windows)]
+unsafe extern "system" fn veh_trap_handler(info: *mut WinExceptionPointers) -> i32 {
+    unsafe {
+        if info.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let rec = (*info).ExceptionRecord;
+        let ctx = (*info).ContextRecord;
+        if rec.is_null() || ctx.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if (*rec).ExceptionCode != STATUS_BREAKPOINT {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let pc = (*ctx).Rip;
+        let Some((tramp, assert)) = lookup_pc(pc) else {
+            return EXCEPTION_CONTINUE_SEARCH; // foreign int3 — not ours
+        };
+        let Some(imm) = decode_deopt_int3(pc) else {
+            return EXCEPTION_CONTINUE_SEARCH; // in-cache but not a deopt site
+        };
+
+        if imm == TRAP_ASSERT {
+            if assert != 0 {
+                capture_regs_win(&*ctx, 0, STATUS_BREAKPOINT);
+                PROBE_IN_PROGRESS.store(true, Ordering::Release);
+                (*ctx).R10 = pc;
+                (*ctx).Rip = assert;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        if tramp == 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        (*ctx).R10 = pc;
+        (*ctx).Rip = tramp;
+        EXCEPTION_CONTINUE_EXECUTION
+    }
+}
+
+/// Arm the process-wide VEH (first in the handler chain). Idempotence is
+/// the caller's job — [`install`] guards with [`HANDLER_ARMED`], exactly
+/// like the macOS `sigaction` arm.
+#[cfg(windows)]
+fn arm_veh() {
+    extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: unsafe extern "system" fn(*mut WinExceptionPointers) -> i32,
+        ) -> *mut core::ffi::c_void;
+    }
+    // SAFETY: registers a well-formed handler; the returned cookie is only
+    // needed for removal, which never happens (armed for process life).
+    let h = unsafe { AddVectoredExceptionHandler(1, veh_trap_handler) };
+    assert!(!h.is_null(), "deopt_trap: AddVectoredExceptionHandler failed");
+}
+
 // ── Trampolines (D4 / D6) generated at startup ────────────────────────────
 
 /// Handles to the generated deopt trampolines, published into the same
@@ -1677,10 +1877,12 @@ pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
     // 4. Arm the handlers on the first install only (process-global,
     //    idempotent). SA_SIGINFO for the 3-arg form.
     if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
+        // WINVM: the Windows arm is the VEH (see the x64 trap-layer section
+        // above) — one process-wide registration, first in the chain.
+        #[cfg(windows)]
+        arm_veh();
         // SAFETY: both handlers match the SA_SIGINFO 3-arg ABI; armed exactly
         // once (the swap above) with zeroed, fully-initialized structures.
-        // WINVM: nothing to arm on Windows yet — deopt traps cannot fire
-        // before the x64 backend + Phase-2 VEH exist anyway.
         #[cfg(target_os = "macos")]
         unsafe {
             let mut sa: libc::sigaction = core::mem::zeroed();
@@ -1744,6 +1946,69 @@ unsafe fn test_arm_handler(lo: u64, hi: u64, uncommon_tramp: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WINVM M2 gate (MIGRATION.md §4 Phase 2): the x64 twin of
+    /// `handler_redirect_smoke`, live end-to-end — a hand-built blob whose
+    /// first bytes are the x64 trap site (`int3` + imm16 `0xDE00`), a
+    /// capture trampoline (`mov rax, r10 ; ret`) that returns the stashed
+    /// trap pc, one registry entry binding them, and the real VEH armed.
+    /// Calling the blob must trap, redirect through the VEH, and return the
+    /// trap pc — proving classify → decode → R10 stash → Rip rewrite →
+    /// resume in one pass.
+    ///
+    /// Safe under parallel tests: the VEH passes every exception it does
+    /// not own straight through (`CONTINUE_SEARCH`), and the registry entry
+    /// is retired on exit.
+    #[cfg(windows)]
+    #[test]
+    fn veh_redirect_smoke() {
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        let jit = WinJit::with_capacity(4096).expect("RWX region");
+        let (base, _cap) = jit.region_raw();
+        let entry = base as u64;
+        let tramp = entry + 16;
+        // entry: int3 ; .word 0xDE00 ; ret   (the ret is unreachable)
+        // tramp: mov rax, r10 ; ret
+        // SAFETY: writes land inside the freshly allocated RWX region.
+        unsafe {
+            core::ptr::copy_nonoverlapping([0xCC, 0x00, 0xDE, 0xC3].as_ptr(), base, 4);
+            core::ptr::copy_nonoverlapping([0x4C, 0x89, 0xD0, 0xC3].as_ptr(), base.add(16), 4);
+        }
+        register_with_probe(entry, entry + 8, tramp, 0, 0);
+        if !HANDLER_ARMED.swap(true, Ordering::AcqRel) {
+            arm_veh();
+        }
+
+        // SAFETY: the blob traps immediately; the VEH redirects to the
+        // trampoline, which returns normally with rax = r10 = trap pc.
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(entry) };
+        let got = f();
+        deregister(entry);
+        assert_eq!(
+            got, entry,
+            "VEH must stash the trap pc in R10 and resume in the trampoline"
+        );
+    }
+
+    /// WINVM: the x64 trap-site decoder accepts exactly our three imm16s
+    /// behind an `int3` and rejects everything else.
+    #[cfg(windows)]
+    #[test]
+    fn decode_deopt_int3_recognizes_trap_sites() {
+        let mk = |bytes: [u8; 3]| {
+            let b = Box::leak(Box::new(bytes));
+            b.as_ptr() as u64
+        };
+        // SAFETY: reads within the leaked 3-byte buffers.
+        unsafe {
+            assert_eq!(decode_deopt_int3(mk([0xCC, 0x00, 0xDE])), Some(TRAP_UNCOMMON));
+            assert_eq!(decode_deopt_int3(mk([0xCC, 0x01, 0xDE])), Some(TRAP_STRESS));
+            assert_eq!(decode_deopt_int3(mk([0xCC, 0x02, 0xDE])), Some(TRAP_ASSERT));
+            assert_eq!(decode_deopt_int3(mk([0xCC, 0x03, 0xDE])), None, "imm past ASSERT");
+            assert_eq!(decode_deopt_int3(mk([0x90, 0x00, 0xDE])), None, "not an int3");
+        }
+    }
 
     /// S13 step 7a END-TO-END through `rt_uncommon_trap` itself (the codecache
     /// entry the trampoline `blr`s), NOT via the safe runtime wrapper: install
@@ -2198,6 +2463,7 @@ mod tests {
     /// so a genuine miss in this mechanism (the fault reaching `SIG_DFL`
     /// instead of being recovered) is exactly the failure this whole
     /// design exists to prevent, made concrete rather than hidden.
+    #[cfg(target_os = "macos")] // WINVM: exercises the macOS signal-based foreign-fault recovery
     #[test]
     fn foreign_fault_recovers_via_registered_jmp_slot_on_a_real_segv() {
         // Arms SIGTRAP/SIGSEGV/SIGBUS (idempotent — may already be armed by
@@ -2246,6 +2512,7 @@ mod tests {
     /// is called FRESH each loop iteration, matching the real deployment
     /// shape (once per guest eval), each call still inline at this same
     /// closure's own call site.
+    #[cfg(target_os = "macos")] // WINVM: exercises the macOS signal-based foreign-fault recovery
     #[test]
     fn foreign_fault_recovers_from_a_second_real_segv_too() {
         let mut cache = CodeCache::new(1 << 16).unwrap();
@@ -2300,6 +2567,7 @@ mod tests {
     /// the actual gap this function closes: SPEC §16.5 requires the GUI's
     /// Browser accept path to run with `MACVM_JIT=off`, and `with_options`
     /// never calls `install` in that mode.
+    #[cfg(target_os = "macos")] // WINVM: exercises the macOS signal-based foreign-fault recovery
     #[test]
     fn arm_foreign_fault_handler_recovers_without_install_or_code_cache() {
         let handle = std::thread::spawn(|| {
@@ -2333,6 +2601,7 @@ mod tests {
     /// must see ITS OWN fault address across every iteration, and the whole
     /// test process must survive. Each thread faults at a DISTINCT address so a
     /// cross-thread stomp would surface as a mismatched `far`.
+    #[cfg(target_os = "macos")] // WINVM: exercises the macOS signal-based foreign-fault recovery
     #[test]
     fn concurrent_foreign_faults_on_two_threads_each_recover_on_their_own_altstack() {
         use std::sync::{Arc, Barrier};

@@ -3048,6 +3048,7 @@ mod tests {
     /// shape any nmethod entry uses) -- NOT its wiring into
     /// `Ir::CallRuntime`, which is S11 step 7's job and has no emission
     /// path to test through yet.
+    #[cfg(target_arch = "aarch64")] // WINVM: executes A64 stub/compiled code; x64 in Phase 3
     #[test]
     fn must_be_boolean_sends_and_returns_result() {
         let mut vm = test_vm();

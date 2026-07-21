@@ -918,6 +918,7 @@ mod tests {
     /// accident of the stale `vm.stack.fp` the link captured, which the B5
     /// step-3 gc-stress deopt test caught chasing overwritten remnant
     /// slots into an unbounded walk.)
+    #[cfg(target_arch = "aarch64")] // WINVM: compiles+executes A64 code; x64 tier-1 is Phase 3
     #[test]
     fn walker_classifies_all_kinds() {
         let mut vm = test_vm();
@@ -967,6 +968,7 @@ mod tests {
     /// to resume interpreted walking from. Must panic with a clear
     /// message (caught by `rt_alloc_slow`'s own `catch_unwind`, reported
     /// back via `Err`), never loop forever or silently misclassify.
+    #[cfg(target_arch = "aarch64")] // WINVM: compiles+executes A64 code; x64 tier-1 is Phase 3
     #[test]
     fn walker_terminates_on_torn_tierlinks() {
         let mut vm = test_vm();

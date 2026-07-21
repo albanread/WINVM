@@ -560,6 +560,7 @@ mod tests {
     /// compiled (smi) target — proven by reading it back, not just by the
     /// result staying correct (which an untouched interpreted IC would
     /// also produce).
+    #[cfg(target_arch = "aarch64")] // WINVM: compiles+executes A64 code; x64 tier-1 is Phase 3
     #[test]
     fn compile_trigger_fires_and_rewrites_ic_to_compiled() {
         let mut vm = VmState::with_options(VmOptions {
@@ -633,6 +634,7 @@ mod tests {
     /// bailout fallback). Both must reach `install_smi_plus`'s interpreted
     /// fallback (the [`OVERFLOW_SENTINEL`]) without disturbing the
     /// still-valid compiled IC entry.
+    #[cfg(target_arch = "aarch64")] // WINVM: compiles+executes A64 code; x64 tier-1 is Phase 3
     #[test]
     fn compile_trigger_bailout_falls_back_correctly() {
         let mut vm = VmState::with_options(VmOptions {
@@ -738,6 +740,7 @@ mod tests {
     /// own documented design, not a bug this test should fight. The
     /// still-uses-the-nmethod guarantee tests_s10.md describes belongs to
     /// the overflow/bailout scenario above, where the IC never leaves mono.
+    #[cfg(target_arch = "aarch64")] // WINVM: compiles+executes A64 code; x64 tier-1 is Phase 3
     #[test]
     fn compile_trigger_double_receiver_is_ic_miss_not_compiled_entry() {
         let mut vm = VmState::with_options(VmOptions {
@@ -831,6 +834,7 @@ mod tests {
     /// fall through to `ic_transition`'s ordinary self-heal — re-resolving
     /// and re-installing a plain interpreted target — rather than calling
     /// `enter_compiled` on a dangling id.
+    #[cfg(target_arch = "aarch64")] // WINVM: compiles+executes A64 code; x64 tier-1 is Phase 3
     #[test]
     fn stale_id_self_heals() {
         let mut vm = VmState::with_options(VmOptions {
