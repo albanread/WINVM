@@ -1,0 +1,21 @@
+"float_nan_compare_both_tiers.mst — WINVM Phase 5. ucomisd signals
+ unordered (NaN) by setting ZF, PF and CF TOGETHER, so a float compare
+ that ignores the parity flag cannot tell NaN from equal and answers
+ true for (NaN = NaN). Every comparison except ~= must be false against
+ NaN. Must agree with the interpreter in both tiers."
+
+Object subclass: NT [
+    lt: a to: b [ ^(a < b) ifTrue: [ 1 ] ifFalse: [ 0 ] ]
+    eq: a to: b [ ^(a = b) ifTrue: [ 1 ] ifFalse: [ 0 ] ]
+    ne: a to: b [ ^(a ~= b) ifTrue: [ 1 ] ifFalse: [ 0 ] ]
+]
+N := NT new.
+Z := 0.0.
+A := 0.0.
+1 to: 400 do: [ :k | A := N lt: 1.0 to: 2.0 ].
+1 to: 400 do: [ :k | A := N eq: 1.0 to: 1.0 ].
+1 to: 400 do: [ :k | A := N ne: 1.0 to: 2.0 ].
+NAN := Z / Z.
+Transcript showCr: (N lt: NAN to: 1.0) printString.
+Transcript showCr: (N eq: NAN to: NAN) printString.
+Transcript showCr: (N ne: NAN to: NAN) printString.

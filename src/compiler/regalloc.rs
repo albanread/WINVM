@@ -723,16 +723,27 @@ const ALLOCATABLE_REGS: &[u8] = &[1, 2, 3, 6, 7, 8, 9];
 #[cfg(target_arch = "aarch64")]
 const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
 
-/// WINVM x86-64: `xmm0`–`xmm4`, all volatile under Win64 — the same
+/// WINVM x86-64: `xmm0`–`xmm2`, all volatile under Win64 — the same
 /// "zero prologue cost, clobbered by any call, safe because crossing
-/// intervals are spilled" rationale as the AArch64 pool. `xmm5` is left
-/// out as emit's FP scratch (the `d16`/`d17` analogue, and volatile so it
-/// needs no save); `xmm6`–`xmm15` are callee-saved on Win64 and would each
-/// cost a prologue `movsd` — they are deliberately unused until float
-/// regions are ported (Phase 5), when the residency tier can claim them
-/// with an explicit save/restore.
+/// intervals are spilled" rationale as the AArch64 pool.
+///
+/// `xmm3`–`xmm5` are reserved as emit's FP scratch (the `d16`/`d17`
+/// analogue, and volatile so they need no save). THREE, not one, and the
+/// reason is x86-64's two-address form: `dst = a - b` where `dst` and `b`
+/// are the same register needs somewhere to park `b` before `dst` is
+/// overwritten, and both `a` and `b` may ALREADY be occupying scratch
+/// registers if each was spilled. One reload scratch per operand plus one
+/// for the shuffle is the worst case, and paying it in register budget is
+/// better than a subtly wrong `subsd`.
+///
+/// Three allocatable FP registers is tight but adequate: float kernels
+/// keep few values simultaneously live, and anything crossing a safepoint
+/// is spilled regardless. `xmm6`–`xmm15` are callee-saved on Win64 and
+/// would each cost a prologue `movsd` — deliberately unused until the
+/// residency tier claims them with an explicit save/restore, which the
+/// call stub asserts against (`fp_pool_is_empty_or_this_stub_must_save_xmm`).
 #[cfg(not(target_arch = "aarch64"))]
-const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4];
+const FP_ALLOCATABLE_REGS: &[u8] = &[0, 1, 2];
 
 /// The FP allocatable pool, for cross-module invariant checks — the x64
 /// call stub asserts against it that it is not required to save any

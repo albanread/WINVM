@@ -88,6 +88,13 @@ pub const SCRATCH0: u8 = R10;
 /// Second scratch (x17/IP1 analogue).
 pub const SCRATCH1: u8 = R11;
 
+/// FP scratch registers — `xmm3`–`xmm5`, all volatile under Win64 and
+/// deliberately outside `regalloc`'s FP pool (see its `FP_ALLOCATABLE_REGS`
+/// doc for why three are needed rather than one).
+pub const FP_SCRATCH0: u8 = 3;
+pub const FP_SCRATCH1: u8 = 4;
+pub const FP_SCRATCH2: u8 = 5;
+
 /// Win64 integer argument registers, in order.
 pub const ARG_REGS: [u8; 4] = [RCX, RDX, R8, R9];
 /// Win64's mandatory 32-byte shadow space every call must reserve.

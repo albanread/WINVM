@@ -49,11 +49,14 @@ use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::emit::{EmittedIcSite, EntryGuard};
 use crate::compiler::assembler_x64::{
     imm, mem, mem_byte, mem_index, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RSP,
-    incoming_stack_slot, outgoing_arg_bytes, outgoing_stack_slot, MAX_REG_ARGS,
+    incoming_stack_slot, outgoing_arg_bytes, outgoing_stack_slot, xmm, FP_SCRATCH0,
+    FP_SCRATCH1, FP_SCRATCH2, MAX_REG_ARGS,
     OUTGOING_ARG_BYTES, SCRATCH0,
-    SCRATCH1, SHADOW_SPACE, VM_STATE,
+    SCRATCH1, VM_STATE,
 };
-use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
+use crate::compiler::ir::{
+    BlockId, CmpOp, FArithOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg,
+};
 use crate::vendor::wfasm::rasm::parse::Operand;
 use crate::compiler::regalloc::{Assignment, RegallocResult, SpillSlot};
 
@@ -88,6 +91,16 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "Ret",
     "RetSelf",
     "Bailout",
+    // Phase 5: the scalar float fast path. Enabled as a SET — a method
+    // containing any float op is declined unless every one of these
+    // lowers, so a partial list would compile nothing new while adding
+    // untested codegen.
+    "FConst",
+    "FUnbox",
+    "FArith",
+    "FCmpBr",
+    "FCmpVal",
+    "FBox",
 ];
 
 /// Byte offset of an object's klass word from its TAGGED pointer:
@@ -226,6 +239,10 @@ pub struct RuntimeAddrs {
     pub must_be_boolean: u64,
     /// `stub_alloc_slow` — the allocation slow path.
     pub alloc_slow: u64,
+    /// `stub_box_double` — `FBox`'s eden-overflow tail. Added when the
+    /// float lowering landed, not before: a field no emitted
+    /// instruction reads is dead weight that looks like wiring.
+    pub box_double: u64,
 }
 
 /// Byte offset of spill slot `i` from the frame pointer: `[rbp − 8·(i+1)]`,
@@ -261,6 +278,7 @@ struct Emitter<'a> {
     stub_poll_lit: LiteralId,
     must_be_boolean_lit: LiteralId,
     alloc_slow_lit: LiteralId,
+    box_double_lit: LiteralId,
     current_bci: usize,
     /// This op's index in regalloc's linear numbering.
     pos: u32,
@@ -304,6 +322,74 @@ impl<'a> Emitter<'a> {
             self.asm
                 .emit("mov", &[mem(RBP, spill_offset(slot)), r64(reg)]);
         }
+    }
+
+    // ── Floating point (Phase 5) ────────────────────────────────────
+    //
+    // The FP mirror of `read_into`/`def_reg`/`store_def`. Kept separate
+    // rather than parameterised on register class because every
+    // instruction differs (`movsd` vs `mov`) and conflating them is how a
+    // GPR `mov` ends up moving eight bytes of a double through an integer
+    // register — which works, right up until it doesn't.
+    //
+    // An fp vreg spills to an ORDINARY 8-byte frame slot: `regalloc`
+    // shares one slot space and marks fp slots not-oop, so the collector
+    // never traces a raw double as a pointer.
+
+    /// Resolve `v` into an XMM register ready to READ.
+    fn read_fp(&mut self, v: VReg, scratch: u8) -> u8 {
+        match self.assignment[v.0 as usize] {
+            Some(Assignment::Reg(r)) => r,
+            Some(Assignment::Spill(slot)) => {
+                self.asm
+                    .emit("movsd", &[xmm(scratch), mem(RBP, spill_offset(slot))]);
+                scratch
+            }
+            None => panic!("emit_x64: fp vreg v{} has no assignment", v.0),
+        }
+    }
+
+    /// The XMM register an fp definition should be computed into.
+    fn def_fp(&self, v: VReg, scratch: u8) -> u8 {
+        match self.assignment[v.0 as usize] {
+            Some(Assignment::Reg(r)) => r,
+            Some(Assignment::Spill(_)) => scratch,
+            None => panic!("emit_x64: fp vreg v{} has no assignment", v.0),
+        }
+    }
+
+    /// Complete an fp definition: store back if `v` is spilled.
+    fn store_def_fp(&mut self, v: VReg, reg: u8) {
+        if let Some(Assignment::Spill(slot)) = self.assignment[v.0 as usize] {
+            self.asm
+                .emit("movsd", &[mem(RBP, spill_offset(slot)), xmm(reg)]);
+        }
+    }
+
+    /// `dst = a op b` in two-address form, for XMM.
+    ///
+    /// The aliasing hazard is the same one `emit_two_address` handles for
+    /// GPRs, but the escape differs: FP `sub`/`div` do not commute AND
+    /// `a`/`b` may already be sitting in scratch registers (each is there
+    /// if it was spilled). `FP_SCRATCH2` is reserved for exactly this
+    /// shuffle so it can never collide with either reload.
+    fn emit_two_address_fp(&mut self, mnemonic: &str, commutative: bool, dst: u8, a: u8, b: u8) {
+        if dst == b {
+            if commutative {
+                self.asm.emit(mnemonic, &[xmm(dst), xmm(a)]);
+            } else {
+                self.asm.emit("movsd", &[xmm(FP_SCRATCH2), xmm(b)]);
+                if dst != a {
+                    self.asm.emit("movsd", &[xmm(dst), xmm(a)]);
+                }
+                self.asm.emit(mnemonic, &[xmm(dst), xmm(FP_SCRATCH2)]);
+            }
+            return;
+        }
+        if dst != a {
+            self.asm.emit("movsd", &[xmm(dst), xmm(a)]);
+        }
+        self.asm.emit(mnemonic, &[xmm(dst), xmm(b)]);
     }
 
     /// Lower a three-address IR op to x86-64's two-address form:
@@ -682,6 +768,7 @@ pub fn emit_x64(
     let stub_poll_lit = asm.literal_u64(rt.stub_poll, Some(RelocKind::RuntimeAddr));
     let must_be_boolean_lit = asm.literal_u64(rt.must_be_boolean, Some(RelocKind::RuntimeAddr));
     let alloc_slow_lit = asm.literal_u64(rt.alloc_slow, Some(RelocKind::RuntimeAddr));
+    let box_double_lit = asm.literal_u64(rt.box_double, Some(RelocKind::RuntimeAddr));
 
     let labels: Vec<Label> = (0..method.blocks.len()).map(|_| asm.new_label()).collect();
     let epilogue = asm.new_label();
@@ -700,6 +787,7 @@ pub fn emit_x64(
         stub_poll_lit,
         must_be_boolean_lit,
         alloc_slow_lit,
+        box_double_lit,
         current_bci: 0,
         pos: 0,
         method,
@@ -1037,6 +1125,175 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.jmp(nb);
         }
 
+        // -- Float fast path (Phase 5, docs/float_fastpath_design.md) --
+
+        Ir::FConst { dst, bits } => {
+            // Raw f64 bits baked into code, then moved across to XMM. No
+            // pool word and no reloc: the VALUE of an immutable Double
+            // literal never changes even when the boxed object moves.
+            e.asm.emit("mov", &[r64(SCRATCH0), imm(*bits as i64)]);
+            let d = e.def_fp(*dst, FP_SCRATCH0);
+            e.asm.emit("movq", &[xmm(d), r64(SCRATCH0)]);
+            e.store_def_fp(*dst, d);
+        }
+
+        Ir::FUnbox { dst, src, fail } => {
+            use crate::oops::layout::{MEM_TAG, WORD_SIZE};
+            let robj = e.read_into(*src, SCRATCH0);
+            let cold = e.labels[fail.0 as usize];
+            // A smi has no klass word to load, so reject it first.
+            e.asm.emit("test", &[r64(robj), imm(3)]);
+            e.asm.jcc(Cond::E, cold);
+            // Untagged base into SCRATCH1 BEFORE SCRATCH0 is reused --
+            // `robj` may itself BE SCRATCH0 (a spilled src).
+            e.asm
+                .emit("lea", &[r64(SCRATCH1), mem(robj, -(MEM_TAG as i64))]);
+            e.asm
+                .emit("mov", &[r64(SCRATCH0), mem(SCRATCH1, WORD_SIZE as i64)]);
+            let k_lit = e.literal_ids[e.method.double_klass_lit.0 as usize];
+            e.asm.cmp_literal(SCRATCH0, k_lit);
+            e.asm.jcc(Cond::Ne, cold);
+            // Payload: body word 0, at untagged + 16.
+            let d = e.def_fp(*dst, FP_SCRATCH0);
+            e.asm
+                .emit("movsd", &[xmm(d), mem(SCRATCH1, 2 * WORD_SIZE as i64)]);
+            e.store_def_fp(*dst, d);
+        }
+
+        Ir::FArith { op, dst, a, b } => {
+            let (mnemonic, commutative) = match op {
+                FArithOp::Add => ("addsd", true),
+                FArithOp::Sub => ("subsd", false),
+                FArithOp::Mul => ("mulsd", true),
+                FArithOp::Div => ("divsd", false),
+            };
+            let ra = e.read_fp(*a, FP_SCRATCH0);
+            let rb = e.read_fp(*b, FP_SCRATCH1);
+            let d = e.def_fp(*dst, FP_SCRATCH0);
+            e.emit_two_address_fp(mnemonic, commutative, d, ra, rb);
+            e.store_def_fp(*dst, d);
+        }
+
+        Ir::FCmpBr {
+            op,
+            a,
+            b,
+            if_true,
+            if_false,
+        } => {
+            let ra = e.read_fp(*a, FP_SCRATCH0);
+            let rb = e.read_fp(*b, FP_SCRATCH1);
+            let (cond, swap) = fcmp_cond(*op);
+            if swap {
+                e.asm.emit("ucomisd", &[xmm(rb), xmm(ra)]);
+            } else {
+                e.asm.emit("ucomisd", &[xmm(ra), xmm(rb)]);
+            }
+            let f = e.labels[if_false.0 as usize];
+            let t = e.labels[if_true.0 as usize];
+            // Unordered (either operand NaN) sets ZF, PF and CF TOGETHER,
+            // which is indistinguishable from "equal" on the flags alone.
+            // Every float comparison except `~=` is false against NaN, so
+            // route parity to the right arm before testing the condition.
+            let nan_arm = if matches!(op, CmpOp::Ne) { t } else { f };
+            e.asm.jcc(Cond::P, nan_arm);
+            e.asm.jcc(cond, t);
+            e.asm.jmp(f);
+        }
+
+        Ir::FCmpVal { op, dst, a, b } => {
+            let ra = e.read_fp(*a, FP_SCRATCH0);
+            let rb = e.read_fp(*b, FP_SCRATCH1);
+            let (cond, swap) = fcmp_cond(*op);
+            if swap {
+                e.asm.emit("ucomisd", &[xmm(rb), xmm(ra)]);
+            } else {
+                e.asm.emit("ucomisd", &[xmm(ra), xmm(rb)]);
+            }
+            // Same NaN rule as `FCmpBr`, materialised rather than branched
+            // to. A bare `setcc` cannot express it: the parity flag has to
+            // be folded in separately.
+            let d = e.def_reg(*dst, SCRATCH0);
+            let false_lit = e.literal_ids[e.method.false_lit.0 as usize];
+            let true_lit = e.literal_ids[e.method.true_lit.0 as usize];
+            let take_false = e.asm.new_label();
+            let done = e.asm.new_label();
+            if matches!(op, CmpOp::Ne) {
+                // NaN ~= anything is TRUE.
+                e.asm.load_literal(d, true_lit);
+                e.asm.jcc(Cond::P, done);
+                e.asm.jcc(cond, done);
+                e.asm.load_literal(d, false_lit);
+                e.asm.bind(done);
+            } else {
+                e.asm.jcc(Cond::P, take_false);
+                e.asm.load_literal(d, true_lit);
+                e.asm.jcc(cond, done);
+                e.asm.bind(take_false);
+                e.asm.load_literal(d, false_lit);
+                e.asm.bind(done);
+            }
+            e.store_def(*dst, d);
+        }
+
+        Ir::FBox { dst, src } => {
+            use crate::oops::layout::WORD_SIZE;
+            use crate::oops::layout::{
+                MEM_TAG, VMREG_EDEN_END_OFFSET, VMREG_EDEN_TOP_ADDR_OFFSET,
+            };
+            let ds = e.read_fp(*src, FP_SCRATCH0);
+            let d = e.def_reg(*dst, RAX);
+            let slow = e.asm.new_label();
+            let done = e.asm.new_label();
+            // mark + klass + f64 payload. A RAW-contents mark, and no nil
+            // fill: the body is a double, not a slot the collector scans.
+            let size_bytes: i64 = 3 * WORD_SIZE as i64;
+
+            e.asm.emit(
+                "mov",
+                &[
+                    r64(SCRATCH1),
+                    mem(VM_STATE, VMREG_EDEN_TOP_ADDR_OFFSET as i64),
+                ],
+            );
+            e.asm.emit("mov", &[r64(SCRATCH0), mem(SCRATCH1, 0)]);
+            e.asm.emit("lea", &[r64(RAX), mem(SCRATCH0, size_bytes)]);
+            e.asm.emit(
+                "cmp",
+                &[r64(RAX), mem(VM_STATE, VMREG_EDEN_END_OFFSET as i64)],
+            );
+            e.asm.jcc(Cond::A, slow);
+            e.asm.emit("mov", &[mem(SCRATCH1, 0), r64(RAX)]);
+
+            let mark_lit = e.literal_ids[e.method.mark_double_lit.0 as usize];
+            e.asm.load_literal(RAX, mark_lit);
+            e.asm.emit("mov", &[mem(SCRATCH0, 0), r64(RAX)]);
+            let klass_lit = e.literal_ids[e.method.double_klass_lit.0 as usize];
+            e.asm.load_literal(RAX, klass_lit);
+            e.asm
+                .emit("mov", &[mem(SCRATCH0, WORD_SIZE as i64), r64(RAX)]);
+            e.asm
+                .emit("movsd", &[mem(SCRATCH0, 2 * WORD_SIZE as i64), xmm(ds)]);
+            e.asm.emit("lea", &[r64(d), mem(SCRATCH0, MEM_TAG as i64)]);
+            e.asm.jmp(done);
+
+            // Slow path: the payload BITS go in the first argument register
+            // (an integer register, matching the AArch64 x0 convention) and
+            // the stub allocates, stores and tags -- so the XMM value need
+            // not survive the call.
+            e.asm.bind(slow);
+            e.asm.emit("movq", &[r64(ARG_REGS[0]), xmm(ds)]);
+            let lit = e.box_double_lit;
+            let ret_pc = e.emit_runtime_call(lit);
+            // Allocation can scavenge, so this is a safepoint.
+            e.record_safepoint_at(ret_pc);
+            if d != RAX {
+                e.asm.emit("mov", &[r64(d), r64(RAX)]);
+            }
+            e.asm.bind(done);
+            e.store_def(*dst, d);
+        }
+
         Ir::RetSelf => {
             // Read the receiver from wherever the ALLOCATOR put it, which
             // is what the AArch64 emitter does (`resolve(SELF_VREG, 0)`).
@@ -1299,12 +1556,29 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
         }
 
         other => panic!(
-            "emit_x64: {} is not in the Phase-3 vertical slice yet (supported: {}). \
+            "emit_x64: {} is not lowered by the x64 back end yet (supported: {}). \
              Emitting something approximate here would be silently wrong code, so this \
              is a hard stop — see MIGRATION.md §4.",
             ir_op_name(other),
             SUPPORTED_OPS.join(", ")
         ),
+    }
+}
+
+/// Map an IR comparison onto an `ucomisd` condition.
+///
+/// `ucomisd` sets the flags as if for an UNSIGNED compare (CF/ZF), so the
+/// signed conditions used for smis are wrong here -- `jl` would test SF/OF,
+/// which a float compare never writes. The `swap` flag exists because
+/// `ucomisd` has no "less" form: `a < b` is emitted as `b > a`.
+fn fcmp_cond(op: CmpOp) -> (Cond, bool) {
+    match op {
+        CmpOp::Eq => (Cond::E, false),
+        CmpOp::Ne => (Cond::Ne, false),
+        CmpOp::Gt => (Cond::A, false),
+        CmpOp::Ge => (Cond::Ae, false),
+        CmpOp::Lt => (Cond::A, true),
+        CmpOp::Le => (Cond::Ae, true),
     }
 }
 
@@ -1733,6 +2007,7 @@ mod tests {
                 stub_poll_lit: LiteralId(0),
                 must_be_boolean_lit: LiteralId(0),
                 alloc_slow_lit: LiteralId(0),
+                box_double_lit: LiteralId(0),
                 current_bci: 0,
                 pos: 0,
                 method: &hand_method(Vec::new(), Vec::new(), 0),
@@ -3210,7 +3485,7 @@ mod tests {
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
-    #[should_panic(expected = "FArith is not in the Phase-3 vertical slice")]
+    #[should_panic(expected = "NlrReturn is not lowered by the x64 back end")]
     fn unsupported_op_panics_by_name() {
         let m = hand_method(
             vec![block(
@@ -3234,18 +3509,23 @@ mod tests {
             stub_poll_lit: LiteralId(0),
             must_be_boolean_lit: LiteralId(0),
             alloc_slow_lit: LiteralId(0),
+            box_double_lit: LiteralId(0),
             current_bci: 0,
             pos: 0,
             method: &m,
         };
         let _ = &ra;
+        // `FArith` used to serve as the example here. Phase 5 lowered
+        // it, so the test now names an op that genuinely has no x64
+        // lowering — `NlrReturn`. Whoever implements that must move this
+        // to the next unsupported op rather than delete the test: its
+        // job is to prove an unlowered op fails LOUDLY, by name, instead
+        // of falling through and emitting nothing.
         emit_op(
             &mut e,
-            &Ir::FArith {
-                op: crate::compiler::ir::FArithOp::Add,
-                dst: VReg(0),
-                a: VReg(0),
-                b: VReg(0),
+            &Ir::NlrReturn {
+                closure: VReg(0),
+                value: VReg(0),
             },
         );
     }

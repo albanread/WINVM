@@ -1195,7 +1195,6 @@ fn compile_method_full(
         // Each grows the struct when its op's lowering lands.
         let _ = (
             &mut asm,
-            box_double_addr,
             box_float64x2_addr,
             box_float32x4_addr,
             box_int32x4_addr,
@@ -1210,6 +1209,7 @@ fn compile_method_full(
                 stub_poll: stub_poll_addr,
                 must_be_boolean: must_be_boolean_addr,
                 alloc_slow: alloc_slow_addr,
+                box_double: box_double_addr,
             },
             if method.is_block() { None } else { Some(&guard) },
         );
