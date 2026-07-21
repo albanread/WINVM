@@ -34,7 +34,7 @@
 //!   compiled callee's arguments must end up in. Everything is therefore
 //!   moved to scratch (`R10`/`R11`) *before* the first argument is loaded.
 
-use crate::compiler::assembler::CodeBlob;
+use crate::compiler::assembler::{CodeBlob, RelocKind};
 use crate::compiler::assembler_x64::{
     imm, mem, r64, Cond, X64Assembler, ARG_REGS, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX,
     RDI, RDX, RSI, RSP, R8, R9, VM_STATE,
@@ -105,6 +105,133 @@ pub fn build_call_stub_x64() -> CodeBlob {
     a.emit("ret", &[]);
 
     a.finish()
+}
+
+// ── Runtime stubs (Phase 3, MIGRATION.md §8) ────────────────────────────────
+//
+// The three the x64 emitter already calls. Each is the seam between
+// compiled code (which knows only the pinned registers) and a Rust `rt_*`
+// entry point (which wants an ordinary Win64 call), so each does the same
+// three jobs: preserve what compiled code still needs, prepend `&VmState`
+// to the argument list, and restore.
+//
+// **The ABI divergence that matters most.** `rt_poll` returns
+// `PollOutcome { result, deopted }` — a 16-byte struct. AAPCS64 returns
+// that in `x0:x1`, which is why the AArch64 stub simply reads two
+// registers. **Win64 returns any struct larger than 8 bytes through a
+// hidden pointer**: the caller passes a buffer address as an implicit
+// FIRST argument, every real argument shifts one register right, and the
+// callee returns the buffer address in `RAX`. Translating the AArch64
+// stub instruction-for-instruction would therefore have read `RAX`/`RDX`
+// as if they held the two fields, silently getting a pointer and garbage.
+// `poll_outcome_is_returned_via_hidden_pointer` pins this empirically
+// rather than on my reading of the ABI.
+
+/// Volatile GPRs a stub preserves across its runtime call. Compiled code
+/// may hold live values in the allocatable volatiles (`RCX RDX R8 R9`),
+/// and the AArch64 poll stub saves the whole `x0`–`x15` bank for exactly
+/// that reason, so this saves every Win64 volatile rather than reasoning
+/// case-by-case about which are live.
+const VOLATILES: [u8; 7] = [RAX, RCX, RDX, R8, R9, R10, R11];
+
+/// Stub frame layout, from `RSP` after the prologue's `sub`:
+/// `[0,32)` shadow space for the outgoing call, `[32,48)` the
+/// `PollOutcome` return buffer, `[48,104)` the saved volatiles.
+/// 112 keeps `RSP` 16-aligned (see the module header's arithmetic).
+const STUB_FRAME: i64 = 112;
+const SHADOW_OFF: i64 = 0;
+const RETBUF_OFF: i64 = 32;
+const SAVE_OFF: i64 = 48;
+
+/// `stub_poll` — the safepoint check's slow half. Calls
+/// `rt_poll(vm, loop_fp, ret_pc)`; on an ordinary return it restores
+/// everything and resumes the loop, but when `deopted` comes back set,
+/// the compiled frame it was polling has been replaced and this stub
+/// must return the deoptee's result to that frame's OWN caller — so it
+/// drops both its own frame and the loop's in one go.
+pub fn build_stub_poll_x64(rt_poll_addr: u64) -> CodeBlob {
+    let mut a = X64Assembler::new();
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+    a.emit("sub", &[r64(RSP), imm(STUB_FRAME)]);
+    for (i, r) in VOLATILES.iter().enumerate() {
+        a.emit("mov", &[mem(RSP, SAVE_OFF + 8 * i as i64), r64(*r)]);
+    }
+
+    // rt_poll(&mut retbuf, vm, loop_fp, ret_pc) — the hidden return
+    // pointer occupies the first argument register, shifting the rest.
+    a.emit("lea", &[r64(ARG_REGS[0]), mem(RSP, RETBUF_OFF)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(VM_STATE)]);
+    // `[rbp]` is the caller's saved RBP — i.e. the polling compiled
+    // frame's own frame pointer; `[rbp+8]` is the return address into it.
+    a.emit("mov", &[r64(ARG_REGS[2]), mem(RBP, 0)]);
+    a.emit("mov", &[r64(ARG_REGS[3]), mem(RBP, 8)]);
+    let lit = a.literal_u64(rt_poll_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(lit);
+    let _ = SHADOW_OFF; // the shadow area is the callee's to use
+
+    // deopted?
+    a.emit("mov", &[r64(R10), mem(RSP, RETBUF_OFF + 8)]);
+    a.emit("test", &[r64(R10), r64(R10)]);
+    let resume = a.new_label();
+    a.jcc(Cond::E, resume);
+
+    // Deopted: hand the deoptee's result back to the LOOP's caller.
+    // `loop_fp` is the compiled frame's RBP, so restoring RSP to it and
+    // popping unwinds this stub's frame and the loop's together.
+    a.emit("mov", &[r64(RAX), mem(RSP, RETBUF_OFF)]);
+    a.emit("mov", &[r64(RSP), mem(RBP, 0)]);
+    a.emit("pop", &[r64(RBP)]);
+    a.emit("ret", &[]);
+
+    // Ordinary return: restore and resume the loop.
+    a.bind(resume);
+    for (i, r) in VOLATILES.iter().enumerate() {
+        a.emit("mov", &[r64(*r), mem(RSP, SAVE_OFF + 8 * i as i64)]);
+    }
+    a.emit("add", &[r64(RSP), imm(STUB_FRAME)]);
+    a.emit("pop", &[r64(RBP)]);
+    a.emit("ret", &[]);
+    a.finish()
+}
+
+/// A stub for a runtime entry of the shape `rt_x(vm, a, b) -> u64`: the
+/// emitter has already placed the real arguments in the first argument
+/// registers, so this shifts them right by one and prepends `&VmState`.
+///
+/// Shared by `must_be_boolean` (one argument) and `alloc_slow` (two) —
+/// they differ only in arity, and shifting a register that holds nothing
+/// is harmless.
+fn build_shift_and_call_stub(rt_addr: u64, argc: usize) -> CodeBlob {
+    assert!(argc <= ARG_REGS.len() - 1, "no room to prepend &VmState");
+    let mut a = X64Assembler::new();
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+    a.emit("sub", &[r64(RSP), imm(STUB_FRAME)]);
+
+    // Shift right-to-left so no argument is overwritten before it moves.
+    for i in (0..argc).rev() {
+        a.emit("mov", &[r64(ARG_REGS[i + 1]), r64(ARG_REGS[i])]);
+    }
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    let lit = a.literal_u64(rt_addr, Some(RelocKind::RuntimeAddr));
+    a.call_far(lit);
+    // The result is already in RAX, which is where compiled code reads it.
+
+    a.emit("add", &[r64(RSP), imm(STUB_FRAME)]);
+    a.emit("pop", &[r64(RBP)]);
+    a.emit("ret", &[]);
+    a.finish()
+}
+
+/// `stub_must_be_boolean` — `rt_must_be_boolean(vm, val) -> u64`.
+pub fn build_stub_must_be_boolean_x64(rt_addr: u64) -> CodeBlob {
+    build_shift_and_call_stub(rt_addr, 1)
+}
+
+/// `stub_alloc_slow` — `rt_alloc_slow(vm, klass_bits, size_bytes) -> u64`.
+pub fn build_stub_alloc_slow_x64(rt_addr: u64) -> CodeBlob {
+    build_shift_and_call_stub(rt_addr, 2)
 }
 
 #[cfg(test)]
@@ -397,6 +524,137 @@ mod tests {
         // Exactly one argument available; the stub must load only that one.
         let argv = [smi(99)];
         assert_eq!(unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) }, smi(99));
+    }
+
+    /// **Pins the ABI fact the poll stub is built on**, empirically
+    /// rather than from my reading of the Win64 spec: a 16-byte struct
+    /// returned by an `extern "C"` function comes back through a HIDDEN
+    /// POINTER passed as the implicit first argument — not in `RAX:RDX`
+    /// the way AAPCS64 returns it in `x0:x1`.
+    ///
+    /// The check calls a real Rust `extern "C"` function returning a
+    /// `PollOutcome`-shaped struct from generated machine code that
+    /// follows the hidden-pointer convention, and requires both fields to
+    /// arrive intact. If Rust ever lowered this differently, the poll
+    /// stub would be silently wrong and this test is what fails.
+    #[cfg(windows)]
+    #[test]
+    fn poll_outcome_is_returned_via_hidden_pointer() {
+        use crate::compiler::assembler_x64::mem as xmem;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        #[repr(C)]
+        struct TwoWords {
+            a: u64,
+            b: u64,
+        }
+        extern "C" fn returns_two_words(x: u64) -> TwoWords {
+            TwoWords {
+                a: x + 1,
+                b: x + 2,
+            }
+        }
+        // The size is what selects the convention; state it.
+        assert_eq!(
+            std::mem::size_of::<TwoWords>(),
+            16,
+            "over 8 bytes, so Win64 uses the hidden-pointer return"
+        );
+
+        // Generated caller: rcx = &buf, rdx = the real argument.
+        let mut a = X64Assembler::new();
+        a.emit("push", &[r64(RBP)]);
+        a.emit("mov", &[r64(RBP), r64(RSP)]);
+        a.emit("sub", &[r64(RSP), imm(64)]);
+        a.emit("mov", &[r64(R10), r64(RCX)]); // callee address
+        a.emit("mov", &[r64(R11), r64(RDX)]); // the argument
+        a.emit("lea", &[r64(RCX), xmem(RSP, 32)]); // hidden return buffer
+        a.emit("mov", &[r64(RDX), r64(R11)]);
+        a.emit("call", &[r64(R10)]);
+        // Return a+b so BOTH fields must have landed correctly.
+        a.emit("mov", &[r64(RAX), xmem(RSP, 32)]);
+        a.emit("add", &[r64(RAX), xmem(RSP, 40)]);
+        a.emit("add", &[r64(RSP), imm(64)]);
+        a.emit("pop", &[r64(RBP)]);
+        a.emit("ret", &[]);
+        let blob = a.finish();
+
+        let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        unsafe { core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base, blob.code.len()) };
+        let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(base) };
+        let got = f(returns_two_words as usize as u64, 10);
+        assert_eq!(got, 23, "(10+1) + (10+2) — both struct fields returned");
+    }
+
+    /// `must_be_boolean` and `alloc_slow` stubs shift the emitter's
+    /// arguments right and prepend `&VmState`. The probes below check the
+    /// exact positions, because an off-by-one shift would still "work"
+    /// for any call whose arguments happen to be interchangeable.
+    #[cfg(windows)]
+    #[test]
+    fn shift_and_call_stubs_prepend_vm_state() {
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // Positional arithmetic: the result is only correct when every
+        // argument landed in its own slot, so a shift that is off by one
+        // (or that forgot to prepend vm) produces a different number
+        // rather than accidentally passing.
+        extern "C" fn mbb(vm: u64, val: u64) -> u64 {
+            vm.wrapping_mul(1000).wrapping_add(val)
+        }
+        extern "C" fn alloc(vm: u64, klass: u64, size: u64) -> u64 {
+            vm.wrapping_mul(1_000_000)
+                .wrapping_add(klass.wrapping_mul(1000))
+                .wrapping_add(size)
+        }
+
+        let run = |blob: CodeBlob, vm: u64, a0: u64, a1: u64| -> u64 {
+            let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX");
+            let (base, _cap) = jit.region_raw();
+            unsafe { core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base, blob.code.len()) };
+            // Drive the stub with R15 (vm) set, the way compiled code
+            // would: a tiny harness that plants R15 then calls.
+            let mut h = X64Assembler::new();
+            h.emit("push", &[r64(RBP)]);
+            h.emit("mov", &[r64(RBP), r64(RSP)]);
+            h.emit("push", &[r64(R15)]);
+            h.emit("sub", &[r64(RSP), imm(40)]);
+            h.emit("mov", &[r64(R10), r64(RCX)]); // stub address
+            h.emit("mov", &[r64(R15), r64(RDX)]); // vm
+            h.emit("mov", &[r64(RCX), r64(R8)]); // emitter arg0
+            h.emit("mov", &[r64(RDX), r64(R9)]); // emitter arg1
+            h.emit("call", &[r64(R10)]);
+            h.emit("add", &[r64(RSP), imm(40)]);
+            h.emit("pop", &[r64(R15)]);
+            h.emit("pop", &[r64(RBP)]);
+            h.emit("ret", &[]);
+            let hb = h.finish();
+            let jit2 = WinJit::with_capacity(hb.code.len() + 4096).expect("RWX");
+            let (hbase, _) = jit2.region_raw();
+            unsafe { core::ptr::copy_nonoverlapping(hb.code.as_ptr(), hbase, hb.code.len()) };
+            let hf: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                unsafe { std::mem::transmute(hbase) };
+            hf(base as u64, vm, a0, a1)
+        };
+
+        // must_be_boolean: emitter passes (val); stub must call (vm, val).
+        let got = run(
+            build_stub_must_be_boolean_x64(mbb as usize as u64),
+            7,
+            42,
+            0,
+        );
+        assert_eq!(got, 7 * 1000 + 42, "vm then val");
+
+        // alloc_slow: emitter passes (klass, size); stub calls (vm, klass, size).
+        let got = run(
+            build_stub_alloc_slow_x64(alloc as usize as u64),
+            3,
+            5,
+            9,
+        );
+        assert_eq!(got, 3 * 1_000_000 + 5 * 1000 + 9, "vm, klass, size");
     }
 
     /// The stub saves the Win64 callee-saved GPRs but deliberately not

@@ -193,7 +193,13 @@ fn emit_entry_guard_x64(asm: &mut X64Assembler, guard: &EntryGuard) {
     asm.bind(matched);
 }
 
-/// Absolute addresses of the runtime entry points compiled code calls.
+/// Absolute addresses of the **stubs** compiled code calls — not the
+/// `rt_*` Rust functions themselves. Each stub owns the register
+/// marshalling: the emitter places only the real arguments, and the stub
+/// prepends `&VmState` from the pinned register (`codecache::stubs_x64`).
+/// Keeping that split means the emitter never has to know a runtime
+/// function's Rust signature.
+///
 /// Passed in rather than looked up so the emitter stays free of any
 /// dependency on a live `VmState` — the same shape as the AArch64
 /// `emit`'s long parameter list, collected into one struct.
@@ -201,9 +207,9 @@ fn emit_entry_guard_x64(asm: &mut X64Assembler, guard: &EntryGuard) {
 pub struct RuntimeAddrs {
     /// `stub_poll` — runs the safepoint action when the poll flag is set.
     pub stub_poll: u64,
-    /// `must_be_boolean` — coerces or raises on a non-boolean.
+    /// `stub_must_be_boolean` — coerces or raises on a non-boolean.
     pub must_be_boolean: u64,
-    /// `rt_alloc_slow` — the allocation slow path.
+    /// `stub_alloc_slow` — the allocation slow path.
     pub alloc_slow: u64,
 }
 
