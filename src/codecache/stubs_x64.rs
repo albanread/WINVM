@@ -602,6 +602,26 @@ pub fn build_stub_value_dispatch_x64(
     a.finish()
 }
 
+/// A stub for a slot the x64 back end cannot reach yet: two `ud2`s.
+///
+/// The `Stubs` table has one entry per stub *address*, and every entry
+/// must hold something — but three of them (the SIMD boxers) exist only
+/// for IR ops `emit_x64` does not lower at all: `FBox` and `VecArith` are
+/// absent from its `SUPPORTED_OPS`, so a method containing one panics at
+/// compile time and never reaches an emitted call. Publishing an empty
+/// blob, or leaving the AArch64 bytes in place, would make an unreachable
+/// path *look* live; `ud2` makes it unmistakable if it somehow isn't.
+///
+/// `ud2` and not `int3`: `int3` is the deopt trap encoding, and the VEH
+/// handler would try to decode this as a deopt site and mis-report it.
+/// `ud2` raises ILLEGAL_INSTRUCTION, which nothing in the VM claims.
+pub fn build_unreachable_stub_x64() -> CodeBlob {
+    let mut a = X64Assembler::new();
+    a.emit_bytes(&[0x0F, 0x0B]); // ud2
+    a.emit_bytes(&[0x0F, 0x0B]); // ud2 — so a one-byte skid still faults
+    a.finish()
+}
+
 #[cfg(test)]
 #[allow(unsafe_code)]
 mod tests {

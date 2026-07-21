@@ -374,7 +374,165 @@ impl Stubs {
 /// or running any real method — `emit.rs` needs `stub_poll`'s address
 /// (`Stubs::stub_poll_addr`) to embed as a pool constant in any method
 /// that emits `Ir::Poll`.
+///
+/// WINVM (Phase 3, MIGRATION.md §4): arch-selected. Until this split, the
+/// AArch64 builders below ran on **every** host, so an x86-64 build
+/// published A64 encodings into the code cache and handed their addresses
+/// to the compiler as `stub_poll_addr()` and friends. Nothing detected
+/// that — the addresses are real, the cache bounds-checks pass, and the
+/// bytes only reveal themselves as garbage when something jumps to them.
 pub fn install(cache: &mut CodeCache) -> Stubs {
+    #[cfg(target_arch = "aarch64")]
+    {
+        install_a64(cache)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        install_x64(cache)
+    }
+}
+
+/// Publish one blob and return its handle, naming the stub in the panic so
+/// an undersized cache says *which* stub did not fit.
+fn place(cache: &mut CodeCache, name: &str, blob: &CodeBlob) -> CodeHandle {
+    let h = cache
+        .alloc(blob.code.len())
+        .unwrap_or_else(|| panic!("stubs::install: code cache too small for {name}"));
+    cache.publish(h, blob);
+    h
+}
+
+/// The x86-64 stub table (WINVM Phase 3).
+///
+/// Two shape differences from the AArch64 side, both deliberate:
+///
+/// * **The builders take their runtime addresses as arguments** rather
+///   than referencing `rt_*` directly, which is what lets them live in
+///   `stubs_x64`/`thunks_x64` and be unit-tested against stand-in
+///   functions. This function is where the real `rt_*` addresses are
+///   supplied, so it is the single place the two halves meet.
+/// * **The three SIMD boxers are `ud2`.** `emit_x64` does not lower
+///   `FBox` or `VecArith` at all (they are absent from its
+///   `SUPPORTED_OPS`, so such a method panics during compilation and
+///   never reaches an emitted call). See [`build_unreachable_stub_x64`].
+#[cfg(not(target_arch = "aarch64"))]
+fn install_x64(cache: &mut CodeCache) -> Stubs {
+    use super::stubs_x64::{
+        build_call_stub_x64, build_deopt_return_trampoline_x64, build_not_entrant_stub_x64,
+        build_stub_alloc_slow_x64, build_stub_box_double_x64, build_stub_call_primitive_x64,
+        build_stub_dnu_x64, build_stub_mega_shared_x64, build_stub_must_be_boolean_x64,
+        build_stub_nlr_originate_x64, build_stub_poll_x64, build_stub_resolve_x64,
+        build_stub_value_dispatch_x64, build_unreachable_stub_x64,
+    };
+    use super::deopt_trap::{rt_deopt_on_return, rt_deopt_return_pc};
+    use super::thunks_x64::build_c2i_shared_x64;
+
+    let a = |f: *const ()| f as u64;
+
+    let call_stub = place(cache, "call_stub", &build_call_stub_x64());
+    let stub_poll = place(
+        cache,
+        "stub_poll",
+        &build_stub_poll_x64(a(rt_poll as *const ())),
+    );
+    let resolve = place(
+        cache,
+        "stub_resolve",
+        &build_stub_resolve_x64(a(rt_resolve_send as *const ())),
+    );
+    let c2i_shared = place(
+        cache,
+        "c2i_shared",
+        &build_c2i_shared_x64(a(rt_interpret_call as *const ()), KIND_C2I),
+    );
+    let mega_shared = place(
+        cache,
+        "mega_shared",
+        &build_stub_mega_shared_x64(a(rt_mega_lookup as *const ())),
+    );
+    let dnu = place(
+        cache,
+        "dnu",
+        &build_stub_dnu_x64(a(rt_dnu as *const ()), KIND_DNU),
+    );
+    let must_be_boolean = place(
+        cache,
+        "must_be_boolean",
+        &build_stub_must_be_boolean_x64(a(rt_must_be_boolean as *const ())),
+    );
+    let alloc_slow = place(
+        cache,
+        "alloc_slow",
+        &build_stub_alloc_slow_x64(a(rt_alloc_slow as *const ())),
+    );
+    let not_entrant = place(
+        cache,
+        "not_entrant",
+        &build_not_entrant_stub_x64(a(rt_resolve_send as *const ())),
+    );
+    let deopt_return = place(
+        cache,
+        "deopt_return",
+        &build_deopt_return_trampoline_x64(
+            a(rt_deopt_return_pc as *const ()),
+            a(rt_deopt_on_return as *const ()),
+        ),
+    );
+    let call_primitive = place(
+        cache,
+        "call_primitive",
+        &build_stub_call_primitive_x64(a(rt_call_primitive as *const ()), KIND_CALL_PRIMITIVE),
+    );
+    let nlr_originate = place(
+        cache,
+        "nlr_originate",
+        &build_stub_nlr_originate_x64(a(rt_nlr_originate as *const ()), KIND_NLR_ORIGINATE),
+    );
+    let value_dispatch = std::array::from_fn(|argc| {
+        let blob = build_stub_value_dispatch_x64(
+            a(rt_value_target as *const ()),
+            a(rt_value_fallback as *const ()),
+            argc as u64,
+            KIND_VALUE_DISPATCH,
+        );
+        place(cache, "value_dispatch", &blob)
+    });
+    let box_double = place(
+        cache,
+        "box_double",
+        &build_stub_box_double_x64(a(rt_box_double as *const ())),
+    );
+    let box_float64x2 = place(cache, "box_float64x2", &build_unreachable_stub_x64());
+    let box_float32x4 = place(cache, "box_float32x4", &build_unreachable_stub_x64());
+    let box_int32x4 = place(cache, "box_int32x4", &build_unreachable_stub_x64());
+
+    Stubs {
+        call_stub,
+        stub_poll,
+        resolve,
+        c2i_shared,
+        mega_shared,
+        dnu,
+        must_be_boolean,
+        alloc_slow,
+        not_entrant,
+        deopt_return,
+        call_primitive,
+        nlr_originate,
+        value_dispatch,
+        box_double,
+        box_float64x2,
+        box_float32x4,
+        box_int32x4,
+    }
+}
+
+/// The AArch64 stub table — this file's original `install`, unchanged.
+///
+/// Compiled on every host (the builders only write bytes, and their
+/// encoding tests run everywhere), but only *called* on AArch64.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn install_a64(cache: &mut CodeCache) -> Stubs {
     let call_stub_blob = build_call_stub();
     let h1 = cache
         .alloc(call_stub_blob.code.len())
@@ -3030,6 +3188,53 @@ mod tests {
         assert!(cache.contains(stubs.must_be_boolean_addr()));
         assert!(cache.contains(stubs.alloc_slow_addr()));
         assert!(cache.contains(stubs.not_entrant_addr()));
+    }
+
+    /// WINVM: `install` must publish the **x86-64** builders' output on an
+    /// x86-64 host.
+    ///
+    /// The test above passes either way — it only checks that the
+    /// addresses land inside the cache, which they did while `install`
+    /// was still publishing AArch64 encodings on every host. So this one
+    /// compares the published bytes against the x64 builders directly,
+    /// which is the only thing that distinguishes "a stub is installed"
+    /// from "the right architecture's stub is installed".
+    #[cfg(not(target_arch = "aarch64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn install_publishes_x64_stub_encodings() {
+        use super::super::stubs_x64::{build_call_stub_x64, build_unreachable_stub_x64};
+
+        let mut cache = test_cache();
+        let stubs = install(&mut cache);
+
+        // SAFETY: each handle names live, published code-cache bytes of
+        // at least the corresponding blob's length.
+        let published = |base: *const u8, len: usize| -> Vec<u8> {
+            unsafe { std::slice::from_raw_parts(base, len) }.to_vec()
+        };
+
+        let want = build_call_stub_x64();
+        assert_eq!(
+            published(stubs.call_stub.base, want.code.len()),
+            want.code,
+            "call_stub must be the x64 encoding — AArch64 bytes here execute as garbage"
+        );
+
+        // The three SIMD boxers are deliberately unreachable on x64: no
+        // `FBox`/`VecArith` lowering exists, so nothing can call them.
+        let ud2 = build_unreachable_stub_x64();
+        for (name, h) in [
+            ("box_float64x2", stubs.box_float64x2),
+            ("box_float32x4", stubs.box_float32x4),
+            ("box_int32x4", stubs.box_int32x4),
+        ] {
+            assert_eq!(
+                published(h.base, ud2.code.len()),
+                ud2.code,
+                "{name} has no x64 lowering yet and must fault loudly, not run stale bytes"
+            );
+        }
     }
 
     fn test_vm() -> VmState {
