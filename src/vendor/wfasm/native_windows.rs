@@ -56,6 +56,122 @@ fn round_up(n: usize, to: usize) -> usize {
     (n + to - 1) & !(to - 1)
 }
 
+// ── Near-host allocation (MIGRATION.md §2.2) ────────────────────────────────
+//
+// Placing the code cache *anywhere* costs every call to a host runtime
+// function an absolute veneer (`mov r10, [rip+pool]; call r10`, a load plus
+// an indirect branch) instead of a plain `call rel32`. Since rel32 reaches
+// ±2 GB, asking the OS for the region within a window of the host image
+// removes that cost entirely — intra-cache calls AND host-extern calls both
+// become direct 5-byte relative calls.
+//
+// `VirtualAlloc2` (Windows 10+) is what accepts an address requirement.
+// It is resolved dynamically because it lives in kernelbase.dll and older
+// systems lack it; when it or the near placement is unavailable, we fall
+// back to placing the region anywhere and the absolute-veneer path in
+// `relocpatch::patch_relocs_x64` handles the out-of-range targets. Nothing
+// is *incorrect* in the fallback — it is just slower.
+
+#[repr(C)]
+struct MemAddressRequirements {
+    lowest_starting_address: *mut c_void,
+    highest_ending_address: *mut c_void,
+    alignment: usize,
+}
+
+#[repr(C)]
+struct MemExtendedParameter {
+    type_and_reserved: u64,
+    pointer: *mut c_void,
+}
+
+const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
+
+type VirtualAlloc2Fn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut c_void,
+    usize,
+    u32,
+    u32,
+    *mut MemExtendedParameter,
+    u32,
+) -> *mut c_void;
+
+fn virtual_alloc2() -> Option<VirtualAlloc2Fn> {
+    // SAFETY: string literals are NUL-terminated; every result is checked
+    // for null before use, and the transmute matches the documented
+    // signature of VirtualAlloc2.
+    unsafe {
+        let lib = {
+            let l = GetModuleHandleA(b"kernelbase.dll\0".as_ptr() as *const c_char);
+            if l.is_null() {
+                LoadLibraryA(b"kernelbase.dll\0".as_ptr() as *const c_char)
+            } else {
+                l
+            }
+        };
+        if lib.is_null() {
+            return None;
+        }
+        let p = GetProcAddress(lib, b"VirtualAlloc2\0".as_ptr() as *const c_char);
+        if p.is_null() {
+            return None;
+        }
+        Some(std::mem::transmute::<*mut c_void, VirtualAlloc2Fn>(p))
+    }
+}
+
+/// The half-width of the placement window. rel32 spans ±2 GB; 1.75 GB
+/// leaves margin so a target a little beyond the anchor on the far side is
+/// still reachable, rather than sitting exactly at the limit.
+const NEAR_WINDOW: u64 = 0x7000_0000;
+
+/// Try to reserve `size` RWX bytes within [`NEAR_WINDOW`] of `anchor`.
+/// `None` if `VirtualAlloc2` is unavailable or the window is too crowded —
+/// the caller falls back to placing the region anywhere.
+fn alloc_near(anchor: u64, size: usize) -> Option<*mut u8> {
+    let va2 = virtual_alloc2()?;
+    const GRANULARITY: u64 = 0x10000;
+    let low = (anchor.saturating_sub(NEAR_WINDOW) + GRANULARITY - 1) & !(GRANULARITY - 1);
+    let low = low.max(GRANULARITY);
+    let high = (anchor.saturating_add(NEAR_WINDOW) & !(GRANULARITY - 1)).saturating_sub(1);
+
+    let mut req = MemAddressRequirements {
+        lowest_starting_address: low as *mut c_void,
+        highest_ending_address: high as *mut c_void,
+        alignment: 0,
+    };
+    let mut param = MemExtendedParameter {
+        type_and_reserved: MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS,
+        pointer: &mut req as *mut _ as *mut c_void,
+    };
+    // SAFETY: a fixed-shape allocation call; the extended parameter array
+    // is one live, fully-initialized element. Result checked for null.
+    let base = unsafe {
+        va2(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_EXECUTE_READWRITE,
+            &mut param,
+            1,
+        )
+    };
+    if base.is_null() {
+        None
+    } else {
+        Some(base as *mut u8)
+    }
+}
+
+/// The anchor every code region is placed near: the address of a function
+/// in this image. Any host symbol serves — they all live in the same
+/// module — and using one of our own keeps the choice self-evident.
+fn host_anchor() -> u64 {
+    host_anchor as usize as u64
+}
+
 struct Placed {
     base: u64,
     relocs: Vec<Reloc>,
@@ -88,20 +204,31 @@ impl WinJit {
     /// is bookkeeping only on Windows — the pages are always RWX.
     pub fn with_capacity(cap: usize) -> Result<Self> {
         let cap = round_up(cap.max(PAGE), PAGE);
-        // SAFETY: fixed-shape allocation call, result checked before use.
-        let region = unsafe {
-            VirtualAlloc(
-                ptr::null_mut(),
-                cap,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            )
+        // Prefer a placement within rel32 of this image, so compiled code
+        // reaches host runtime functions with a direct `call rel32` rather
+        // than an absolute veneer (see the near-allocation section above).
+        // Falling back to "anywhere" stays correct — `patch_relocs_x64`
+        // routes any out-of-range branch through a stub — just slower.
+        let region = match alloc_near(host_anchor(), cap) {
+            Some(p) => p,
+            None => {
+                // SAFETY: fixed-shape allocation call, result checked.
+                let p = unsafe {
+                    VirtualAlloc(
+                        ptr::null_mut(),
+                        cap,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_EXECUTE_READWRITE,
+                    )
+                };
+                p as *mut u8
+            }
         };
         if region.is_null() {
             bail!("VirtualAlloc(PAGE_EXECUTE_READWRITE) failed — JIT memory unavailable");
         }
         Ok(WinJit {
-            region: region as *mut u8,
+            region,
             cap,
             used: 0,
             symbols: HashMap::new(),
@@ -430,6 +557,49 @@ entry:
             unsafe { jit.lookup_fn("entry").expect("lookup entry") };
         assert_eq!(f(10), 22, "(10+1)*2 via host callback");
         assert_eq!(f(0), 2);
+    }
+
+    /// The region must land within `rel32` of this image, so compiled code
+    /// reaches host runtime functions with a direct `call rel32` instead of
+    /// an absolute veneer (MIGRATION.md §2.2).
+    ///
+    /// Asserted against the FULL round trip a real call makes — from the
+    /// far end of the region to the host anchor — not merely against the
+    /// region base, because it is the worst-case distance that decides
+    /// whether a veneer is needed.
+    #[test]
+    fn region_lands_within_rel32_of_the_host_image() {
+        let cap = 1 << 20;
+        let jit = WinJit::with_capacity(cap).expect("RWX region");
+        let (base, actual_cap) = jit.region_raw();
+        let anchor = host_anchor() as i64;
+        let lo = base as i64;
+        let hi = lo + actual_cap as i64;
+        for end in [lo, hi] {
+            let disp = anchor - end;
+            assert!(
+                i32::try_from(disp).is_ok(),
+                "code region at {lo:#x}..{hi:#x} is {disp} bytes from the host anchor \
+                 {anchor:#x} — outside rel32, so every host call would need a veneer"
+            );
+        }
+    }
+
+    /// A compiled `call rel32` straight to a host function, with no veneer
+    /// — the payoff of near allocation, executed.
+    #[test]
+    fn direct_rel32_call_to_a_host_function_executes() {
+        extern "C" fn host_triple(x: u64) -> u64 {
+            x * 3
+        }
+        let mut jit = WinJit::new();
+        jit.define_extern("host_triple", host_triple as usize as u64);
+        jit.add_asm(
+            ".globl entry\nentry:\n  sub rsp, 40\n  call host_triple\n  add rsp, 40\n  ret\n",
+        )
+        .expect("add_asm");
+        let f: extern "C" fn(u64) -> u64 = unsafe { jit.lookup_fn("entry").expect("entry") };
+        assert_eq!(f(14), 42);
     }
 
     #[test]

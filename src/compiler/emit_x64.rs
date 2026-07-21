@@ -46,6 +46,7 @@
 //! away.
 
 use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
+use crate::compiler::emit::EmittedIcSite;
 use crate::compiler::assembler_x64::{
     imm, mem, mem_byte, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
     SCRATCH0, SCRATCH1, SHADOW_SPACE, VM_STATE,
@@ -70,6 +71,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "BoolBr",
     "Poll",
     "Alloc",
+    "CallSend",
     "CallRuntime",
     "Jump",
     "UncommonTrap",
@@ -104,6 +106,8 @@ pub struct Emitted {
     /// AArch64 emitter uses (contrast [`TrapSite`], which keys on the
     /// trapping instruction itself).
     pub safepoints: Vec<TrapSite>,
+    /// Patchable inline-cache sites, for the code cache to wire up.
+    pub ic_sites: Vec<EmittedIcSite>,
 }
 
 /// Absolute addresses of the runtime entry points compiled code calls.
@@ -148,6 +152,7 @@ struct Emitter<'a> {
     bailout: Label,
     trap_sites: Vec<TrapSite>,
     safepoints: Vec<TrapSite>,
+    ic_sites: Vec<EmittedIcSite>,
     /// Pool entries holding the runtime entry points.
     stub_poll_lit: LiteralId,
     must_be_boolean_lit: LiteralId,
@@ -233,6 +238,97 @@ impl<'a> Emitter<'a> {
         self.asm.emit("test", &[r64(reg), imm(3)]);
         let target = self.labels[fail.0 as usize];
         self.asm.jcc(Cond::Ne, target);
+    }
+
+    /// Marshal `args` into the Win64 argument registers — a *parallel*
+    /// move, not a sequence of independent ones.
+    ///
+    /// The hazard: a source register may itself be some other argument's
+    /// destination. Moving naively in index order would clobber a value
+    /// still needed. The standard resolution, and the one the AArch64
+    /// emitter uses: repeatedly emit any move whose destination is not
+    /// still pending as somebody's source (those are always safe); when
+    /// only a cycle remains, break it by parking one value in a scratch
+    /// register and rewriting the references to it.
+    ///
+    /// Spilled sources are never part of a cycle — a memory operand is
+    /// nobody's destination — so they can always be loaded directly.
+    fn marshal_args(&mut self, args: &[VReg]) {
+        assert!(
+            args.len() <= ARG_REGS.len(),
+            "emit_x64: {} arguments exceeds the {} Win64 register slots — stack-passed \
+             arguments are not in the Phase-3 slice yet",
+            args.len(),
+            ARG_REGS.len()
+        );
+
+        #[derive(Clone, Copy)]
+        enum Src {
+            Reg(u8),
+            Slot(SpillSlot),
+        }
+
+        // (destination register, source) for every argument that isn't
+        // already sitting in the right register.
+        let mut pending: Vec<(u8, Src)> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| {
+                let dst = ARG_REGS[i];
+                match self.assignment[v.0 as usize] {
+                    Some(Assignment::Reg(r)) if r == dst => None,
+                    Some(Assignment::Reg(r)) => Some((dst, Src::Reg(r))),
+                    Some(Assignment::Spill(slot)) => Some((dst, Src::Slot(slot))),
+                    None => panic!("emit_x64: argument vreg v{} has no assignment", v.0),
+                }
+            })
+            .collect();
+
+        while !pending.is_empty() {
+            // A destination that no pending move still reads is safe now.
+            let ready = pending.iter().position(|&(dst, _)| {
+                !pending
+                    .iter()
+                    .any(|&(_, s)| matches!(s, Src::Reg(r) if r == dst))
+            });
+            if let Some(pos) = ready {
+                let (dst, src) = pending.remove(pos);
+                match src {
+                    Src::Reg(r) => self.asm.emit("mov", &[r64(dst), r64(r)]),
+                    Src::Slot(slot) => self
+                        .asm
+                        .emit("mov", &[r64(dst), mem(RBP, spill_offset(slot))]),
+                }
+            } else {
+                // Everything left is a cycle. Park the first destination's
+                // current value in a scratch and redirect readers to it,
+                // which turns the cycle into a chain.
+                let (dst0, _) = pending[0];
+                self.asm.emit("mov", &[r64(SCRATCH0), r64(dst0)]);
+                for (_, s) in pending.iter_mut() {
+                    if let Src::Reg(r) = s {
+                        if *r == dst0 {
+                            *r = SCRATCH0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// After any call that can run guest code: if the callee was unwound
+    /// by a non-local return it hands back [`NLR_SENTINEL`] instead of a
+    /// result, and this frame must return that sentinel to ITS caller
+    /// immediately — propagating the escape one native frame at a time
+    /// back to `enter_compiled`. Falling through would treat the sentinel
+    /// as an ordinary oop.
+    fn emit_nlr_check(&mut self) {
+        self.asm.emit(
+            "cmp",
+            &[r64(RAX), imm(crate::oops::layout::NLR_SENTINEL as i64)],
+        );
+        let epi = self.epilogue;
+        self.asm.jcc(Cond::E, epi);
     }
 
     /// Call an absolute runtime address, Win64-correctly.
@@ -407,6 +503,7 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) 
         bailout,
         trap_sites: Vec::new(),
         safepoints: Vec::new(),
+        ic_sites: Vec::new(),
         stub_poll_lit,
         must_be_boolean_lit,
         alloc_slow_lit,
@@ -457,10 +554,12 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) 
 
     let trap_sites = std::mem::take(&mut e.trap_sites);
     let safepoints = std::mem::take(&mut e.safepoints);
+    let ic_sites = std::mem::take(&mut e.ic_sites);
     Emitted {
         blob: e.asm.finish(),
         trap_sites,
         safepoints,
+        ic_sites,
     }
 }
 
@@ -698,6 +797,36 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.jmp(ep);
         }
 
+        Ir::CallSend { dst, site, args } => {
+            e.marshal_args(args);
+            // The patchable site: a 5-byte `call rel32` whose displacement
+            // the code cache rewrites to point at the current IC target.
+            // It sits INSIDE the shadow-space reservation, because the
+            // callee is ordinary Win64 code like any other.
+            e.asm
+                .emit("sub", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+            let off = e.asm.call_patchable(RelocKind::InlineCache);
+            e.asm
+                .emit("add", &[r64(RSP), imm(SHADOW_SPACE as i64)]);
+            // A send is a deopt safepoint, keyed on the return address.
+            e.record_safepoint();
+            let info = e.method.call_sites[*site as usize];
+            e.ic_sites.push(EmittedIcSite {
+                off,
+                site: *site,
+                selector: info.selector,
+                argc: info.argc,
+            });
+            // A callee unwound by a non-local return hands back the
+            // sentinel rather than a value; propagate before using it.
+            e.emit_nlr_check();
+            let d = e.def_reg(*dst, RAX);
+            if d != RAX {
+                e.asm.emit("mov", &[r64(d), r64(RAX)]);
+            }
+            e.store_def(*dst, d);
+        }
+
         Ir::Alloc {
             dst,
             klass,
@@ -913,6 +1042,8 @@ mod tests {
     use super::*;
     use crate::compiler::ir::{BailoutReason, IrBlock, PoolLit, VRegInfo};
     use crate::compiler::regalloc::regalloc;
+    use crate::oops::wrappers::SymbolOop;
+    use crate::oops::Oop;
 
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
         IrMethod {
@@ -1279,6 +1410,7 @@ mod tests {
                 bailout: Label(0),
                 trap_sites: Vec::new(),
                 safepoints: Vec::new(),
+                ic_sites: Vec::new(),
                 stub_poll_lit: LiteralId(0),
                 must_be_boolean_lit: LiteralId(0),
                 alloc_slow_lit: LiteralId(0),
@@ -1552,33 +1684,28 @@ mod tests {
         use crate::memory::cards::CARD_SHIFT;
         use crate::vendor::wfasm::native_windows::WinJit;
 
-        // A card table, and a VM register block pointing at it. `old_start`
-        // is chosen so we can place objects deliberately on either side.
-        let mut cards = vec![0xFFu8; 1 << 12];
-        // Objects: `old` sits above old_start, `young` below it.
-        let mut old_obj = [0u64; 4];
-        let mut young_obj = [0u64; 4];
-        let old_addr = old_obj.as_ptr() as u64;
-        let young_addr = young_obj.as_ptr() as u64;
-        // Pick old_start between them so the classification is real. The
-        // allocator gives no ordering guarantee, so derive it rather than
-        // assuming which address is lower.
-        let (lo, hi) = if old_addr < young_addr {
-            (young_addr, old_addr)
-        } else {
-            (old_addr, young_addr)
-        };
-        // `lo` is the higher address -> treat it as "old"; place old_start
-        // just below it so `hi` classifies as young.
-        let old_start = lo;
-        let (old_addr, young_addr) = (lo, hi);
-        let old_obj_p = old_addr as *mut u64;
-        let young_obj_p = young_addr as *mut u64;
+        // One arena holding both objects, so their relative placement is
+        // OURS to choose rather than whatever the stack happens to give.
+        //
+        // An earlier version of this test derived `old_start` from the
+        // addresses of two separate stack arrays. That passed in isolation
+        // and failed in the full parallel run: whether the two arrays
+        // straddled a 512-byte card boundary decided whether a card index
+        // came out negative, which then wrapped when cast to `usize`. The
+        // barrier was fine; the test was reading a different card each run.
+        // Everything below is therefore positioned at fixed offsets.
+        const ARENA_WORDS: usize = 512; // 4 KiB, several cards wide
+        let mut arena = vec![0u64; ARENA_WORDS];
+        let arena_base = arena.as_mut_ptr() as u64;
+        // Young at the start, old well past the boundary we pick.
+        let young_addr = arena_base;
+        let old_addr = arena_base + 2048;
+        let old_start = arena_base + 1024; // young < old_start <= old
 
-        // card_base_biased: the table base minus (old_start >> CARD_SHIFT),
-        // so `card_base_biased + (addr >> CARD_SHIFT)` indexes the table.
-        let card_base_biased =
-            cards.as_mut_ptr() as u64 - ((old_start >> CARD_SHIFT) as u64);
+        let mut cards = vec![0xFFu8; 1 << 12];
+        // Bias against the ARENA base (not old_start) so every index for
+        // an address inside the arena is small and non-negative.
+        let card_base_biased = cards.as_mut_ptr() as u64 - (arena_base >> CARD_SHIFT);
         let mut vmreg = [0u64; 8];
         vmreg[VMREG_OLD_START_OFFSET / 8] = old_start;
         vmreg[VMREG_CARD_BASE_BIASED_OFFSET / 8] = card_base_biased;
@@ -1658,12 +1785,8 @@ mod tests {
         unsafe { stub_fn(entry, vm, argv.as_ptr(), 2) };
         assert_eq!(cards[idx], 0xFF, "old -> old does not concern a scavenge");
 
-        // Keep the backing storage alive for the whole test.
-        unsafe {
-            let _ = core::ptr::read_volatile(old_obj_p);
-            let _ = core::ptr::read_volatile(young_obj_p);
-        }
-        let _ = (&mut old_obj, &mut young_obj);
+        // Keep the arena alive for the whole test.
+        let _ = &mut arena;
     }
 
     /// `SmiCmpVal` materializes a boolean branchlessly via `cmov`, picking
@@ -2132,10 +2255,247 @@ mod tests {
         let _ = &mut eden;
     }
 
+    /// Patch an emitted IC site to call `target`, the way the code cache
+    /// does: rewrite the `rel32` field relative to the END of the 5-byte
+    /// call instruction.
+    ///
+    /// Prefers a DIRECT relative call, which is what actually happens in
+    /// practice now that `WinJit` places its region within rel32 of the
+    /// host image (`native_windows::alloc_near`). If the region ever falls
+    /// back to an arbitrary placement, the target is reached through an
+    /// absolute thunk (`movabs rax, target ; jmp rax`) laid down in the
+    /// region — the same veneer `relocpatch::patch_relocs_x64` builds for
+    /// an out-of-range branch. The thunk tail-calls, so the callee returns
+    /// straight to the send site either way.
+    ///
+    /// Returns `true` if the direct form was used.
+    #[cfg(windows)]
+    fn patch_ic_site(base: *mut u8, site_abs: u64, thunk_off: usize, target: u64) -> bool {
+        use crate::vendor::wfasm::relocpatch::abs_stub_x64;
+        let direct = i32::try_from(target as i64 - (site_abs as i64 + 5));
+        let (rel32, was_direct) = match direct {
+            Ok(r) => (r, true),
+            Err(_) => {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        abs_stub_x64(target).as_ptr(),
+                        base.add(thunk_off),
+                        12,
+                    );
+                }
+                let thunk_addr = base as u64 + thunk_off as u64;
+                let r = i32::try_from(thunk_addr as i64 - (site_abs as i64 + 5))
+                    .expect("an in-region thunk is always within rel32 of the site");
+                (r, false)
+            }
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                rel32.to_le_bytes().as_ptr(),
+                (site_abs + 1) as *mut u8,
+                4,
+            );
+        }
+        was_direct
+    }
+
+    /// Fabricate a `SymbolOop` from raw words, for call-site metadata in
+    /// tests that have no live VM. `SymbolOop::try_from` only requires the
+    /// oop's klass to have `IndexableBytes` format, so a two-object graph
+    /// (`klass` with the format smi in body word 0, `symbol` pointing at
+    /// it) is enough. The storage must outlive the returned handle, which
+    /// is why the caller owns the backing arrays.
+    fn fake_symbol(klass_words: &mut [u64; 4], sym_words: &mut [u64; 2]) -> SymbolOop {
+        use crate::oops::layout::{KLASS_FORMAT_INDEX, MEM_TAG};
+        // klass: [mark][klass][format-smi ...]; body word 0 is the format.
+        klass_words[2 + KLASS_FORMAT_INDEX] =
+            (crate::oops::klass::Format::IndexableBytes as u64) << 2;
+        let klass_tagged = klass_words.as_ptr() as u64 | MEM_TAG;
+        // symbol: [mark][klass]
+        sym_words[1] = klass_tagged;
+        let sym_tagged = sym_words.as_ptr() as u64 | MEM_TAG;
+        SymbolOop::try_from(Oop::from_raw(sym_tagged))
+            .expect("fabricated symbol should satisfy SymbolOop::try_from")
+    }
+
+    /// `CallSend` end to end: marshal the receiver and arguments into the
+    /// Win64 argument registers, call through the patchable site, and take
+    /// the result. The site is emitted with a displacement of 0 (a
+    /// self-call placeholder), so the test patches it exactly as the code
+    /// cache will — which is also what proves the recorded site offset
+    /// points at the right byte.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_call_send_marshals_args_and_patches() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::compiler::ir::CallSiteInfo;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // The IC target: returns arg0 - arg1, so a swapped or stale
+        // argument register shows up as a wrong sign rather than passing.
+        extern "C" fn target(a: u64, b: u64) -> u64 {
+            a.wrapping_sub(b)
+        }
+
+        let mut kw = [0u64; 4];
+        let mut sw = [0u64; 2];
+        let sym = fake_symbol(&mut kw, &mut sw);
+
+        let mut m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::Param {
+                        dst: VReg(1),
+                        index: 1,
+                    },
+                    Ir::CallSend {
+                        dst: VReg(2),
+                        site: 0,
+                        args: vec![VReg(0), VReg(1)],
+                    },
+                    Ir::Ret { val: VReg(2) },
+                ],
+            )],
+            oops(3),
+            2,
+        );
+        m.call_sites = vec![CallSiteInfo {
+            selector: sym,
+            argc: 1,
+            static_klass: None,
+        }];
+
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default());
+        assert_eq!(out.ic_sites.len(), 1, "one send, one IC site");
+        assert_eq!(out.ic_sites[0].site, 0);
+        assert_eq!(out.safepoints.len(), 1, "a send is a deopt safepoint");
+        let site_off = out.ic_sites[0].off as usize;
+        assert_eq!(
+            out.blob.code[site_off], 0xE8,
+            "the recorded IC offset must point AT the call opcode"
+        );
+
+        let blob = out.blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+
+        // Patch the site the way the code cache does: rel32 relative to
+        // the END of the 5-byte call instruction, via an in-region thunk.
+        let site_addr = base as u64 + moff as u64 + site_off as u64;
+        let thunk_off = (moff + blob.code.len() + 15) & !15;
+        let direct = patch_ic_site(base, site_addr, thunk_off, target as usize as u64);
+        assert!(
+            direct,
+            "with near allocation the IC target should be reachable by a direct              call rel32 — no veneer needed"
+        );
+
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let argv = [100u64, 42u64];
+        assert_eq!(
+            unsafe { stub_fn(entry, 0, argv.as_ptr(), 2) },
+            58,
+            "100 - 42 through a patched inline-cache site"
+        );
+        // Argument ORDER is checked by the asymmetry: swapped registers
+        // would give the negation.
+        let argv = [42u64, 100u64];
+        assert_eq!(
+            unsafe { stub_fn(entry, 0, argv.as_ptr(), 2) },
+            42u64.wrapping_sub(100),
+        );
+    }
+
+    /// A callee unwound by a non-local return hands back `NLR_SENTINEL`
+    /// instead of a value; the sender must return it immediately rather
+    /// than treat it as an ordinary result.
+    #[cfg(windows)]
+    #[test]
+    fn call_send_propagates_the_nlr_sentinel() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::compiler::ir::CallSiteInfo;
+        use crate::oops::layout::NLR_SENTINEL;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        extern "C" fn unwinding_callee(_a: u64, _b: u64) -> u64 {
+            NLR_SENTINEL
+        }
+
+        let mut kw = [0u64; 4];
+        let mut sw = [0u64; 2];
+        let sym = fake_symbol(&mut kw, &mut sw);
+
+        let mut m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::CallSend {
+                        dst: VReg(1),
+                        site: 0,
+                        args: vec![VReg(0)],
+                    },
+                    // If the sentinel were NOT intercepted, this would
+                    // overwrite it and the test would see 999 instead.
+                    Ir::ConstSmi {
+                        dst: VReg(1),
+                        value: 999,
+                    },
+                    Ir::Ret { val: VReg(1) },
+                ],
+            )],
+            oops(2),
+            1,
+        );
+        m.call_sites = vec![CallSiteInfo {
+            selector: sym,
+            argc: 0,
+            static_klass: None,
+        }];
+
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default());
+        let site_off = out.ic_sites[0].off as usize;
+        let blob = out.blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let site_addr = base as u64 + moff as u64 + site_off as u64;
+        let thunk_off = (moff + blob.code.len() + 15) & !15;
+        patch_ic_site(base, site_addr, thunk_off, unwinding_callee as usize as u64);
+
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let argv = [smi(1)];
+        assert_eq!(
+            unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) },
+            NLR_SENTINEL,
+            "the sentinel must propagate straight out, not be overwritten"
+        );
+    }
+
     /// An op outside the slice fails loudly and names itself, rather than
     /// emitting approximate code (CONVENTIONS §4).
     #[test]
-    #[should_panic(expected = "CallSend is not in the Phase-3 vertical slice")]
+    #[should_panic(expected = "ArrayAt is not in the Phase-3 vertical slice")]
     fn unsupported_op_panics_by_name() {
         let m = hand_method(
             vec![block(
@@ -2155,6 +2515,7 @@ mod tests {
             bailout: Label(0),
             trap_sites: Vec::new(),
             safepoints: Vec::new(),
+            ic_sites: Vec::new(),
             stub_poll_lit: LiteralId(0),
             must_be_boolean_lit: LiteralId(0),
             alloc_slow_lit: LiteralId(0),
@@ -2164,10 +2525,12 @@ mod tests {
         let _ = &ra;
         emit_op(
             &mut e,
-            &Ir::CallSend {
+            &Ir::ArrayAt {
                 dst: VReg(0),
-                site: 0,
-                args: Vec::new(),
+                arr: VReg(0),
+                idx: VReg(0),
+                klass: crate::compiler::ir::PoolLit(0),
+                fail: BlockId(0),
             },
         );
     }
