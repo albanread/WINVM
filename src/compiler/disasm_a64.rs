@@ -1127,6 +1127,12 @@ mod tests {
     /// here would name an instruction the emitter genuinely produced that
     /// this decoder can't, exactly the gap the corpus test approximates
     /// but this exercises against live codegen output.
+    // WINVM: this one disassembles whatever the DRIVER emitted, so once
+    // the x64 back end was wired in (Phase 3v) it started decoding x86-64
+    // bytes as AArch64 — which is how it caught the seam going live. The
+    // other tests in this module feed the decoder fixed A64 words and
+    // stay host-independent; only this one is target-coupled.
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn round_trips_a_real_compiled_method() {
         use crate::runtime::vm_state::{VmOptions, VmState};

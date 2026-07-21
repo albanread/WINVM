@@ -906,6 +906,41 @@ fn compile_method_full(
     } else {
         None
     };
+
+    // WINVM (Phase 3): the x64 back end covers a subset of the AArch64
+    // one. Decline what it cannot lower — the method stays interpreted,
+    // which is always correct — instead of emitting approximate code.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // An OSR compile is declined WITHOUT disabling the method: only
+        // the on-stack-replacement entry is unsupported, and the ordinary
+        // call-path compile of this same method may well succeed. This is
+        // the same fail-soft shape the OSR planner below already uses for
+        // a header it cannot resolve.
+        if osr_bci.is_some() {
+            if vm.options.trace.is_enabled("jit") {
+                eprintln!(
+                    "[jit] x64 back end has no OSR entry; declining OSR compile of {}",
+                    selector_string(method)
+                );
+            }
+            return None;
+        }
+        if let Some(reason) = x64_decline_reason(&ir_method, prim_shim) {
+            if vm.options.trace.is_enabled("jit") {
+                eprintln!(
+                    "[jit] x64 back end declines {}: {reason}",
+                    selector_string(method)
+                );
+            }
+            // Permanent: these gaps are properties of the back end, not
+            // of this run's type feedback, so a retry would decline
+            // again for the same reason.
+            method.set_compile_disabled();
+            return None;
+        }
+    }
+
     let guard = emit::EntryGuard {
         smi_klass_bits: vm.universe.smi_klass.oop().raw(),
         key_klass_bits: rcvr_klass.oop().raw(),
@@ -1119,6 +1154,79 @@ fn compile_method_full(
         reload_pos: req.reload_pos,
     });
     let frame_slots_for_osr = regalloc_result.frame_slots;
+
+    // WINVM (Phase 3, MIGRATION.md §4): back-end selection. The x64
+    // emitter covers a strict subset of the AArch64 one, and the three
+    // gaps are handled by DECLINING the compile above rather than
+    // approximating here — see `x64_decline_reason`. What remains is a
+    // shape adaptation: `emit_x64` returns a struct with `block_pcs`
+    // indexed by block and traps kept separate from call safepoints,
+    // where `emit::emit` returns a 6-tuple with both already merged.
+    #[cfg(not(target_arch = "aarch64"))]
+    let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs, osr_off) = {
+        // Unused on this path, and deliberately so: `emit_x64` takes only
+        // the three runtime addresses it can actually emit calls to. The
+        // six below all belong to ops it declines above (`FBox` and
+        // `VecArith` for the boxers, `prim_shim` for `call_primitive`,
+        // `NlrReturn` for `nlr_originate`), so plumbing them through
+        // `RuntimeAddrs` would add fields no emitted instruction reads.
+        // Each grows the struct when its op's lowering lands.
+        let _ = (
+            &mut asm,
+            box_double_addr,
+            box_float64x2_addr,
+            box_float32x4_addr,
+            box_int32x4_addr,
+            call_primitive_addr,
+            nlr_originate_addr,
+            &osr_req,
+        );
+        let em = crate::compiler::emit_x64::emit_x64(
+            &ir_method,
+            &regalloc_result,
+            crate::compiler::emit_x64::RuntimeAddrs {
+                stub_poll: stub_poll_addr,
+                must_be_boolean: must_be_boolean_addr,
+                alloc_slow: alloc_slow_addr,
+            },
+            if method.is_block() { None } else { Some(&guard) },
+        );
+        let block_pcs: Vec<emit::BlockPc> = em
+            .block_pcs
+            .iter()
+            .enumerate()
+            .map(|(i, &pc_off)| emit::BlockPc {
+                pc_off,
+                bci: ir_method.blocks[i].bci,
+            })
+            .collect();
+        // `build_deopt_metadata` keys EVERY deopt site off this list —
+        // uncommon traps included, which the AArch64 emitter reports in
+        // the same vector. Keeping them separate here would make a
+        // trapping method panic in `build_deopt_metadata` ("no emitted
+        // safepoint") rather than mis-compile, but the union is what the
+        // contract actually asks for.
+        let safepoint_pcs: Vec<emit::SafepointPc> = em
+            .safepoints
+            .iter()
+            .chain(em.trap_sites.iter())
+            .map(|t| emit::SafepointPc {
+                pc_off: t.pc_off,
+                bci: t.bci,
+                position: t.position,
+            })
+            .collect();
+        (
+            em.blob,
+            block_pcs,
+            em.verified_entry_off,
+            em.ic_sites,
+            safepoint_pcs,
+            None::<u32>,
+        )
+    };
+
+    #[cfg(target_arch = "aarch64")]
     let (blob, block_pcs, verified_entry_off, emitted_ic_sites, safepoint_pcs, osr_off) =
         emit::emit(
             &mut asm,
@@ -1437,6 +1545,41 @@ fn selector_string(method: MethodOop) -> String {
 /// unambiguous. `method_pool_ix` is a `0` placeholder until materialization
 /// (step 6) interns the compile-time method oop — leaving the pool
 /// untouched keeps existing listing goldens byte-stable.
+/// WINVM (Phase 3): why the x86-64 back end cannot compile this method,
+/// or `None` if it can.
+///
+/// Checked against [`emit_x64::SUPPORTED_OPS`] rather than against a
+/// hand-maintained list of "risky" method shapes, because that is the
+/// list `emit_x64` itself branches on: an op it does not lower panics
+/// with an "unsupported op" message. Consulting the same set here turns
+/// that panic — a compiler crash on a legal Smalltalk program — into a
+/// method that simply stays interpreted.
+///
+/// `prim_shim` is checked separately because it is not an IR op at all
+/// but an emitter *parameter*: `emit::emit` splices a primitive call into
+/// the prologue when asked, and `emit_x64` has no such parameter. A scan
+/// of the IR would never see it.
+#[cfg(not(target_arch = "aarch64"))]
+fn x64_decline_reason(
+    ir_method: &ir::IrMethod,
+    prim_shim: Option<(i64, u8)>,
+) -> Option<String> {
+    use crate::compiler::emit_x64::{ir_op_name, SUPPORTED_OPS};
+
+    if let Some((prim, _)) = prim_shim {
+        return Some(format!("primitive shim (prim {prim}) is not lowered on x64"));
+    }
+    for block in &ir_method.blocks {
+        for op in &block.code {
+            let name = ir_op_name(op);
+            if !SUPPORTED_OPS.contains(&name) {
+                return Some(format!("IR op `{name}` is not lowered on x64"));
+            }
+        }
+    }
+    None
+}
+
 fn build_deopt_metadata(
     ir_method: &ir::IrMethod,
     regalloc_result: &regalloc::RegallocResult,

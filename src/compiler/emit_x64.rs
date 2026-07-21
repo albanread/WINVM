@@ -1212,7 +1212,7 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
 
 /// The variant name of an `Ir`, for the unsupported-op panic. `Debug`'s
 /// full rendering would bury the name under every field.
-fn ir_op_name(op: &Ir) -> &'static str {
+pub fn ir_op_name(op: &Ir) -> &'static str {
     match op {
         Ir::ConstSmi { .. } => "ConstSmi",
         Ir::ConstPool { .. } => "ConstPool",
