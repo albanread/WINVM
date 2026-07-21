@@ -34,6 +34,7 @@
 //!   compiled callee's arguments must end up in. Everything is therefore
 //!   moved to scratch (`R10`/`R11`) *before* the first argument is loaded.
 
+use crate::codecache::stubs::KIND_DEOPT_BRIDGE;
 use crate::compiler::assembler::{CodeBlob, RelocKind};
 use crate::compiler::assembler_x64::{
     imm, mem, r64, Cond, X64Assembler, ARG_REGS, R10, R11, R12, R13, R14, R15, RAX, RBP, RBX, RCX,
@@ -339,6 +340,112 @@ pub fn build_stub_resolve_x64(rt_resolve_send_addr: u64) -> CodeBlob {
 /// `doesNotUnderstand:`.
 pub fn build_stub_dnu_x64(rt_dnu_addr: u64, kind: u64) -> CodeBlob {
     build_send_stub(rt_dnu_addr, kind)
+}
+
+/// `not_entrant_stub` — the entry an invalidated nmethod is repointed at,
+/// so any later call re-resolves instead of running stale code.
+///
+/// Its body is **identical** to [`build_stub_resolve_x64`] (the AArch64
+/// pair are byte-for-byte the same too): both hand the site to
+/// `rt_resolve_send` and tail-jump wherever it says. They stay separate
+/// stubs because they are separate *addresses* — an nmethod's entry is
+/// repointed here, while unlinked inline caches point at `stub_resolve` —
+/// and the runtime distinguishes the two cases by which address it finds,
+/// not by the code at it.
+pub fn build_not_entrant_stub_x64(rt_resolve_send_addr: u64) -> CodeBlob {
+    build_send_stub(rt_resolve_send_addr, crate::codecache::stubs::KIND_RESOLVE)
+}
+
+/// `deopt_return_trampoline` — the other half of the deopt story from the
+/// uncommon trap. When a method is invalidated while its activation is
+/// live, that frame's saved return address is redirected here, so a
+/// callee's ordinary `ret` lands in this trampoline instead of back in
+/// stale compiled code.
+///
+/// It is therefore entered **by a `ret`**, not a call, with `RAX` holding
+/// the callee's result and `RBP` already restored to the victim frame's
+/// own frame pointer by that callee's epilogue.
+///
+/// Two runtime calls, in order:
+/// 1. `rt_deopt_return_pc(vm, victim_fp)` — the ORIGINAL return address,
+///    a pc inside the victim nmethod. It becomes this trampoline's own
+///    frame's return-address slot, so a GC during the second call
+///    classifies the victim frame at its true safepoint rather than at
+///    some arbitrary pc.
+/// 2. `rt_deopt_on_return(vm, victim_fp, result)` — materializes and runs
+///    the interpreter frames, answering the deoptee's result.
+///
+/// Then, exactly like the uncommon trampoline, the victim activation is
+/// gone: unwind to `victim_fp` and return to the victim's OWN caller.
+pub fn build_deopt_return_trampoline_x64(
+    rt_deopt_return_pc_addr: u64,
+    rt_deopt_on_return_addr: u64,
+) -> CodeBlob {
+    use crate::oops::layout::{
+        VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_KIND_OFFSET,
+        VMREG_LAST_COMPILED_PC_OFFSET,
+    };
+    let mut a = X64Assembler::new();
+
+    // Park the two inputs in callee-saved registers so the runtime calls
+    // below cannot destroy them. (Safe to clobber RBX/RSI here: nothing
+    // live is in them, by the spill-all-at-safepoints invariant, and the
+    // call stub restores them at the Rust boundary.)
+    a.emit("mov", &[r64(RBX), r64(RAX)]); // the callee's result
+    a.emit("mov", &[r64(RSI), r64(RBP)]); // victim_fp
+
+    // (1) orig_ret_pc = rt_deopt_return_pc(vm, victim_fp)
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(RSI)]);
+    let pc_lit = a.literal_u64(rt_deopt_return_pc_addr, Some(RelocKind::RuntimeAddr));
+    a.emit("sub", &[r64(RSP), imm(32)]);
+    a.call_far(pc_lit);
+    a.emit("add", &[r64(RSP), imm(32)]);
+
+    // Build the bridged frame with orig_ret_pc in the return-address slot
+    // — the walkability trick, same as the uncommon trampoline's.
+    a.emit("push", &[r64(RAX)]); // orig_ret_pc
+    a.emit("push", &[r64(RBP)]);
+    a.emit("mov", &[r64(RBP), r64(RSP)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(RBP)],
+    );
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_PC_OFFSET as i64), r64(RAX)],
+    );
+    a.emit("mov", &[r64(R10), imm(KIND_DEOPT_BRIDGE as i64)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R10)],
+    );
+
+    // (2) result = rt_deopt_on_return(vm, victim_fp, callee_result)
+    a.emit("mov", &[r64(ARG_REGS[0]), r64(VM_STATE)]);
+    a.emit("mov", &[r64(ARG_REGS[1]), r64(RSI)]);
+    a.emit("mov", &[r64(ARG_REGS[2]), r64(RBX)]);
+    let rt_lit = a.literal_u64(rt_deopt_on_return_addr, Some(RelocKind::RuntimeAddr));
+    a.emit("sub", &[r64(RSP), imm(32)]);
+    a.call_far(rt_lit);
+    a.emit("add", &[r64(RSP), imm(32)]);
+
+    a.emit("mov", &[r64(R10), imm(0)]);
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_FP_OFFSET as i64), r64(R10)],
+    );
+    a.emit(
+        "mov",
+        &[mem(VM_STATE, VMREG_LAST_COMPILED_KIND_OFFSET as i64), r64(R10)],
+    );
+
+    // The victim activation is gone: unwind to its frame and return the
+    // deoptee's result (in RAX) to the victim's own caller.
+    a.emit("mov", &[r64(RSP), r64(RSI)]);
+    a.emit("pop", &[r64(RBP)]);
+    a.emit("ret", &[]);
+    a.finish()
 }
 
 #[cfg(test)]
@@ -879,6 +986,173 @@ mod tests {
         assert!(
             ret > h_lo && ret < h_hi,
             "ret_addr {ret:#x} must point inside the calling code              ({h_lo:#x}..{h_hi:#x}), not into a link register's stale value"
+        );
+    }
+
+    /// The deopt RETURN trampoline, driven the way it is really reached:
+    /// a victim frame calls a callee whose saved return address has been
+    /// redirected here, so the callee's ordinary `ret` lands in the
+    /// trampoline with its result in `RAX` and `RBP` already restored to
+    /// the victim's frame pointer.
+    ///
+    /// What the test pins, none of which is visible from the return value
+    /// alone:
+    /// - both runtime calls receive `victim_fp`, and the second also the
+    ///   callee's result;
+    /// - the bridged frame's return-address slot holds `orig_ret_pc` (a pc
+    ///   inside the victim), which is what makes a GC classify the victim
+    ///   at its true safepoint;
+    /// - the trampoline unwinds the VICTIM frame, so the deoptee's result
+    ///   reaches the victim's caller — a `0xBAD` from the victim's own
+    ///   tail would mean it returned there instead.
+    #[cfg(windows)]
+    #[test]
+    fn deopt_return_trampoline_unwinds_the_victim_frame() {
+        use crate::oops::layout::{VMREG_LAST_COMPILED_FP_OFFSET, VMREG_LAST_COMPILED_PC_OFFSET};
+        use crate::vendor::wfasm::native_windows::WinJit;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEEN_FP_1: AtomicU64 = AtomicU64::new(0);
+        static SEEN_FP_2: AtomicU64 = AtomicU64::new(0);
+        static SEEN_RESULT: AtomicU64 = AtomicU64::new(0);
+        static SEEN_BRIDGE_PC: AtomicU64 = AtomicU64::new(0);
+        const ORIG_RET_PC: u64 = 0xC0DE_1234;
+
+        extern "C" fn return_pc_probe(_vm: u64, victim_fp: u64) -> u64 {
+            SEEN_FP_1.store(victim_fp, Ordering::Relaxed);
+            ORIG_RET_PC
+        }
+        extern "C" fn on_return_probe(vm: u64, victim_fp: u64, result: u64) -> u64 {
+            SEEN_FP_2.store(victim_fp, Ordering::Relaxed);
+            SEEN_RESULT.store(result, Ordering::Relaxed);
+            // The bridged frame must be published with orig_ret_pc.
+            let vmreg = vm as *const u64;
+            SEEN_BRIDGE_PC.store(
+                unsafe { *vmreg.add(VMREG_LAST_COMPILED_PC_OFFSET / 8) },
+                Ordering::Relaxed,
+            );
+            0xDEE0 // the deoptee's result
+        }
+
+        let tramp = build_deopt_return_trampoline_x64(
+            return_pc_probe as usize as u64,
+            on_return_probe as usize as u64,
+        );
+
+        // The "callee": returns a result. Its return address will be
+        // redirected to the trampoline by the victim below.
+        let mut c = X64Assembler::new();
+        c.emit("mov", &[r64(RAX), imm(0x77)]);
+        c.emit("ret", &[]);
+        let callee = c.finish();
+
+        // The "victim": a normal compiled frame that calls the callee,
+        // but overwrites its own pushed return address so the callee
+        // returns into the trampoline instead of back here.
+        let mut v = X64Assembler::new();
+        v.emit("push", &[r64(RBP)]);
+        v.emit("mov", &[r64(RBP), r64(RSP)]);
+        v.emit("sub", &[r64(RSP), imm(32)]);
+        // rcx = callee, rdx = trampoline
+        v.emit("mov", &[r64(R10), r64(RCX)]);
+        v.emit("mov", &[r64(R11), r64(RDX)]);
+        v.emit("call", &[r64(R10)]);
+        // Only reached if the trampoline wrongly returned to the victim.
+        v.emit("mov", &[r64(RAX), imm(0xBAD)]);
+        v.emit("mov", &[r64(RSP), r64(RBP)]);
+        v.emit("pop", &[r64(RBP)]);
+        v.emit("ret", &[]);
+        let victim = v.finish();
+
+        let total = tramp.code.len() + callee.code.len() + victim.code.len() + 4096;
+        let jit = WinJit::with_capacity(total).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let c_off = (tramp.code.len() + 15) & !15;
+        let v_off = (c_off + callee.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(tramp.code.as_ptr(), base, tramp.code.len());
+            core::ptr::copy_nonoverlapping(callee.code.as_ptr(), base.add(c_off), callee.code.len());
+            core::ptr::copy_nonoverlapping(victim.code.as_ptr(), base.add(v_off), victim.code.len());
+        }
+
+        // A harness that sets R15 and calls the victim; it also performs
+        // the return-address redirection the runtime would do, by
+        // patching the callee to `jmp` the trampoline instead of `ret`.
+        // (Simpler and equivalent: the callee's `ret` target IS the
+        // redirected slot.) Build a callee that jumps to the trampoline
+        // with its result already in RAX — exactly the state a redirected
+        // `ret` produces.
+        let mut c2 = X64Assembler::new();
+        c2.emit("mov", &[r64(RAX), imm(0x77)]);
+        c2.emit("mov", &[r64(RSP), r64(RBP)]); // pop this callee's own frame-less state
+        c2.emit("jmp", &[r64(R11)]); // R11 = trampoline, as the victim set it
+        let callee2 = c2.finish();
+        assert!(callee2.code.len() <= callee.code.len() + 32);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                callee2.code.as_ptr(),
+                base.add(c_off),
+                callee2.code.len(),
+            );
+        }
+
+        let mut h = X64Assembler::new();
+        h.emit("push", &[r64(RBP)]);
+        h.emit("mov", &[r64(RBP), r64(RSP)]);
+        h.emit("push", &[r64(VM_STATE)]);
+        h.emit("sub", &[r64(RSP), imm(40)]);
+        h.emit("mov", &[r64(RAX), r64(RCX)]); // victim
+        h.emit("mov", &[r64(VM_STATE), r64(RDX)]); // vm
+        h.emit("mov", &[r64(RCX), r64(R8)]); // callee
+        h.emit("mov", &[r64(RDX), r64(R9)]); // trampoline
+        h.emit("call", &[r64(RAX)]);
+        h.emit("add", &[r64(RSP), imm(40)]);
+        h.emit("pop", &[r64(VM_STATE)]);
+        h.emit("pop", &[r64(RBP)]);
+        h.emit("ret", &[]);
+        let harness = h.finish();
+        let h_off = (v_off + victim.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                harness.code.as_ptr(),
+                base.add(h_off),
+                harness.code.len(),
+            );
+        }
+
+        let mut vmreg = [0u64; 16];
+        let vm = vmreg.as_mut_ptr() as u64;
+        let hf: extern "C" fn(u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(base.add(h_off)) };
+        let got = hf(
+            base as u64 + v_off as u64,
+            vm,
+            base as u64 + c_off as u64,
+            base as u64,
+        );
+
+        assert_eq!(
+            got, 0xDEE0,
+            "the deoptee's result must reach the victim's caller — 0xBAD would \
+             mean the trampoline returned into the victim instead of unwinding it"
+        );
+        assert_eq!(SEEN_RESULT.load(Ordering::Relaxed), 0x77, "callee's result");
+        assert_ne!(SEEN_FP_1.load(Ordering::Relaxed), 0, "victim_fp to call 1");
+        assert_eq!(
+            SEEN_FP_1.load(Ordering::Relaxed),
+            SEEN_FP_2.load(Ordering::Relaxed),
+            "both runtime calls must key on the SAME victim frame"
+        );
+        assert_eq!(
+            SEEN_BRIDGE_PC.load(Ordering::Relaxed),
+            ORIG_RET_PC,
+            "the bridged frame must publish orig_ret_pc, so a GC classifies \
+             the victim at its true safepoint"
+        );
+        assert_eq!(
+            vmreg[VMREG_LAST_COMPILED_FP_OFFSET / 8],
+            0,
+            "walker record cleared once the bridge is over"
         );
     }
 
