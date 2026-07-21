@@ -254,9 +254,42 @@ relative-to-C ratios.
   Richards ×10 = 1135 ms — the tier-1 x64 backend (Phase 3) is where the
   Mac's 30–53× lives. FFI `dispatch_ffi_primitive` guest-fatals cleanly
   on non-ARM64 until then.
-- **Next (Phase 2):** re-vendor JASM's x64 `rasm` encoder + Windows
-  `NativeJit`, VEH-based trap plumbing from `seh.rs`, code-cache region
-  on the x64 reloc kinds.
+- **2026-07-21 — M2 done (Phase 2, the JIT substrate).** Three commits:
+  - **Encoder.** Vendored JASM's native x86-64 `rasm` encoder into
+    `src/vendor/wfasm/rasm/` (byte-identical to upstream modulo header +
+    crate paths); 20 encoder tests pass.
+  - **Loader + relocations.** `WinJit` (the `native_windows.rs` twin of
+    `MacJit`) now assembles via `rasm` and relocates via new
+    `relocpatch::patch_relocs_x64` (rel32 in place; far branches through
+    `movabs rax ; jmp rax` stubs; `Abs64`). It **executes native x64** —
+    proven by leaf, internal-call, and host-extern-callback tests.
+  - **Trap layer.** An x86-64 Vectored Exception Handler
+    (`deopt_trap::veh_trap_handler`) mirrors the macOS SIGTRAP path:
+    trap site = `int3` + imm16, trap-pc stashed in **R10** (the x16
+    analogue), classify→redirect→resume. `veh_redirect_smoke` round-trips
+    `int3 → VEH → trampoline → resume` — **the M2 acceptance gate.**
+  - **Windows is simpler here, as predicted:** no `MAP_JIT`, no per-thread
+    W^X toggle, no icache invalidation; foreign `int3` passes through the
+    VEH for free (no `SIG_DFL` restore dance).
+  - `cargo test --lib` is **green on Windows: 655 passed, 0 failed.** The
+    world interpreter is unchanged (5891/0). A `.gitattributes` pins LF so
+    scripted edits stay byte-clean.
+  - **Test gating (all macOS/aarch64-only, re-enabled per phase):** tier-1
+    compile+execute tests (`target_arch = "aarch64"`); signal-based fault
+    recovery + real-FFI (`mmap`/`getpid`) tests and the embedded-VmHandle
+    integration suite (`embed::tests`) (`target_os = "macos"`); the 16 KiB
+    Apple-page commit assertion.
+  - **Known Phase-2 follow-up:** Windows guest-fatal recovery. My
+    `sigsetjmp`/`siglongjmp` are stubs, so an embedded `VmHandle` cannot yet
+    catch a guest `error:`/DNU/FFI-fault as a message (it would `process::
+    exit`). The macOS path uses `siglongjmp` specifically to cross JIT
+    frames; the interpreter-only Windows build has none yet, so a Rust
+    `catch_unwind`-based recovery is viable and is the intended fix before
+    tier-1 lands.
+- **Next (Phase 3):** the x64 compiler back end — `assembler.rs` operand
+  DSL over `rasm`, `regalloc.rs` (7-reg pool, two-address form),
+  `emit.rs` op-by-op, `stubs.rs`/`adapters.rs` in x64. This turns the JIT
+  on and re-enables the gated tier-1 and FFI test surface.
 
 ## 7. What deliberately does *not* change
 

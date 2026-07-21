@@ -1,0 +1,8 @@
+# WINVM: the tree is authored with LF endings (seeded from MACVM on macOS).
+# Keep it that way on Windows checkouts so scripted edits and diffs stay
+# clean — Rust/toml/markdown are LF, never autoconverted to CRLF.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
