@@ -137,6 +137,30 @@ impl Cond {
         }
     }
 
+    /// The `cmovcc` mnemonic for this condition — a branchless select,
+    /// which is how `SmiCmpVal` materializes a boolean.
+    pub fn cmov(self) -> &'static str {
+        // `jcc()` is "j" + suffix and `cmovcc` is "cmov" + the same
+        // suffix, so derive one from the other rather than repeating the
+        // table (and risking the two drifting apart).
+        match self {
+            Cond::E => "cmove",
+            Cond::Ne => "cmovne",
+            Cond::L => "cmovl",
+            Cond::Le => "cmovle",
+            Cond::G => "cmovg",
+            Cond::Ge => "cmovge",
+            Cond::B => "cmovb",
+            Cond::Be => "cmovbe",
+            Cond::A => "cmova",
+            Cond::Ae => "cmovae",
+            Cond::O => "cmovo",
+            Cond::No => "cmovno",
+            Cond::S => "cmovs",
+            Cond::Ns => "cmovns",
+        }
+    }
+
     /// The condition that is true exactly when this one is false — for
     /// inverting a branch when the emitter wants fallthrough on the other
     /// side.
@@ -201,6 +225,22 @@ pub fn mem(base: u8, disp: i64) -> Operand {
         rip_sym: None,
     })
 }
+/// `byte ptr [base + disp]` — the write barrier's card store is the only
+/// sub-word access the emitter makes.
+pub fn mem_byte(base: u8, disp: i64) -> Operand {
+    Operand::Mem(Mem {
+        size: Some(MemSize::Byte),
+        base: Some(Reg {
+            class: RegClass::R64,
+            num: base,
+        }),
+        index: None,
+        scale: 1,
+        disp,
+        rip_sym: None,
+    })
+}
+
 /// `qword ptr [base + index*scale + disp]` — indexed object/array access.
 pub fn mem_index(base: u8, index: u8, scale: u8, disp: i64) -> Operand {
     debug_assert!(

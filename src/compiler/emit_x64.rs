@@ -47,7 +47,8 @@
 
 use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
 use crate::compiler::assembler_x64::{
-    imm, mem, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RSP, SCRATCH0, SCRATCH1,
+    imm, mem, mem_byte, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP, SCRATCH0,
+    SCRATCH1, VM_STATE,
 };
 use crate::compiler::ir::{BlockId, CmpOp, GuardShape, Ir, IrMethod, PoolLit, SmiOp, VReg};
 use crate::compiler::regalloc::{Assignment, RegallocResult, SpillSlot};
@@ -64,9 +65,13 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "GuardKlass",
     "SmiArith",
     "SmiCmpBr",
+    "SmiCmpVal",
+    "StoreField",
+    "BoolBr",
     "Jump",
     "UncommonTrap",
     "Ret",
+    "RetSelf",
     "Bailout",
 ];
 
@@ -201,6 +206,62 @@ impl<'a> Emitter<'a> {
         self.asm.emit("test", &[r64(reg), imm(3)]);
         let target = self.labels[fail.0 as usize];
         self.asm.jcc(Cond::Ne, target);
+    }
+
+    /// The generational write barrier: dirty the card covering a stored
+    /// field, but only when the store actually creates an old→young
+    /// reference. Three early-outs, in the AArch64 emitter's order and for
+    /// the same reasons — each is cheaper than the one after it:
+    ///
+    /// 1. **`obj` is young** (below `old_start`) — a young object is
+    ///    scanned wholesale by the scavenger, so it needs no card.
+    /// 2. **`val` is a smi** — an immediate is not a reference at all.
+    /// 3. **`val` is old** (at or above `old_start`) — an old→old
+    ///    reference does not concern a young collection.
+    ///
+    /// Only a store that survives all three marks its card. `CARD_DIRTY`
+    /// is 0, so the mark is a byte store of zero (the A64 side stores the
+    /// zero register; x86 stores an immediate).
+    ///
+    /// `biased` is the already-tag-adjusted field displacement, so the
+    /// card index is computed from the true field address.
+    fn emit_write_barrier(&mut self, robj: u8, rval: u8, biased: i64) {
+        let skip = self.asm.new_label();
+        // old_start, read live from the VM register block.
+        self.asm.emit(
+            "mov",
+            &[
+                r64(RAX),
+                mem(VM_STATE, crate::oops::layout::VMREG_OLD_START_OFFSET as i64),
+            ],
+        );
+        self.asm.emit("cmp", &[r64(robj), r64(RAX)]);
+        self.asm.jcc(Cond::B, skip); // obj younger than old_start
+        self.asm.emit("test", &[r64(rval), imm(3)]);
+        self.asm.jcc(Cond::E, skip); // val is a smi
+        self.asm.emit("cmp", &[r64(rval), r64(RAX)]);
+        self.asm.jcc(Cond::Ae, skip); // val is old too
+
+        // card_index = (obj + biased) >> CARD_SHIFT, then dirty the byte
+        // at card_base_biased + card_index.
+        self.asm.emit("lea", &[r64(SCRATCH0), mem(robj, biased)]);
+        self.asm.emit(
+            "shr",
+            &[r64(SCRATCH0), imm(crate::memory::cards::CARD_SHIFT as i64)],
+        );
+        self.asm.emit(
+            "mov",
+            &[
+                r64(RAX),
+                mem(
+                    VM_STATE,
+                    crate::oops::layout::VMREG_CARD_BASE_BIASED_OFFSET as i64,
+                ),
+            ],
+        );
+        self.asm.emit("add", &[r64(RAX), r64(SCRATCH0)]);
+        self.asm.emit("mov", &[mem_byte(RAX, 0), imm(0)]); // CARD_DIRTY == 0
+        self.asm.bind(skip);
     }
 
     /// A klass guard (`GuardShape::KlassTest`): the object must be a heap
@@ -407,7 +468,14 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
         Ir::LoadField { dst, obj, byte_off } => {
             let o = e.read_into(*obj, SCRATCH0);
             let d = e.def_reg(*dst, SCRATCH1);
-            e.asm.emit("mov", &[r64(d), mem(o, *byte_off as i64)]);
+            // A heap oop's word is its address biased by MEM_TAG, so the
+            // field displacement is biased too — exactly as `StoreField`
+            // and `LoadKlass` do it. (This bias was missing when the op
+            // first landed; `compiled_store_field_writes_through_the_tag_
+            // bias` is the test that caught it, by reading back a field it
+            // had just written and getting a value shifted by one byte.)
+            let biased = *byte_off as i64 - crate::oops::layout::MEM_TAG as i64;
+            e.asm.emit("mov", &[r64(d), mem(o, biased)]);
             e.store_def(*dst, d);
         }
 
@@ -476,6 +544,82 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm.jcc(cmp_cond(*cop), t);
             let f = e.labels[if_false.0 as usize];
             e.asm.jmp(f);
+        }
+
+        Ir::StoreField {
+            obj,
+            byte_off,
+            val,
+            barrier,
+        } => {
+            let o = e.read_into(*obj, SCRATCH0);
+            let v = e.read_into(*val, SCRATCH1);
+            // A heap oop's word is the address biased by MEM_TAG, so every
+            // field offset is biased too — the same `- 1` the A64 emitter
+            // folds into its `stur` displacement.
+            let biased = *byte_off as i64 - crate::oops::layout::MEM_TAG as i64;
+            e.asm.emit("mov", &[mem(o, biased), r64(v)]);
+            if *barrier {
+                e.emit_write_barrier(o, v, biased);
+            }
+        }
+
+        Ir::SmiCmpVal {
+            op: cop,
+            dst,
+            a,
+            b,
+            fail,
+        } => {
+            let ra = e.read_into(*a, SCRATCH0);
+            let rb = e.read_into(*b, SCRATCH1);
+            e.emit_smi_guard(ra, *fail);
+            e.emit_smi_guard(rb, *fail);
+            e.asm.emit("cmp", &[r64(ra), r64(rb)]);
+            // Branchless select, the `csel` analogue: load false into the
+            // destination, true into a scratch, then conditionally move.
+            // `cmp` writes no register, so both scratches are free again
+            // regardless of what they held for the operands.
+            let d = e.def_reg(*dst, RAX);
+            let false_lit = e.literal_ids[e.method.false_lit.0 as usize];
+            let true_lit = e.literal_ids[e.method.true_lit.0 as usize];
+            e.asm.load_literal(d, false_lit);
+            e.asm.load_literal(SCRATCH0, true_lit);
+            e.asm
+                .emit(cmp_cond(*cop).cmov(), &[r64(d), r64(SCRATCH0)]);
+            e.store_def(*dst, d);
+        }
+
+        Ir::BoolBr {
+            val,
+            if_true,
+            if_false,
+            not_bool,
+        } => {
+            let rv = e.read_into(*val, SCRATCH0);
+            // Compare against the canonical true/false oops. Anything else
+            // is not a boolean and takes the `not_bool` edge — Smalltalk
+            // requires `ifTrue:` on a non-boolean to raise, not to coerce.
+            let true_lit = e.literal_ids[e.method.true_lit.0 as usize];
+            e.asm.load_literal(SCRATCH1, true_lit);
+            e.asm.emit("cmp", &[r64(rv), r64(SCRATCH1)]);
+            let t = e.labels[if_true.0 as usize];
+            e.asm.jcc(Cond::E, t);
+            let false_lit = e.literal_ids[e.method.false_lit.0 as usize];
+            e.asm.load_literal(SCRATCH1, false_lit);
+            e.asm.emit("cmp", &[r64(rv), r64(SCRATCH1)]);
+            let f = e.labels[if_false.0 as usize];
+            e.asm.jcc(Cond::E, f);
+            let nb = e.labels[not_bool.0 as usize];
+            e.asm.jmp(nb);
+        }
+
+        Ir::RetSelf => {
+            // The receiver lives in its pinned register for the whole
+            // activation, so returning self is just a move.
+            e.asm.emit("mov", &[r64(RAX), r64(RECEIVER)]);
+            let ep = e.epilogue;
+            e.asm.jmp(ep);
         }
 
         Ir::Jump { target } => {
@@ -1130,6 +1274,329 @@ mod tests {
             got,
             entry + trap_off as u64,
             "the VEH must decode the emitted trap site and stash its pc in R10"
+        );
+    }
+
+    /// `StoreField` without a barrier writes through the tag bias, so the
+    /// value lands in the slot `LoadField` would read back.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_store_field_writes_through_the_tag_bias() {
+        use crate::oops::layout::MEM_TAG;
+        let mut obj = [0u64; 4];
+        let tagged = obj.as_ptr() as u64 | MEM_TAG;
+        // Store arg1 into field at byte_off 24, then read it back.
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::Param {
+                        dst: VReg(1),
+                        index: 1,
+                    },
+                    Ir::StoreField {
+                        obj: VReg(0),
+                        byte_off: 24,
+                        val: VReg(1),
+                        barrier: false,
+                    },
+                    Ir::LoadField {
+                        dst: VReg(2),
+                        obj: VReg(0),
+                        byte_off: 24,
+                    },
+                    Ir::Ret { val: VReg(2) },
+                ],
+            )],
+            oops(3),
+            2,
+        );
+        assert_eq!(compile_and_run(&m, tagged, smi(77)), smi(77));
+        // The write really landed in the object, at the biased offset:
+        // word index 3 == byte 24 from the untagged base.
+        assert_eq!(obj[3], smi(77));
+        let _ = &mut obj;
+    }
+
+    /// The generational write barrier, executed against a stand-in VM
+    /// register block. Only an old→young store may dirty a card; each of
+    /// the three early-outs is checked by giving it a case that must NOT
+    /// mark. A barrier that marked unconditionally would still "work"
+    /// functionally — it would just quietly destroy scavenge performance —
+    /// so the negative cases are the point of this test.
+    ///
+    /// Driven through the call stub because the barrier reads `old_start`
+    /// and `card_base` through the pinned `R15`, which is exactly what the
+    /// stub establishes.
+    #[cfg(windows)]
+    #[test]
+    fn write_barrier_marks_only_old_to_young_stores() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::oops::layout::{MEM_TAG, VMREG_CARD_BASE_BIASED_OFFSET, VMREG_OLD_START_OFFSET};
+        use crate::memory::cards::CARD_SHIFT;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // A card table, and a VM register block pointing at it. `old_start`
+        // is chosen so we can place objects deliberately on either side.
+        let mut cards = vec![0xFFu8; 1 << 12];
+        // Objects: `old` sits above old_start, `young` below it.
+        let mut old_obj = [0u64; 4];
+        let mut young_obj = [0u64; 4];
+        let old_addr = old_obj.as_ptr() as u64;
+        let young_addr = young_obj.as_ptr() as u64;
+        // Pick old_start between them so the classification is real. The
+        // allocator gives no ordering guarantee, so derive it rather than
+        // assuming which address is lower.
+        let (lo, hi) = if old_addr < young_addr {
+            (young_addr, old_addr)
+        } else {
+            (old_addr, young_addr)
+        };
+        // `lo` is the higher address -> treat it as "old"; place old_start
+        // just below it so `hi` classifies as young.
+        let old_start = lo;
+        let (old_addr, young_addr) = (lo, hi);
+        let old_obj_p = old_addr as *mut u64;
+        let young_obj_p = young_addr as *mut u64;
+
+        // card_base_biased: the table base minus (old_start >> CARD_SHIFT),
+        // so `card_base_biased + (addr >> CARD_SHIFT)` indexes the table.
+        let card_base_biased =
+            cards.as_mut_ptr() as u64 - ((old_start >> CARD_SHIFT) as u64);
+        let mut vmreg = [0u64; 8];
+        vmreg[VMREG_OLD_START_OFFSET / 8] = old_start;
+        vmreg[VMREG_CARD_BASE_BIASED_OFFSET / 8] = card_base_biased;
+
+        // A method that stores arg1 into arg0's field 24, with a barrier.
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::Param {
+                        dst: VReg(0),
+                        index: 0,
+                    },
+                    Ir::Param {
+                        dst: VReg(1),
+                        index: 1,
+                    },
+                    Ir::StoreField {
+                        obj: VReg(0),
+                        byte_off: 24,
+                        val: VReg(1),
+                        barrier: true,
+                    },
+                    Ir::ConstSmi {
+                        dst: VReg(2),
+                        value: 0,
+                    },
+                    Ir::Ret { val: VReg(2) },
+                ],
+            )],
+            oops(3),
+            2,
+        );
+        let blob = emit_x64(&m, &regalloc(&m)).blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let vm = vmreg.as_ptr() as u64;
+
+        // Hoisted to a plain integer so the closure holds no borrow of
+        // `cards` (which the assertions below mutate).
+        let cards_base = cards.as_ptr() as usize;
+        let card_of = |addr: u64| -> usize {
+            ((card_base_biased + ((addr + 24 - MEM_TAG) >> CARD_SHIFT)) as usize) - cards_base
+        };
+
+        // 1. old object ← young pointer: MUST mark.
+        let idx = card_of(old_addr);
+        cards[idx] = 0xFF;
+        let argv = [old_addr | MEM_TAG, young_addr | MEM_TAG];
+        unsafe { stub_fn(entry, vm, argv.as_ptr(), 2) };
+        assert_eq!(cards[idx], 0, "old <- young must dirty the card");
+
+        // 2. young object ← young pointer: must NOT mark (obj is young).
+        let idx_y = card_of(young_addr);
+        cards[idx_y] = 0xFF;
+        let argv = [young_addr | MEM_TAG, young_addr | MEM_TAG];
+        unsafe { stub_fn(entry, vm, argv.as_ptr(), 2) };
+        assert_eq!(cards[idx_y], 0xFF, "a young object needs no card");
+
+        // 3. old object ← smi: must NOT mark (not a reference).
+        cards[idx] = 0xFF;
+        let argv = [old_addr | MEM_TAG, smi(42)];
+        unsafe { stub_fn(entry, vm, argv.as_ptr(), 2) };
+        assert_eq!(cards[idx], 0xFF, "a smi is not a reference");
+
+        // 4. old object ← old pointer: must NOT mark (old->old).
+        cards[idx] = 0xFF;
+        let argv = [old_addr | MEM_TAG, old_addr | MEM_TAG];
+        unsafe { stub_fn(entry, vm, argv.as_ptr(), 2) };
+        assert_eq!(cards[idx], 0xFF, "old -> old does not concern a scavenge");
+
+        // Keep the backing storage alive for the whole test.
+        unsafe {
+            let _ = core::ptr::read_volatile(old_obj_p);
+            let _ = core::ptr::read_volatile(young_obj_p);
+        }
+        let _ = (&mut old_obj, &mut young_obj);
+    }
+
+    /// `SmiCmpVal` materializes a boolean branchlessly via `cmov`, picking
+    /// the canonical true/false oops out of the literal pool.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_smi_cmp_val_selects_the_right_boolean() {
+        use crate::compiler::ir::PoolEntry;
+        const TRUE_OOP: u64 = 0x1111_0001;
+        const FALSE_OOP: u64 = 0x2222_0001;
+
+        let mut m = hand_method(
+            vec![
+                block(
+                    0,
+                    vec![
+                        Ir::Param {
+                            dst: VReg(0),
+                            index: 0,
+                        },
+                        Ir::Param {
+                            dst: VReg(1),
+                            index: 1,
+                        },
+                        Ir::SmiCmpVal {
+                            op: CmpOp::Lt,
+                            dst: VReg(2),
+                            a: VReg(0),
+                            b: VReg(1),
+                            fail: BlockId(1),
+                        },
+                        Ir::Ret { val: VReg(2) },
+                    ],
+                ),
+                block(
+                    1,
+                    vec![Ir::Bailout {
+                        reason: BailoutReason::SmiOpFailed,
+                    }],
+                ),
+            ],
+            oops(3),
+            2,
+        );
+        // Pool slot 0 = true, slot 1 = false; point the method at them.
+        m.pool = vec![
+            PoolEntry {
+                value: TRUE_OOP,
+                kind: Some(RelocKind::Oop),
+            },
+            PoolEntry {
+                value: FALSE_OOP,
+                kind: Some(RelocKind::Oop),
+            },
+        ];
+        m.true_lit = PoolLit(0);
+        m.false_lit = PoolLit(1);
+
+        assert_eq!(compile_and_run(&m, smi(3), smi(9)), TRUE_OOP, "3 < 9");
+        assert_eq!(compile_and_run(&m, smi(9), smi(3)), FALSE_OOP, "9 < 3");
+        assert_eq!(compile_and_run(&m, smi(4), smi(4)), FALSE_OOP, "4 < 4");
+        assert_eq!(compile_and_run(&m, smi(-9), smi(-3)), TRUE_OOP, "-9 < -3");
+    }
+
+    /// `BoolBr` takes the true edge on the canonical true oop, the false
+    /// edge on false, and the `not_bool` edge on ANYTHING else — Smalltalk
+    /// requires `ifTrue:` on a non-boolean to raise, never to coerce.
+    #[cfg(windows)]
+    #[test]
+    fn compiled_bool_br_rejects_non_booleans() {
+        use crate::compiler::ir::PoolEntry;
+        const TRUE_OOP: u64 = 0x1111_0001;
+        const FALSE_OOP: u64 = 0x2222_0001;
+
+        let mut m = hand_method(
+            vec![
+                block(
+                    0,
+                    vec![
+                        Ir::Param {
+                            dst: VReg(0),
+                            index: 0,
+                        },
+                        Ir::BoolBr {
+                            val: VReg(0),
+                            if_true: BlockId(1),
+                            if_false: BlockId(2),
+                            not_bool: BlockId(3),
+                        },
+                    ],
+                ),
+                block(
+                    1,
+                    vec![
+                        Ir::ConstSmi {
+                            dst: VReg(1),
+                            value: 1,
+                        },
+                        Ir::Ret { val: VReg(1) },
+                    ],
+                ),
+                block(
+                    2,
+                    vec![
+                        Ir::ConstSmi {
+                            dst: VReg(1),
+                            value: 2,
+                        },
+                        Ir::Ret { val: VReg(1) },
+                    ],
+                ),
+                block(
+                    3,
+                    vec![Ir::Bailout {
+                        reason: BailoutReason::SmiOpFailed,
+                    }],
+                ),
+            ],
+            oops(2),
+            1,
+        );
+        m.pool = vec![
+            PoolEntry {
+                value: TRUE_OOP,
+                kind: Some(RelocKind::Oop),
+            },
+            PoolEntry {
+                value: FALSE_OOP,
+                kind: Some(RelocKind::Oop),
+            },
+        ];
+        m.true_lit = PoolLit(0);
+        m.false_lit = PoolLit(1);
+
+        assert_eq!(compile_and_run(&m, TRUE_OOP, 0), smi(1));
+        assert_eq!(compile_and_run(&m, FALSE_OOP, 0), smi(2));
+        assert_eq!(
+            compile_and_run(&m, smi(7), 0),
+            BAILOUT_SENTINEL,
+            "a smi is not a boolean"
+        );
+        assert_eq!(
+            compile_and_run(&m, 0x9999_0001, 0),
+            BAILOUT_SENTINEL,
+            "an unrelated heap oop is not a boolean"
         );
     }
 
