@@ -1171,6 +1171,191 @@ const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 #[cfg(windows)]
 const STATUS_BREAKPOINT: u32 = 0x8000_0003;
 
+// The fault codes PROBE claims, the Windows counterpart of the macOS
+// layer's `SIGSEGV`/`SIGBUS` pair. A fault whose pc is inside a
+// registered code cache is a *compiled-code* fault, and the one place
+// the `R15 == &VmState` convention is trustworthy enough to build a
+// dossier from (docs/DEBUGGER.md §4.1).
+//
+// `STATUS_ILLEGAL_INSTRUCTION` earns its place here on x64 specifically:
+// it is what a `ud2` placeholder raises, and — more usefully during a
+// port — what executing the *wrong architecture's* bytes usually decays
+// into. That is not a hypothetical: it is how the JIT failed on Windows
+// before the two `install` splits, and it produced no dossier at all.
+#[cfg(windows)]
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+#[cfg(windows)]
+const STATUS_IN_PAGE_ERROR: u32 = 0xC000_0006;
+#[cfg(windows)]
+const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+#[cfg(windows)]
+const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC000_0096;
+#[cfg(windows)]
+const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+#[cfg(windows)]
+const STATUS_STACK_OVERFLOW: u32 = 0xC000_00FD;
+
+#[cfg(windows)]
+fn is_probe_fault(code: u32) -> bool {
+    matches!(
+        code,
+        STATUS_ACCESS_VIOLATION
+            | STATUS_IN_PAGE_ERROR
+            | STATUS_ILLEGAL_INSTRUCTION
+            | STATUS_PRIVILEGED_INSTRUCTION
+            | STATUS_INTEGER_DIVIDE_BY_ZERO
+            | STATUS_STACK_OVERFLOW
+    )
+}
+
+/// A short, human-readable name for a fault code — so the verdict line
+/// says `ACCESS_VIOLATION` rather than `0xc0000005`, which matters most
+/// at exactly the moment someone is reading it in a hurry.
+#[cfg(windows)]
+fn fault_name(code: u32) -> &'static [u8] {
+    match code {
+        STATUS_ACCESS_VIOLATION => b"ACCESS_VIOLATION",
+        STATUS_IN_PAGE_ERROR => b"IN_PAGE_ERROR",
+        STATUS_ILLEGAL_INSTRUCTION => b"ILLEGAL_INSTRUCTION",
+        STATUS_PRIVILEGED_INSTRUCTION => b"PRIVILEGED_INSTRUCTION",
+        STATUS_INTEGER_DIVIDE_BY_ZERO => b"INTEGER_DIVIDE_BY_ZERO",
+        STATUS_STACK_OVERFLOW => b"STACK_OVERFLOW",
+        STATUS_BREAKPOINT => b"BREAKPOINT",
+        _ => b"FAULT",
+    }
+}
+
+/// Raw `WriteFile` to stderr — the Windows counterpart of the macOS
+/// layer's `libc::write`, and used for the same reason: this runs inside
+/// an exception handler, where `println!` may allocate, take a lock the
+/// faulting thread already holds, or reenter the very code that faulted.
+#[cfg(windows)]
+fn raw_stderr(bytes: &[u8]) {
+    extern "system" {
+        fn GetStdHandle(n: u32) -> *mut core::ffi::c_void;
+        fn WriteFile(
+            h: *mut core::ffi::c_void,
+            buf: *const u8,
+            len: u32,
+            written: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    let mut written = 0u32;
+    // SAFETY: a plain write of a borrowed buffer to an inherited handle.
+    unsafe {
+        let h = GetStdHandle(STD_ERROR_HANDLE);
+        WriteFile(h, bytes.as_ptr(), bytes.len() as u32, &mut written, core::ptr::null_mut());
+    }
+}
+
+/// The one-line verdict for a fault PROBE will not build a dossier for,
+/// written with no allocation. Mirrors the macOS `write_foreign_verdict`.
+///
+/// This line is the whole diagnostic when a fault lands outside every
+/// registered cache, so it carries the three facts that decide what to do
+/// next: what faulted, where, and what address it touched.
+#[cfg(windows)]
+fn write_foreign_verdict_win(code: u32, pc: u64, far: u64, in_cache: bool) {
+    fn put(buf: &mut [u8; 160], n: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *n < buf.len() {
+                buf[*n] = b;
+                *n += 1;
+            }
+        }
+    }
+    fn put_hex(buf: &mut [u8; 160], n: &mut usize, v: u64) {
+        put(buf, n, b"0x");
+        let digits = b"0123456789abcdef";
+        let mut started = false;
+        for i in (0..16).rev() {
+            let d = ((v >> (i * 4)) & 0xf) as usize;
+            if d != 0 || started || i == 0 {
+                started = true;
+                put(buf, n, &[digits[d]]);
+            }
+        }
+    }
+    let mut buf = [0u8; 160];
+    let mut n = 0usize;
+    put(&mut buf, &mut n, b"MACVM PROBE: ");
+    put(&mut buf, &mut n, fault_name(code));
+    put(&mut buf, &mut n, b" pc ");
+    put_hex(&mut buf, &mut n, pc);
+    put(&mut buf, &mut n, b" addr ");
+    put_hex(&mut buf, &mut n, far);
+    put(
+        &mut buf,
+        &mut n,
+        if in_cache {
+            // In-cache but no dossier: either a second fault while one was
+            // already being built (the dossier itself is broken), or a
+            // cache registered without a probe trampoline.
+            b" IN CODE CACHE but no dossier available; dying\n"
+        } else {
+            b" FOREIGN (not in any code cache); dying\n"
+        },
+    );
+    raw_stderr(&buf[..n]);
+}
+
+/// Claim a compiled-code fault for PROBE: capture the register file and
+/// redirect `Rip` into this cache's probe trampoline, which switches to a
+/// dedicated stack and builds the dossier in ordinary code.
+///
+/// Returns `EXCEPTION_CONTINUE_SEARCH` for anything it cannot own, which
+/// leaves debuggers and the default handler seeing the fault exactly as
+/// they would have.
+///
+/// # Safety
+/// `ctx` is the kernel's context record for this delivery.
+#[cfg(windows)]
+unsafe fn handle_win_fault(ctx: &mut WinContext, rec: &WinExceptionRecord) -> i32 {
+    let code = rec.ExceptionCode;
+    let pc = ctx.Rip;
+    // For an access violation, parameter[1] is the address touched. Other
+    // codes carry nothing meaningful there, so report 0 rather than a
+    // number that would read as a real address.
+    let far = if matches!(code, STATUS_ACCESS_VIOLATION | STATUS_IN_PAGE_ERROR)
+        && rec.NumberParameters >= 2
+    {
+        rec.ExceptionInformation[1] as u64
+    } else {
+        0
+    };
+
+    // Reentrancy: a fault while a dossier is already being built means the
+    // dossier ITSELF dereferenced something bad. Do not recurse — let the
+    // process die, keeping whatever prefix was already flushed. (The
+    // per-step flushing in `rt_probe_crash` exists precisely so that
+    // prefix is worth something.)
+    if PROBE_IN_PROGRESS.load(Ordering::Acquire) {
+        write_foreign_verdict_win(code, pc, far, true);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let probe = match lookup_pc_full(pc) {
+        Some((_, _, p)) if p != 0 => p,
+        // Outside every registered cache — the `R15 == &VmState`
+        // convention does not hold, so there is nothing trustworthy to
+        // build a dossier from. One honest line, then the default
+        // disposition.
+        other => {
+            write_foreign_verdict_win(code, pc, far, other.is_some());
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    // SAFETY: kernel-provided context for this delivery.
+    unsafe { capture_regs_win(ctx, far, code) };
+    PROBE_IN_PROGRESS.store(true, Ordering::Release);
+    ctx.R10 = pc;
+    ctx.Rip = probe;
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
 /// In-handler capture of the x64 integer register file into [`CAPTURED`] —
 /// the Windows sibling of [`capture_regs`]. Slot mapping: `x[0..16]` hold
 /// the GPRs in canonical x64 numbering (RAX, RCX, RDX, RBX, RSP, RBP, RSI,
@@ -1218,7 +1403,13 @@ unsafe extern "system" fn veh_trap_handler(info: *mut WinExceptionPointers) -> i
         if rec.is_null() || ctx.is_null() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        if (*rec).ExceptionCode != STATUS_BREAKPOINT {
+        let code = (*rec).ExceptionCode;
+        if is_probe_fault(code) {
+            // A compiled-code fault: PROBE's territory, not the deopt
+            // path's. Handled entirely separately below.
+            return unsafe { handle_win_fault(&mut *ctx, &*rec) };
+        }
+        if code != STATUS_BREAKPOINT {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let pc = (*ctx).Rip;
@@ -1982,19 +2173,35 @@ pub(crate) fn arm_foreign_fault_handler() {
 /// (README: `MACVM_JIT=off` for lldb sessions).
 pub fn install(cache: &mut CodeCache) -> DeoptTrampolines {
     // 1. Generate + publish this cache's own trampolines.
-    let uncommon_blob = build_uncommon_trampoline();
+    //
+    // WINVM (Phase 3w): arch-selected. Until this split these three were
+    // built by the AArch64 emitters on every host, so on Windows the VEH
+    // classified a trap correctly and then rewrote `Rip` to point at A64
+    // encodings — the handler was right and its landing pad was garbage.
+    // Same bug class as `stubs::install` had, and just as invisible: the
+    // addresses are real and inside the cache.
+    #[cfg(windows)]
+    let (uncommon_blob, assert_blob, probe_blob) = (
+        build_uncommon_trampoline_x64(),
+        build_assert_stub_x64(),
+        build_probe_trampoline_x64(),
+    );
+    #[cfg(not(windows))]
+    let (uncommon_blob, assert_blob, probe_blob) = (
+        build_uncommon_trampoline(),
+        build_assert_stub(),
+        build_probe_trampoline(),
+    );
     let hu = cache
         .alloc(uncommon_blob.code.len())
         .expect("deopt_trap::install: code cache too small for uncommon trampoline");
     cache.publish(hu, &uncommon_blob);
 
-    let assert_blob = build_assert_stub();
     let ha = cache
         .alloc(assert_blob.code.len())
         .expect("deopt_trap::install: code cache too small for assert stub");
     cache.publish(ha, &assert_blob);
 
-    let probe_blob = build_probe_trampoline();
     let hp = cache
         .alloc(probe_blob.code.len())
         .expect("deopt_trap::install: code cache too small for probe trampoline");

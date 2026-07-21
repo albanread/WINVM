@@ -59,13 +59,16 @@ anyhow = "1"
 # D2.4) — almost always 1-2 entries per publish/patch, so the inline
 # capacity avoids a heap allocation on the common path.
 smallvec = "1"
+# WINVM: x86-64 disassembly. A REGULAR dependency, not a dev-dependency:
+# the PROBE crash dossier disassembles a window around the faulting pc
+# (docs/DEBUGGER.md §4.1), and a dossier that can only be produced in test
+# builds is no use at all — the crashes that matter happen in the shipped
+# binary. Decoder + Intel formatter only.
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 
 # Codegen backend is an OPEN DECISION (see docs/DESIGN.md §4). Backends are
 # selected by feature so the compiler front end never hard-depends on one.
 [dev-dependencies]
-# WINVM: the vendored rasm encoder's own difftest suite decodes its output
-# with iced-x86 (same shape as JASM upstream); also the Phase-3 x64 disasm.
-iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 
 [features]
 default = []

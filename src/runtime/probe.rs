@@ -32,6 +32,36 @@ use crate::runtime::vm_state::{ProbeEvent, VmState};
 /// The register file at the moment of the trigger, copied out of the
 /// signal ucontext (or synthesized for synchronous triggers). Plain data —
 /// no signal-specific types leak out of `deopt_trap`.
+/// Names for the `regs.x[..]` slots, in the order the platform's capture
+/// routine fills them (`deopt_trap::capture_regs` / `capture_regs_win`).
+#[cfg(target_arch = "aarch64")]
+pub const REG_NAMES: &[&str] = &[
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28",
+];
+/// x86-64 has 16 GPRs, so the list stops there — the AArch64 loop printed
+/// 29 slots, leaving thirteen permanent `0x0` lines on x64 that read like
+/// captured state but were only unfilled array.
+#[cfg(not(target_arch = "aarch64"))]
+pub const REG_NAMES: &[&str] = &[
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15",
+];
+
+#[cfg(target_arch = "aarch64")]
+pub const FP_NAME: &str = "fp";
+#[cfg(not(target_arch = "aarch64"))]
+pub const FP_NAME: &str = "rbp";
+#[cfg(target_arch = "aarch64")]
+pub const SP_NAME: &str = "sp";
+#[cfg(not(target_arch = "aarch64"))]
+pub const SP_NAME: &str = "rsp";
+#[cfg(target_arch = "aarch64")]
+pub const FLAGS_NAME: &str = "cpsr";
+#[cfg(not(target_arch = "aarch64"))]
+pub const FLAGS_NAME: &str = "efl";
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CapturedRegs {
     pub x: [u64; 29],
@@ -94,23 +124,34 @@ pub unsafe fn crash_dossier(vm: &mut VmState, regs: &CapturedRegs, trigger: &str
     flush();
 
     // ── 3. Registers, annotated. ─────────────────────────────────────────
-    for i in 0..29 {
+    //
+    // Named for the host ISA. On x64 these were printed as `x0..x28`
+    // until WINVM Phase 3x, which is worse than unhelpful: `x4` there is
+    // RSP and `x5` is RBP, so a reader following AArch64 habits would
+    // take the stack pointer for an argument register. A crash dump that
+    // misnames its registers actively causes misdiagnosis.
+    for (i, name) in REG_NAMES.iter().enumerate() {
         let a = annotate_value(vm, regs.x[i]);
-        eprintln!("[3] x{i:<2} = {:#018x}  {a}", regs.x[i]);
-        json.push("registers", &format!("x{i}={:#x} {a}", regs.x[i]));
+        eprintln!("[3] {name:<4}= {:#018x}  {a}", regs.x[i]);
+        json.push("registers", &format!("{name}={:#x} {a}", regs.x[i]));
     }
     eprintln!(
-        "[3] fp  = {:#018x}  {}",
+        "[3] {:<4}= {:#018x}  {}",
+        FP_NAME,
         regs.fp,
         annotate_value(vm, regs.fp)
     );
-    eprintln!(
-        "[3] lr  = {:#018x}  {}",
-        regs.lr,
-        annotate_value(vm, regs.lr)
-    );
-    eprintln!("[3] sp  = {:#018x}", regs.sp);
-    eprintln!("[3] cpsr= {:#010x}", regs.cpsr);
+    // x64 has no link register; the return address lives on the stack, so
+    // printing a always-zero `lr` would imply a value that does not exist.
+    if cfg!(target_arch = "aarch64") {
+        eprintln!(
+            "[3] lr  = {:#018x}  {}",
+            regs.lr,
+            annotate_value(vm, regs.lr)
+        );
+    }
+    eprintln!("[3] {SP_NAME:<4}= {:#018x}", regs.sp);
+    eprintln!("[3] {FLAGS_NAME:<4}= {:#010x}", regs.cpsr);
     flush();
 
     // ── 4. Compiler's claim vs reality at the nearest safepoint. ─────────
@@ -605,25 +646,39 @@ fn disasm_window(vm: &VmState, pc: u64) -> Vec<String> {
     };
     let base = nm.code.base as u64;
     let code_off = (pc - base) as usize;
-    let window = 16 * 4; // ±16 instructions
-    let lo = code_off.saturating_sub(window);
-    let hi = (code_off + window + 4).min(nm.code.len);
-    let bytes = &nm.code.as_bytes()[lo..hi];
-    let listing =
-        crate::compiler::disasm_a64::disasm_slice(bytes, Some(code_off.saturating_sub(lo)));
-    // Re-base the +offset labels onto the nmethod so they read absolutely.
-    listing
-        .lines()
-        .map(|l| {
-            // Each line starts "+0xNN  ..." relative to `lo`; annotate the
-            // nmethod offset it really is.
-            l.to_string()
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .enumerate()
-        .map(|(i, l)| format!("nm+{:#06x}  {l}", lo + i * 4))
-        .collect()
+
+    // x86-64: decode FORWARD from the nmethod base, which is an
+    // instruction boundary by construction, and pick the window by
+    // counting instructions. Slicing `pc±64` and decoding from the cut —
+    // what the AArch64 path below does, correctly, for a fixed-width ISA
+    // — would start mid-instruction on x64 and produce a listing that is
+    // confidently wrong. See `disasm_x64`'s module doc.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let bytes = &nm.code.as_bytes()[..nm.code.len];
+        crate::compiler::disasm_x64::window(bytes, base, code_off, 16, 16, None)
+            .into_iter()
+            .map(|l| format!("nm{l}"))
+            .collect()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let window = 16 * 4; // ±16 instructions
+        let lo = code_off.saturating_sub(window);
+        let hi = (code_off + window + 4).min(nm.code.len);
+        let bytes = &nm.code.as_bytes()[lo..hi];
+        let listing =
+            crate::compiler::disasm_a64::disasm_slice(bytes, Some(code_off.saturating_sub(lo)));
+        listing
+            .lines()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| format!("nm+{:#06x}  {l}", lo + i * 4))
+            .collect()
+    }
 }
 
 fn heap_verify_line(vm: &VmState) -> String {

@@ -19,6 +19,10 @@ pub mod decode;
 // documented vertical slice (see its `SUPPORTED_OPS`).
 pub mod emit_x64;
 pub mod disasm_a64;
+// WINVM (Phase 3x): x86-64 disassembly for the PROBE dossier. Compiles
+// everywhere (iced-x86 decodes x64 on any host); only the dossier's
+// choice of decoder is target-gated.
+pub mod disasm_x64;
 pub mod driver;
 pub mod emit;
 pub mod escape;
