@@ -100,6 +100,23 @@ const DESC_ADDR_CACHE: usize = 6;
 /// function is still alive in a local for a scavenge to invalidate —
 /// there is nothing here for a `HandleScope` to protect.
 pub(crate) fn dispatch_ffi_primitive(vm: &mut VmState, m: MethodOop, argc: u8) -> PrimitiveOutcome {
+    // WINVM: the FFI invoke trampolines (`codecache::ffi_stubs`) are still
+    // AArch64 machine code — executing one on x64 is an instant fault. Fail
+    // the doit cleanly until the Phase-3 x64 backend re-emits the stubs
+    // (MIGRATION.md §4). Guest-fatal, not a prim Fail: same rationale as
+    // the Tier-2 arm below — the generated method body is empty besides the
+    // pragma, so a silent fallthrough would look like a successful send.
+    if cfg!(not(target_arch = "aarch64")) {
+        crate::runtime::error::guest_fatal(
+            vm,
+            format!(
+                "FFI: native calls aren't available on this platform yet (the invoke \
+                 trampolines are AArch64; the x64 backend is Phase 3 — MIGRATION.md) — \
+                 function {name:?}",
+                name = sym_text(m.literals().at(DESC_NAME)),
+            ),
+        );
+    }
     let desc = m.literals();
 
     let kind = sym_text(desc.at(DESC_KIND));

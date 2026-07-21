@@ -270,13 +270,25 @@ const DEFAULT_PROBE: &[&str] = &["ucrtbase.dll", "msvcrt.dll", "kernel32.dll"];
 /// handle), matching the macOS twin's no-cache rationale.
 pub fn dlsym_resolve(lib: Option<&str>, symbol: &str) -> Option<u64> {
     let c_sym = CString::new(symbol).ok()?;
+    // The MSVC CRT exports POSIX names with a leading underscore
+    // (`getpid` → `_getpid`, `open` → `_open`, …); resolve the plain name
+    // first, then the underscore alias, so Tier-1 world bindings written
+    // against POSIX names keep working unchanged.
+    let c_sym_underscore = CString::new(format!("_{symbol}")).ok()?;
     let lookup = |handle: *mut c_void| {
-        // SAFETY: `handle` is a live module handle, `c_sym` a valid C string.
-        let addr = unsafe { GetProcAddress(handle, c_sym.as_ptr()) };
-        if addr.is_null() {
-            None
-        } else {
-            Some(addr as u64)
+        // SAFETY: `handle` is a live module handle, both names valid C strings.
+        unsafe {
+            let addr = GetProcAddress(handle, c_sym.as_ptr());
+            let addr = if addr.is_null() {
+                GetProcAddress(handle, c_sym_underscore.as_ptr())
+            } else {
+                addr
+            };
+            if addr.is_null() {
+                None
+            } else {
+                Some(addr as u64)
+            }
         }
     };
     match lib {
