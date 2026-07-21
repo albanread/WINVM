@@ -15,6 +15,9 @@ pub mod assembler;
 // encoding tests run everywhere; only the tier-1 wiring is target-gated.
 pub mod assembler_x64;
 pub mod decode;
+// WINVM (Phase 3): the x86-64 IR lowering, sibling of `emit`. Currently a
+// documented vertical slice (see its `SUPPORTED_OPS`).
+pub mod emit_x64;
 pub mod disasm_a64;
 pub mod driver;
 pub mod emit;
