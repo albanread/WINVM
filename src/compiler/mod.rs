@@ -10,6 +10,10 @@
 //! [`decode::Cfg`] -> SSA-lite `Ir` -> linear-scan regalloc -> emit.
 
 pub mod assembler;
+// WINVM (Phase 3, MIGRATION.md §4): the x86-64 emitter, sibling of
+// `jasm_assembler`. Compiles on every host (it only writes bytes), so its
+// encoding tests run everywhere; only the tier-1 wiring is target-gated.
+pub mod assembler_x64;
 pub mod decode;
 pub mod disasm_a64;
 pub mod driver;
