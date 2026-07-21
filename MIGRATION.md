@@ -434,16 +434,39 @@ relative-to-C ratios.
     Worth recording alongside the `LoadField` bias bug: both were caught
     by running things, neither by reading them.
   - 696 lib tests pass; world interpreter still 5891/0.
-- **Next (rest of Phase 3):** `ArrayAt/AtPut` and `oopmap.rs` register
-  numbering — both small — then the wiring: `compiled_call.rs` and
-  `driver.rs` selecting the x64 back end so tier-up fires, plus
-  `adapters.rs`.
-  **Status to be clear about:** the x64 back end is proven op-by-op by
-  execution tests, but no running Smalltalk program reaches it yet —
-  every benchmark and world-test number above is still the interpreter.
-  The substantial ops are now all done; the wiring step is what closes
-  the gap and re-enables the `target_arch = "aarch64"`-gated tier-1
-  tests.
+- **2026-07-21 — Phase 3j: array ops; `oopmap.rs` needed nothing.**
+  - `ArrayAt`/`ArrayAtPut` with their four guards. x86 addressing makes
+    these markedly tighter than the A64 originals: the element address is
+    **one operand** (`[arr + idx*2 + base]` — a tagged index `i<<2`
+    scaled by 2 is exactly `i*8`, one stride, where AArch64 needs two
+    `add`s), and the klass check is register-free via
+    `cmp reg, [rip+lit]` where AArch64 must load the literal into a
+    scratch. Together those let the whole guard sequence run on `RAX`
+    alone, leaving both scratches holding the array and index.
+  - The bounds check is a single **unsigned** compare of tagged values:
+    `idx − 4` is `(i−1) << 2`, so comparing unsigned against the tagged
+    length rejects `i < 1` and `i > length` in one instruction, because a
+    zero or negative index wraps to a huge unsigned value. Tests cover
+    index 0 and −1 explicitly — a signed compare would pass both and read
+    outside the object.
+  - **`oopmap.rs` required no changes at all.** It never inspects
+    registers, only spill slots — because spill-all-at-safepoints means
+    nothing is live in a register at a safepoint. That is the fourth time
+    this one invariant has removed work from the port (after `idiv`
+    precoloring, ABI precoloring, and safe volatile clobbering at runtime
+    calls).
+  - 698 lib tests pass; world interpreter still 5891/0.
+- **The IR surface is now complete except floats/SIMD/OSR** (`FUnbox`,
+  `FBox`, `FArith`, `FCmpBr`, `FCmpVal`, `FConst`, `VecArith`,
+  `NlrReturn`), which are Phase 5 work.
+- **Next — the wiring, and it is the honest remaining gap:**
+  `compiled_call.rs` and `driver.rs` must select the x64 back end so
+  tier-up actually fires, plus `adapters.rs`. Until then the x64 back end
+  is proven op-by-op by execution tests but **no running Smalltalk
+  program reaches it** — every benchmark and world-test number above is
+  still the interpreter. That step is also what re-enables the
+  `target_arch = "aarch64"`-gated tier-1 tests, which are the real
+  differential check against the Mac.
 
 ## 7. What deliberately does *not* change
 
