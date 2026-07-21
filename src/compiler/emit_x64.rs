@@ -46,7 +46,7 @@
 //! away.
 
 use crate::compiler::assembler::{CodeBlob, Label, LiteralId, RelocKind};
-use crate::compiler::emit::EmittedIcSite;
+use crate::compiler::emit::{EmittedIcSite, EntryGuard};
 use crate::compiler::assembler_x64::{
     imm, mem, mem_byte, mem_index, r32, r64, Cond, X64Assembler, ARG_REGS, RAX, RBP, RECEIVER, RSP,
     SCRATCH0, SCRATCH1, SHADOW_SPACE, VM_STATE,
@@ -125,6 +125,72 @@ pub struct Emitted {
     pub safepoints: Vec<TrapSite>,
     /// Patchable inline-cache sites, for the code cache to wire up.
     pub ic_sites: Vec<EmittedIcSite>,
+    /// Byte offset of each basic block's first instruction, indexed by
+    /// block number — what the debugger and OSR entry resolution need.
+    pub block_pcs: Vec<u32>,
+    /// Offset past the entry guard: where a caller that has already
+    /// checked the receiver's klass (a monomorphic IC hit) may enter
+    /// directly. Equals 0 when no guard was requested.
+    pub verified_entry_off: u32,
+}
+
+/// Emit the per-klass customization guard that precedes a compiled
+/// method's body: the receiver's klass must equal the key this nmethod
+/// was customized for, or control tail-jumps to the resolve stub, which
+/// re-dispatches. Falls through to the verified entry on a match.
+///
+/// The receiver arrives in the first Win64 argument register (matching
+/// [`Ir::Param`] index 0), which is where AArch64's `x0` maps to.
+///
+/// Two shapes, exactly as the AArch64 emitter has them:
+/// - **Heap key** (the overwhelmingly common case): a smi receiver can
+///   never match a heap klass, so the smi case *is* a miss and needs no
+///   smi-klass literal or merge point at all.
+/// - **Smi key**: the two cases have to merge, because a smi's klass is a
+///   literal rather than a header word.
+fn emit_entry_guard_x64(asm: &mut X64Assembler, guard: &EntryGuard) {
+    let recv = ARG_REGS[0];
+    let key_lit = asm.literal_u64(guard.key_klass_bits, Some(RelocKind::KeyKlassOop));
+    let resolve_lit = asm.literal_u64(guard.resolve_addr, Some(RelocKind::RuntimeAddr));
+
+    // The miss path, shared by both shapes: load the resolve stub and
+    // TAIL-jump — this frame has no prologue yet, so the stub returns
+    // directly to the original caller.
+    let emit_miss = |asm: &mut X64Assembler| {
+        asm.load_literal(SCRATCH0, resolve_lit);
+        asm.emit("jmp", &[r64(SCRATCH0)]);
+    };
+
+    if guard.key_klass_bits != guard.smi_klass_bits {
+        let miss = asm.new_label();
+        let matched = asm.new_label();
+        asm.emit("test", &[r64(recv), imm(3)]);
+        asm.jcc(Cond::E, miss); // a smi can never match a heap key
+        asm.emit("mov", &[r64(SCRATCH1), mem(recv, KLASS_OFF_FROM_TAGGED)]);
+        asm.cmp_literal(SCRATCH1, key_lit);
+        asm.jcc(Cond::E, matched);
+        asm.bind(miss);
+        emit_miss(asm);
+        asm.bind(matched);
+        return;
+    }
+
+    let smi_lit = asm.literal_u64(guard.smi_klass_bits, Some(RelocKind::Oop));
+    let smi_case = asm.new_label();
+    let after_klass_load = asm.new_label();
+    let matched = asm.new_label();
+
+    asm.emit("test", &[r64(recv), imm(3)]);
+    asm.jcc(Cond::E, smi_case);
+    asm.emit("mov", &[r64(SCRATCH1), mem(recv, KLASS_OFF_FROM_TAGGED)]);
+    asm.jmp(after_klass_load);
+    asm.bind(smi_case);
+    asm.load_literal(SCRATCH1, smi_lit);
+    asm.bind(after_klass_load);
+    asm.cmp_literal(SCRATCH1, key_lit);
+    asm.jcc(Cond::E, matched);
+    emit_miss(asm);
+    asm.bind(matched);
 }
 
 /// Absolute addresses of the runtime entry points compiled code calls.
@@ -525,7 +591,12 @@ fn cmp_cond(op: CmpOp) -> Cond {
 /// is directly callable as an `extern "C" fn(u64, ...) -> u64`. Wiring the
 /// real call stub (which additionally establishes the pinned `&VmState` /
 /// receiver registers) is the next Phase-3 step.
-pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) -> Emitted {
+pub fn emit_x64(
+    method: &IrMethod,
+    regalloc: &RegallocResult,
+    rt: RuntimeAddrs,
+    guard: Option<&EntryGuard>,
+) -> Emitted {
     let mut asm = X64Assembler::new();
 
     // Intern the method's constant pool first, so `PoolLit(i)` indexes
@@ -569,6 +640,13 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) 
         method,
     };
 
+    // The customization guard precedes everything, so a monomorphic
+    // caller can skip it by entering at `verified_entry_off`.
+    if let Some(g) = guard {
+        emit_entry_guard_x64(&mut e.asm, g);
+    }
+    let verified_entry_off = e.asm.offset();
+
     // ── Prologue ────────────────────────────────────────────────────────
     // A real frame (push rbp; mov rbp, rsp), not a frameless leaf: the GC
     // and the debugger walk the RBP chain to find compiled activations,
@@ -587,9 +665,11 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) 
     }
 
     // ── Blocks ──────────────────────────────────────────────────────────
+    let mut block_pcs: Vec<u32> = vec![0; method.blocks.len()];
     for (bi, block) in method.blocks.iter().enumerate() {
         let l = e.labels[bi];
         e.asm.bind(l);
+        block_pcs[bi] = e.asm.offset();
         e.current_bci = block.bci;
         for op in &block.code {
             emit_op(&mut e, op);
@@ -618,6 +698,8 @@ pub fn emit_x64(method: &IrMethod, regalloc: &RegallocResult, rt: RuntimeAddrs) 
         trap_sites,
         safepoints,
         ic_sites,
+        block_pcs,
+        verified_entry_off,
     }
 }
 
@@ -1214,7 +1296,7 @@ mod tests {
     fn compile_and_run(method: &IrMethod, a: u64, b: u64) -> u64 {
         use crate::vendor::wfasm::native_windows::WinJit;
         let ra = regalloc(method);
-        let blob = emit_x64(method, &ra, RuntimeAddrs::default()).blob;
+        let blob = emit_x64(method, &ra, RuntimeAddrs::default(), None).blob;
         let jit = WinJit::with_capacity(blob.code.len() + 4096).expect("RWX region");
         let (base, _cap) = jit.region_raw();
         // SAFETY: the region was just allocated with room for the blob.
@@ -1683,7 +1765,7 @@ mod tests {
             0,
         );
         let ra = regalloc(&m);
-        let out = emit_x64(&m, &ra, RuntimeAddrs::default());
+        let out = emit_x64(&m, &ra, RuntimeAddrs::default(), None);
 
         // The emitter recorded the site, keyed by the trap's own offset.
         assert_eq!(out.trap_sites.len(), 1);
@@ -1845,7 +1927,7 @@ mod tests {
             oops(3),
             2,
         );
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default()).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2087,7 +2169,7 @@ mod tests {
             stub_poll: poll_stub_probe as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2141,7 +2223,7 @@ mod tests {
             oops(1),
             0,
         );
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default());
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None);
         assert_eq!(out.safepoints.len(), 1, "one poll, one safepoint");
         // It is a return address, so it must be strictly inside the code,
         // past the call that precedes it.
@@ -2188,7 +2270,7 @@ mod tests {
             must_be_boolean: double_it as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2292,7 +2374,7 @@ mod tests {
             alloc_slow: alloc_slow_probe as usize as u64,
             ..RuntimeAddrs::default()
         };
-        let blob = emit_x64(&m, &regalloc(&m), rt).blob;
+        let blob = emit_x64(&m, &regalloc(&m), rt, None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2476,7 +2558,7 @@ mod tests {
             static_klass: None,
         }];
 
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default());
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None);
         assert_eq!(out.ic_sites.len(), 1, "one send, one IC site");
         assert_eq!(out.ic_sites[0].site, 0);
         assert_eq!(out.safepoints.len(), 1, "a send is a deopt safepoint");
@@ -2573,7 +2655,7 @@ mod tests {
             static_klass: None,
         }];
 
-        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default());
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None);
         let site_off = out.ic_sites[0].off as usize;
         let blob = out.blob;
         let stub = build_call_stub_x64();
@@ -2753,7 +2835,7 @@ mod tests {
         use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
         use crate::vendor::wfasm::native_windows::WinJit;
         let vmreg = [0u64; 8];
-        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default()).blob;
+        let blob = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), None).blob;
         let stub = build_call_stub_x64();
         let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
         let (base, _cap) = jit.region_raw();
@@ -2777,6 +2859,108 @@ mod tests {
         assert_eq!(storage[4], smi(77), "element 2 written");
         assert_eq!(storage[5], smi(0), "element 3 untouched");
         assert_eq!(storage[2], smi(3), "the length word was not overwritten");
+    }
+
+    /// The customization guard, executed: a receiver whose klass matches
+    /// the key falls through to the body; a mismatch — and a smi, which
+    /// can never be an instance of a heap klass — tail-jumps to the
+    /// resolve stub instead.
+    ///
+    /// `verified_entry_off` must be a real entry point: a monomorphic
+    /// caller skips the guard by jumping there, so the test enters BOTH
+    /// ways and requires the same answer.
+    #[cfg(windows)]
+    #[test]
+    fn entry_guard_admits_the_key_klass_and_diverts_everything_else() {
+        use crate::codecache::stubs_x64::{build_call_stub_x64, CallStubFn};
+        use crate::oops::layout::MEM_TAG;
+        use crate::vendor::wfasm::native_windows::WinJit;
+
+        // The resolve stub stands in for re-dispatch: it returns a
+        // recognizable value so a diverted call is unmistakable.
+        extern "C" fn resolve_probe(_recv: u64) -> u64 {
+            0xDEAD_BEEF
+        }
+
+        const KEY_KLASS: u64 = 0x7777_0001;
+        let mut matching = [0u64; 2];
+        matching[1] = KEY_KLASS;
+        let recv_ok = matching.as_ptr() as u64 | MEM_TAG;
+        let mut other = [0u64; 2];
+        other[1] = 0x8888_0001;
+        let recv_bad = other.as_ptr() as u64 | MEM_TAG;
+
+        // `^ 7` — the body is irrelevant; what matters is whether it runs.
+        let m = hand_method(
+            vec![block(
+                0,
+                vec![
+                    Ir::ConstSmi {
+                        dst: VReg(0),
+                        value: 7,
+                    },
+                    Ir::Ret { val: VReg(0) },
+                ],
+            )],
+            oops(1),
+            1,
+        );
+        let guard = EntryGuard {
+            // Distinct from the key, so this takes the heap-key shape.
+            smi_klass_bits: 0x9999_0001,
+            key_klass_bits: KEY_KLASS,
+            resolve_addr: resolve_probe as usize as u64,
+        };
+        let out = emit_x64(&m, &regalloc(&m), RuntimeAddrs::default(), Some(&guard));
+        assert!(
+            out.verified_entry_off > 0,
+            "a guard was requested, so the verified entry must sit past it"
+        );
+        assert_eq!(
+            out.block_pcs.len(),
+            1,
+            "one block, one recorded block pc"
+        );
+        assert!(out.block_pcs[0] >= out.verified_entry_off);
+
+        let blob = out.blob;
+        let stub = build_call_stub_x64();
+        let jit = WinJit::with_capacity(stub.code.len() + blob.code.len() + 4096).expect("RWX");
+        let (base, _cap) = jit.region_raw();
+        let moff = (stub.code.len() + 15) & !15;
+        unsafe {
+            core::ptr::copy_nonoverlapping(stub.code.as_ptr(), base, stub.code.len());
+            core::ptr::copy_nonoverlapping(blob.code.as_ptr(), base.add(moff), blob.code.len());
+        }
+        let stub_fn: CallStubFn = unsafe { std::mem::transmute(base) };
+        let entry = base as u64 + moff as u64;
+        let verified = entry + out.verified_entry_off as u64;
+
+        // Matching klass: through the guard, into the body.
+        let argv = [recv_ok];
+        assert_eq!(unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) }, smi(7));
+        // Wrong klass: diverted to the resolve stub.
+        let argv = [recv_bad];
+        assert_eq!(
+            unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) },
+            0xDEAD_BEEF,
+            "a non-matching klass must tail-jump to resolve"
+        );
+        // A smi receiver can never be an instance of a heap klass.
+        let argv = [smi(3)];
+        assert_eq!(
+            unsafe { stub_fn(entry, 0, argv.as_ptr(), 1) },
+            0xDEAD_BEEF,
+            "a smi receiver misses a heap key without loading any header"
+        );
+        // Entering at the verified entry skips the guard entirely — even
+        // the receiver that would have missed now runs the body.
+        let argv = [recv_bad];
+        assert_eq!(
+            unsafe { stub_fn(verified, 0, argv.as_ptr(), 1) },
+            smi(7),
+            "verified_entry_off must be a genuine entry past the guard"
+        );
     }
 
     /// An op outside the slice fails loudly and names itself, rather than
