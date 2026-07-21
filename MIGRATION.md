@@ -459,14 +459,47 @@ relative-to-C ratios.
 - **The IR surface is now complete except floats/SIMD/OSR** (`FUnbox`,
   `FBox`, `FArith`, `FCmpBr`, `FCmpVal`, `FConst`, `VecArith`,
   `NlrReturn`), which are Phase 5 work.
-- **Next — the wiring, and it is the honest remaining gap:**
-  `compiled_call.rs` and `driver.rs` must select the x64 back end so
-  tier-up actually fires, plus `adapters.rs`. Until then the x64 back end
-  is proven op-by-op by execution tests but **no running Smalltalk
-  program reaches it** — every benchmark and world-test number above is
-  still the interpreter. That step is also what re-enables the
-  `target_arch = "aarch64"`-gated tier-1 tests, which are the real
-  differential check against the Mac.
+- **2026-07-21 — Phase 3k: entry guard, block PCs, verified entry.**
+  `emit_entry_guard_x64` emits the per-klass customization guard
+  (receiver in the first Win64 argument register; a heap key needs no
+  smi-klass literal at all, since a smi can never match it; a miss
+  **tail-jumps** to the resolve stub, sound because the guard runs before
+  any prologue so the stub returns straight to the original caller).
+  `emit_x64` now also reports `block_pcs` and `verified_entry_off`. The
+  test enters both ways — through the guard and directly at
+  `verified_entry_off` — and requires the same answer, which is what
+  makes that offset a genuine entry point rather than a number.
+  699 lib tests pass; world interpreter still 5891/0.
+
+## 8. The remaining gap to a firing JIT — measured, not estimated
+
+The emitter side of Phase 3 is essentially complete: every IR op except
+floats/SIMD/OSR lowers, and each is proven by an execution test. **But no
+running Smalltalk program reaches any of it**, and the reason is not the
+emitter — it is that tier-1 needs a *runtime environment* of hand-written
+stubs, all of which still exist only as AArch64.
+
+Surveyed rather than guessed:
+
+| Component | A64 generators to port | Notes |
+|---|---|---|
+| `codecache/stubs.rs` | **13** `build_*` functions | `call_stub` is done (`stubs_x64.rs`); still needed: `stub_poll`, `stub_resolve`, `not_entrant`, `deopt_return_trampoline`, `mega_shared`, `dnu`, `must_be_boolean`, `box_double`, `alloc_slow`, `call_primitive`, `nlr_originate`, `value_dispatch` |
+| `codecache/deopt_trap.rs` | **3** trampolines | `uncommon`, `assert`, `probe` — the VEH already redirects to them; they just need x64 bodies |
+| `codecache/pics.rs`, `mega.rs`, `adapters.rs` | PIC/megamorphic/adapter emitters | patch-site shapes already fixed by `call_patchable` |
+| `compiler/driver.rs` | back-end selection | the `emit::emit` call site takes 15 parameters and returns a 6-tuple; `emit_x64` returns an `Emitted` struct. Needs a seam, plus `prim_shim` and OSR support, and `SafepointPc`-vs-`TrapSite` reconciliation for `build_deopt_metadata` |
+| `compiler/disasm_a64.rs` | trace/debug disassembly | replace with `iced-x86` (already a dev-dependency) |
+
+So the honest position: **the hard, novel work is done and tested; what
+remains is a substantial amount of mechanical-but-careful stub porting**,
+none of it conceptually new, but all of it load-bearing — a wrong stub is
+a silent crash inside compiled code. The next natural unit is
+`stub_poll` + `alloc_slow` + `must_be_boolean` (the three the emitter
+already calls, so they close the first executable loop), then the deopt
+trampolines, then the driver seam.
+
+Only after that do the `target_arch = "aarch64"`-gated tier-1 tests come
+back — and those are the real differential check against the Mac, worth
+far more than the hand-built IR tests written so far.
 
 ## 7. What deliberately does *not* change
 
