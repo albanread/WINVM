@@ -11,9 +11,19 @@
 mod browser_render;
 mod canvas_render;
 mod editor_render;
+/// The native Metal game pane — macOS-only and off by default
+/// (`Cargo.toml`'s `gamepane` feature; `../MIGRATION.md` §1 defers the game
+/// demos on Windows, where D3D11/XAudio2 would be their counterpart).
+#[cfg(feature = "gamepane")]
 mod game_pane;
+/// The dependency-free Objective-C bridge — used only by the macOS shell.
+#[cfg(target_os = "macos")]
 mod objc;
 mod preprocess;
+/// The native shell (window, web view, menus, timers, clipboard). Everything
+/// platform-specific in this crate lives behind this one module — see
+/// `shell/mod.rs`.
+mod shell;
 mod vm_host;
 mod workspace_render;
 // Moved to image_store (docs/package_aware_editing_design.md M2): that
@@ -23,48 +33,25 @@ mod workspace_render;
 // `crate::world_boot::...` call site in this crate needed no changes.
 pub(crate) use image_store::world_boot;
 
-use objc::{sel, Id, Sel, NIL};
 use preprocess::Theme;
+use shell::ScriptMessage;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// `Id`/`Sel` are raw pointers (not `Send`/`Sync`) — sound to store in a
-/// `static` here because AppKit only ever calls into this process on the
-/// main thread, and nothing in this crate spawns another one.
-struct MainThreadPtr(Id);
-unsafe impl Send for MainThreadPtr {}
-unsafe impl Sync for MainThreadPtr {}
-
-static WEBVIEW: OnceLock<MainThreadPtr> = OnceLock::new();
-/// The `NSWindow`, stored so the game pane can swap its content view (once the
-/// game view is installed, the WKWebView's own `.window` goes nil, so it can't
-/// be re-derived from the webview — it must be held separately).
-static WINDOW: OnceLock<MainThreadPtr> = OnceLock::new();
-/// Set when `macvm-gui mandelvm` runs (the standalone MandelVM demo,
-/// `run-mandelvm.sh`): the window hosts only the game pane, so when the demo's
-/// frame loop stops (the dive finishes → `MandelVM>>diveBottomed` sends
-/// `pane stop` → `StopLoop`) there is no browser to return to and the whole app
-/// quits instead. Read by [`on_game_loop_stopped`] and [`on_game_tick`].
+/// Set when `winvm-gui mandelvm` runs (the standalone MandelVM demo): the
+/// window hosts only the game pane, so when the demo's frame loop stops there
+/// is no browser to return to and the whole app quits instead.
+#[cfg(feature = "gamepane")]
 static MANDELVM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// True while the "Mandelbrot — spawned VM" demo is running: a genuinely SECOND
 /// VM instance (`DEMO_VM`) drives the game pane while the GUI's own `VM` keeps
-/// serving the Workspace/browser untouched. Routes the frame timer + Escape/stop
-/// to the spawned VM and its teardown instead of the main VM. See
-/// [`run_spawned_mandel_demo`] / [`teardown_spawned_demo`].
+/// serving the Workspace/browser untouched.
+#[cfg(feature = "gamepane")]
 static DEMO_VM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The bridge object whose `drainDemoVm:` selector drains `DEMO_VM`'s responses
-/// (built once, on first use).
-static DEMO_VM_BRIDGE: OnceLock<MainThreadPtr> = OnceLock::new();
-/// The game-loop frame timer's target object (a `MacvmGameTimer` instance whose
-/// `gameTick:` IMP is [`on_game_tick`]), created lazily on the first
-/// `StartLoop`. Main-thread only (`docs/gamepane_design.md` M4).
-static GAME_TIMER_TARGET: OnceLock<MainThreadPtr> = OnceLock::new();
 
+#[cfg(feature = "gamepane")]
 thread_local! {
-    /// The currently-scheduled frame `NSTimer` (NIL when the loop is stopped).
-    /// Main-thread only.
-    static GAME_TIMER: std::cell::Cell<Id> = const { std::cell::Cell::new(NIL) };
     /// The second, spawned VM instance behind the "Mandelbrot — spawned VM" demo
     /// (a full `VmHost`: its own worker thread + fresh `VmHandle`, independent of
     /// the GUI's own `VM`). `Some` only while that demo is on screen; dropped at
@@ -102,11 +89,6 @@ fn set_theme(theme: Theme) {
         THEME.store(idx as u8, Ordering::Relaxed);
     }
 }
-
-/// One `(Theme, menu-item-pointer)` pair per `Theme::ALL` entry, so their
-/// checkmarks can be updated when the active theme changes
-/// (`update_theme_menu_checkmarks`).
-static THEME_MENU_ITEMS: OnceLock<Vec<(Theme, MainThreadPtr)>> = OnceLock::new();
 
 /// Page zoom percentage (G5 `biggerText`/`smallerText`, `../PLAN.md` §4),
 /// read on every `navigate_to` same as `THEME`. Stored directly as the
@@ -596,8 +578,11 @@ fn navigate_to(path: &Path) -> bool {
     }
     if path == game_view_marker() {
         // Swap the native Metal game pane in as the window content view and
-        // render a frame — not HTML into the WKWebView (see `game_pane.rs`).
+        // render a frame — not HTML into the web view (see `game_pane.rs`).
+        #[cfg(feature = "gamepane")]
         display_game_pane();
+        #[cfg(not(feature = "gamepane"))]
+        report_no_game_pane();
         return true;
     }
     if let Some(tool) = path
@@ -852,182 +837,196 @@ fn open_canvas() {
     }
 }
 
+// ── Native game pane (macOS-only, `gamepane` feature) ──────────────────────
+//
+// `../MIGRATION.md` §1 defers the game demos on Windows (D3D11/XAudio2 would
+// be their counterpart), and the pane is Metal-backed, so this whole section
+// compiles out unless the feature is on. The toolbar's `gamePane` button and
+// the `.game-view` marker are handled without it — see `navigate_toolbar`.
+#[cfg(feature = "gamepane")]
+mod game_pane_driver {
+    use super::*;
+
 /// Opens the native Metal game pane (`game_pane.rs`,
-/// `../docs/gamepane_design.md`) — the toolbar's `gamePane` action and the
-/// `MACVM_GAMEPANE_DEMO` env trigger. Pushes the marker and swaps the native
-/// view in, mirroring `open_canvas`'s marker/display split.
-fn open_game_pane() {
-    if let Some(nav) = NAV.get() {
-        nav.lock().unwrap().go(game_view_marker());
-    }
-    display_game_pane();
-}
-
-/// Swap the native game pane's `NSView` in as the window content view (out of
-/// the WKWebView) and render one frame. Main thread only. A no-op with a note
-/// if this Mac has no Metal device.
-fn display_game_pane() {
-    let Some(view) = game_pane::ensure_native_view(game_pane::PANE_W, game_pane::PANE_H) else {
-        append_transcript("(game pane: no Metal device available)");
-        return;
-    };
-    // Start each game session with a clean held-key table. HELD_KEYS is only
-    // cleared by a keyUp: delivered to the game view, so the Escape that closed
-    // the PREVIOUS game — its keyUp: went to the webview that replaced the pane,
-    // never to us — would otherwise still read as held here, and the frame
-    // loop's level-triggered Escape check would close this new game on its very
-    // first tick. Clearing on open fixes that "second demo exits immediately".
-    macgamepane_graphics::input::clear_all();
-    if let Some(window) = WINDOW.get() {
-        objc::send1_id(window.0, sel("setContentView:"), view);
-        // Make the key-capable game view first responder so keyDown:/keyUp:
-        // populate HELD_KEYS while the game is focused (docs/gamepane_design.md).
-        objc::send1_id(window.0, sel("makeFirstResponder:"), view);
-    }
-    game_pane::render_native_frame();
-}
-
-// ── Game-loop frame driver (docs/gamepane_design.md M4) ─────────────────────
-
-/// The `MacvmGameTimer` target object whose `gameTick:` runs [`on_game_tick`].
-fn build_game_timer_target() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmGameTimer");
-    objc::add_method(cls, sel("gameTick:"), on_game_tick as *const _, "v@:@");
-    objc::register_class(cls);
-    objc::alloc_init("MacvmGameTimer")
-}
-
-/// NSTimer callback (~60 Hz on the main run loop while a game loop runs): if the
-/// worker is idle, submit exactly one `GameStep` carrying this tick's held keys.
-/// Single-outstanding — a still-running step means we skip, never pile up.
-/// Rendering happens later, when the step's draw commands drain (not here).
-extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
-    // Escape ends the game. Normally that returns to the browser
-    // (`close_game_pane`); in the standalone mandelvm demo it quits the app, and
-    // in the spawned-VM demo it tears the second VM down — both via the frame
-    // loop's stop path. macOS virtual key code 53 = Escape.
-    if macgamepane_graphics::input::key_held(53) {
-        if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-            || MANDELVM.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            on_game_loop_stopped();
-        } else {
-            close_game_pane();
+    /// `../docs/gamepane_design.md`) — the toolbar's `gamePane` action and the
+    /// `MACVM_GAMEPANE_DEMO` env trigger. Pushes the marker and swaps the native
+    /// view in, mirroring `open_canvas`'s marker/display split.
+    fn open_game_pane() {
+        if let Some(nav) = NAV.get() {
+            nav.lock().unwrap().go(game_view_marker());
         }
-        return;
+        display_game_pane();
     }
-    let keys = current_game_key_mask();
-    // The spawned-VM demo drives the SECOND VM instance; every other game runs in
-    // the GUI's own VM. Same single-outstanding backpressure (`is_idle`) either way.
-    if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        DEMO_VM.with(|d| {
-            if let Some(vm) = d.borrow().as_ref() {
-                if vm.is_idle() {
-                    vm.submit(vm_host::VmRequest::GameStep { keys });
+    
+    /// Swap the native game pane's `NSView` in as the window content view (out of
+    /// the WKWebView) and render one frame. Main thread only. A no-op with a note
+    /// if this Mac has no Metal device.
+    fn display_game_pane() {
+        let Some(view) = game_pane::ensure_native_view(game_pane::PANE_W, game_pane::PANE_H) else {
+            append_transcript("(game pane: no Metal device available)");
+            return;
+        };
+        // Start each game session with a clean held-key table. HELD_KEYS is only
+        // cleared by a keyUp: delivered to the game view, so the Escape that closed
+        // the PREVIOUS game — its keyUp: went to the webview that replaced the pane,
+        // never to us — would otherwise still read as held here, and the frame
+        // loop's level-triggered Escape check would close this new game on its very
+        // first tick. Clearing on open fixes that "second demo exits immediately".
+        macgamepane_graphics::input::clear_all();
+        if let Some(window) = WINDOW.get() {
+            objc::send1_id(window.0, sel("setContentView:"), view);
+            // Make the key-capable game view first responder so keyDown:/keyUp:
+            // populate HELD_KEYS while the game is focused (docs/gamepane_design.md).
+            objc::send1_id(window.0, sel("makeFirstResponder:"), view);
+        }
+        game_pane::render_native_frame();
+    }
+    
+    // ── Game-loop frame driver (docs/gamepane_design.md M4) ─────────────────────
+    
+    /// The `MacvmGameTimer` target object whose `gameTick:` runs [`on_game_tick`].
+    fn build_game_timer_target() -> Id {
+        let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmGameTimer");
+        objc::add_method(cls, sel("gameTick:"), on_game_tick as *const _, "v@:@");
+        objc::register_class(cls);
+        objc::alloc_init("MacvmGameTimer")
+    }
+    
+    /// NSTimer callback (~60 Hz on the main run loop while a game loop runs): if the
+    /// worker is idle, submit exactly one `GameStep` carrying this tick's held keys.
+    /// Single-outstanding — a still-running step means we skip, never pile up.
+    /// Rendering happens later, when the step's draw commands drain (not here).
+    extern "C" fn on_game_tick(_this: Id, _cmd: Sel, _timer: Id) {
+        // Escape ends the game. Normally that returns to the browser
+        // (`close_game_pane`); in the standalone mandelvm demo it quits the app, and
+        // in the spawned-VM demo it tears the second VM down — both via the frame
+        // loop's stop path. macOS virtual key code 53 = Escape.
+        if macgamepane_graphics::input::key_held(53) {
+            if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                || MANDELVM.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                on_game_loop_stopped();
+            } else {
+                close_game_pane();
+            }
+            return;
+        }
+        let keys = current_game_key_mask();
+        // The spawned-VM demo drives the SECOND VM instance; every other game runs in
+        // the GUI's own VM. Same single-outstanding backpressure (`is_idle`) either way.
+        if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            DEMO_VM.with(|d| {
+                if let Some(vm) = d.borrow().as_ref() {
+                    if vm.is_idle() {
+                        vm.submit(vm_host::VmRequest::GameStep { keys });
+                    }
                 }
+            });
+            return;
+        }
+        let Some(vm) = VM.get() else { return };
+        if !vm.is_idle() {
+            return;
+        }
+        vm.submit(vm_host::VmRequest::GameStep { keys });
+    }
+    
+    /// Close the game pane and return to the GUI (bound to Escape): stop the frame
+    /// loop, restore the WKWebView (by navigating back to the pre-game page, whose
+    /// load swaps the content view back — see `display_html`), make it first
+    /// responder, then drop the native pane so a reopen starts fresh. Order matters:
+    /// swap the game view out of the window *before* freeing its GPU resources.
+    fn close_game_pane() {
+        stop_game_loop_timer();
+        // Reset the VM-side game state so the closed demo leaves nothing behind:
+        // GamePane>>reset nils the registered step block (releasing the demo object
+        // it closes over) and clears the held-key mask. teardown() below drops the
+        // native pane's own state; together that is a full reset, so the next demo
+        // launch starts clean. Queued to the worker (FIFO), so a later launch runs
+        // after it. (NextId stays monotonic by design — that is what keeps a stale
+        // sprite id from aliasing a fresh one; see gamepane_design.md.)
+        if let Some(vm) = VM.get() {
+            vm.submit(vm_host::VmRequest::Doit {
+                code: "GamePane reset.".to_string(),
+            });
+        }
+        let prev = NAV
+            .get()
+            .and_then(|n| n.lock().unwrap().back())
+            .unwrap_or_else(start_page);
+        navigate_to(&prev);
+        if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
+            objc::send1_id(window.0, sel("makeFirstResponder:"), webview.0);
+        }
+        game_pane::teardown();
+    }
+    
+    /// Pack MacGamePane's process-global held-key table into the bitmask
+    /// `GamePane>>keyHeld:` reads (bit 0=Left … 5=B), by macOS virtual key code.
+    fn current_game_key_mask() -> i64 {
+        // Left, Right, Up, Down, Space (A), Z (B) — matches GamePane class>>keyLeft…keyB.
+        const CODES: [u16; 6] = [123, 124, 126, 125, 49, 6];
+        let mut mask = 0i64;
+        for (bit, code) in CODES.iter().enumerate() {
+            if macgamepane_graphics::input::key_held(*code) {
+                mask |= 1 << bit;
+            }
+        }
+        mask
+    }
+    
+    /// Start (or restart) the frame timer — called on `StartLoop` (`GamePane>>run`).
+    pub(crate) fn start_game_loop_timer() {
+        let target = GAME_TIMER_TARGET
+            .get_or_init(|| MainThreadPtr(build_game_timer_target()))
+            .0;
+        GAME_TIMER.with(|t| {
+            let existing = t.get();
+            if existing != NIL {
+                objc::send0(existing, sel("invalidate"));
+            }
+            t.set(objc::scheduled_timer(1.0 / 60.0, target, sel("gameTick:"), true));
+        });
+    }
+    
+    /// Stop the frame timer — called on `StopLoop` (`GamePane>>stop`).
+    pub(crate) fn stop_game_loop_timer() {
+        GAME_TIMER.with(|t| {
+            let existing = t.get();
+            if existing != NIL {
+                objc::send0(existing, sel("invalidate"));
+                t.set(NIL);
             }
         });
-        return;
     }
-    let Some(vm) = VM.get() else { return };
-    if !vm.is_idle() {
-        return;
+    
+    /// True while the native game-pane frame loop is running (the 60 Hz timer is
+    /// scheduled). `game_pane::present_if_dirty` uses this to stay out of the way
+    /// during the loop, so a frame is shown only by its own explicit `Present` and
+    /// never mid-stream (the anti-flicker invariant — see `present_if_dirty`).
+    pub(crate) fn game_loop_active() -> bool {
+        GAME_TIMER.with(|t| t.get() != NIL)
     }
-    vm.submit(vm_host::VmRequest::GameStep { keys });
-}
-
-/// Close the game pane and return to the GUI (bound to Escape): stop the frame
-/// loop, restore the WKWebView (by navigating back to the pre-game page, whose
-/// load swaps the content view back — see `display_html`), make it first
-/// responder, then drop the native pane so a reopen starts fresh. Order matters:
-/// swap the game view out of the window *before* freeing its GPU resources.
-fn close_game_pane() {
-    stop_game_loop_timer();
-    // Reset the VM-side game state so the closed demo leaves nothing behind:
-    // GamePane>>reset nils the registered step block (releasing the demo object
-    // it closes over) and clears the held-key mask. teardown() below drops the
-    // native pane's own state; together that is a full reset, so the next demo
-    // launch starts clean. Queued to the worker (FIFO), so a later launch runs
-    // after it. (NextId stays monotonic by design — that is what keeps a stale
-    // sprite id from aliasing a fresh one; see gamepane_design.md.)
-    if let Some(vm) = VM.get() {
-        vm.submit(vm_host::VmRequest::Doit {
-            code: "GamePane reset.".to_string(),
-        });
-    }
-    let prev = NAV
-        .get()
-        .and_then(|n| n.lock().unwrap().back())
-        .unwrap_or_else(start_page);
-    navigate_to(&prev);
-    if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
-        objc::send1_id(window.0, sel("makeFirstResponder:"), webview.0);
-    }
-    game_pane::teardown();
-}
-
-/// Pack MacGamePane's process-global held-key table into the bitmask
-/// `GamePane>>keyHeld:` reads (bit 0=Left … 5=B), by macOS virtual key code.
-fn current_game_key_mask() -> i64 {
-    // Left, Right, Up, Down, Space (A), Z (B) — matches GamePane class>>keyLeft…keyB.
-    const CODES: [u16; 6] = [123, 124, 126, 125, 49, 6];
-    let mut mask = 0i64;
-    for (bit, code) in CODES.iter().enumerate() {
-        if macgamepane_graphics::input::key_held(*code) {
-            mask |= 1 << bit;
+    
+    /// A game's frame loop has stopped — the guest sent `StopLoop` (`pane stop`),
+    /// e.g. `MandelVM` after finishing its one dive. Always stops the timer; in the
+    /// standalone `mandelvm` mode there is no browser to fall back to, so the demo
+    /// ending means the app (and its VM instance) exits.
+    pub(crate) fn on_game_loop_stopped() {
+        stop_game_loop_timer();
+        if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            // The spawned-VM demo ended: drop that second instance, return to the GUI.
+            teardown_spawned_demo();
+        } else if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
+            // The standalone `mandelvm` window has nothing to return to: quit.
+            let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
+            objc::send1_id(app, sel("terminate:"), NIL);
         }
     }
-    mask
 }
 
-/// Start (or restart) the frame timer — called on `StartLoop` (`GamePane>>run`).
-pub(crate) fn start_game_loop_timer() {
-    let target = GAME_TIMER_TARGET
-        .get_or_init(|| MainThreadPtr(build_game_timer_target()))
-        .0;
-    GAME_TIMER.with(|t| {
-        let existing = t.get();
-        if existing != NIL {
-            objc::send0(existing, sel("invalidate"));
-        }
-        t.set(objc::scheduled_timer(1.0 / 60.0, target, sel("gameTick:"), true));
-    });
-}
-
-/// Stop the frame timer — called on `StopLoop` (`GamePane>>stop`).
-pub(crate) fn stop_game_loop_timer() {
-    GAME_TIMER.with(|t| {
-        let existing = t.get();
-        if existing != NIL {
-            objc::send0(existing, sel("invalidate"));
-            t.set(NIL);
-        }
-    });
-}
-
-/// True while the native game-pane frame loop is running (the 60 Hz timer is
-/// scheduled). `game_pane::present_if_dirty` uses this to stay out of the way
-/// during the loop, so a frame is shown only by its own explicit `Present` and
-/// never mid-stream (the anti-flicker invariant — see `present_if_dirty`).
-pub(crate) fn game_loop_active() -> bool {
-    GAME_TIMER.with(|t| t.get() != NIL)
-}
-
-/// A game's frame loop has stopped — the guest sent `StopLoop` (`pane stop`),
-/// e.g. `MandelVM` after finishing its one dive. Always stops the timer; in the
-/// standalone `mandelvm` mode there is no browser to fall back to, so the demo
-/// ending means the app (and its VM instance) exits.
-pub(crate) fn on_game_loop_stopped() {
-    stop_game_loop_timer();
-    if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        // The spawned-VM demo ended: drop that second instance, return to the GUI.
-        teardown_spawned_demo();
-    } else if MANDELVM.load(std::sync::atomic::Ordering::Relaxed) {
-        // The standalone `mandelvm` window has nothing to return to: quit.
-        let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
-        objc::send1_id(app, sel("terminate:"), NIL);
-    }
-}
+#[cfg(feature = "gamepane")]
+pub(crate) use game_pane_driver::*;
 
 // ── VM metrics dashboard (native sampler → ring buffer → toolbar) ────────────
 //
@@ -1071,17 +1070,16 @@ struct MetricsState {
     poll_pending: bool, // single-outstanding GetMetrics
 }
 
-static METRICS_TIMER_TARGET: OnceLock<MainThreadPtr> = OnceLock::new();
 thread_local! {
     static METRICS: std::cell::RefCell<MetricsState> =
         std::cell::RefCell::new(MetricsState::default());
-    static METRICS_TIMER: std::cell::Cell<Id> = const { std::cell::Cell::new(NIL) };
 }
 
-/// The ~15 Hz sampler tick (main thread). Records whether the VM is executing
-/// compiled code right now (from its per-VM live-signal `Arc`), and once a
-/// second asks the worker for a full counter snapshot.
-extern "C" fn on_metrics_tick(_this: Id, _cmd: Sel, _timer: Id) {
+/// The ~15 Hz sampler tick (UI thread), driven by the shell's timer. Records
+/// whether the VM is executing compiled code right now (from its per-VM
+/// live-signal `Arc`), and once a second asks the worker for a full counter
+/// snapshot.
+pub(crate) fn on_metrics_tick() {
     let Some(vm) = VM.get() else { return };
     // Exec-mode sample: only meaningful while the VM is busy (idle == neither
     // interpreting nor compiling). compiled_depth > 0 == in compiled code.
@@ -1113,30 +1111,6 @@ extern "C" fn on_metrics_tick(_this: Id, _cmd: Sel, _timer: Id) {
     if want_poll {
         vm.submit(vm_host::VmRequest::GetMetrics);
     }
-}
-
-fn build_metrics_timer_target() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmMetricsTimer");
-    objc::add_method(cls, sel("metricsTick:"), on_metrics_tick as *const _, "v@:@");
-    objc::register_class(cls);
-    objc::alloc_init("MacvmMetricsTimer")
-}
-
-/// Start the always-on metrics sampler (~15 Hz). Called once at app launch.
-fn start_metrics_timer() {
-    let target = METRICS_TIMER_TARGET
-        .get_or_init(|| MainThreadPtr(build_metrics_timer_target()))
-        .0;
-    METRICS_TIMER.with(|t| {
-        if t.get() == NIL {
-            t.set(objc::scheduled_timer(
-                1.0 / 15.0,
-                target,
-                sel("metricsTick:"),
-                true,
-            ));
-        }
-    });
 }
 
 /// A counter snapshot came back: fold the window's exec-mode samples into one
@@ -1251,22 +1225,9 @@ fn display_canvas() {
 /// and its doc comment's reasoning — without going through a corpus file
 /// on disk first.
 fn display_html(html: &str) {
-    // If the native game pane swapped itself in as the content view, restore
-    // the WKWebView before loading HTML — only the game pane ever swaps it out,
-    // so this is a no-op on every other navigation.
-    if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
-        let current = objc::send0(window.0, sel("contentView"));
-        if current != webview.0 {
-            objc::send1_id(window.0, sel("setContentView:"), webview.0);
-        }
-    }
-
     let rendered_dir = gui_root().join(".rendered");
     if let Err(e) = std::fs::create_dir_all(&rendered_dir) {
-        eprintln!(
-            "macvm-gui: failed to create {}: {e}",
-            rendered_dir.display()
-        );
+        eprintln!("winvm-gui: failed to create {}: {e}", rendered_dir.display());
         return;
     }
     // A single reusable filename: navigation is synchronous from the main
@@ -1274,42 +1235,16 @@ fn display_html(html: &str) {
     let rendered_path = rendered_dir.join("current.html");
     if let Err(e) = std::fs::write(&rendered_path, html) {
         eprintln!(
-            "macvm-gui: failed to write {}: {e}",
+            "winvm-gui: failed to write {}: {e}",
             rendered_path.display()
         );
         return;
     }
-
-    let Some(webview) = WEBVIEW.get() else { return };
-    let target_url = make_file_url(&rendered_path);
-    let access_root_url = make_file_url(&gui_root());
-    objc::send2_id(
-        webview.0,
-        sel("loadFileURL:allowingReadAccessToURL:"),
-        target_url,
-        access_root_url,
-    );
+    shell::load_rendered_page(&rendered_path);
 }
 
-fn make_file_url(dir: &Path) -> Id {
-    let cls = objc::get_class("NSURL");
-    let path_str = objc::nsstring(&dir.to_string_lossy());
-    objc::send1_id(cls, sel("fileURLWithPath:"), path_str)
-}
-
-/// `[webview evaluateJavaScript:completionHandler:]` with a nil completion
-/// handler — Cocoa accepts nil there when the caller doesn't need the
-/// result (this shell never does), which sidesteps building an
-/// Objective-C block literal entirely (see `objc.rs`'s module doc: this
-/// bridge deliberately doesn't implement the block ABI).
 fn eval_js(js: &str) {
-    let Some(webview) = WEBVIEW.get() else { return };
-    objc::send2_id(
-        webview.0,
-        sel("evaluateJavaScript:completionHandler:"),
-        objc::nsstring(js),
-        NIL,
-    );
+    shell::eval_js(js);
 }
 
 fn js_string_literal(s: &str) -> String {
@@ -1336,71 +1271,26 @@ fn append_transcript(text: &str) {
     ));
 }
 
-/// Cut/Copy/Paste/Select All from `smtk.js`'s custom context menu
-/// (`../PLAN.md`'s native-context-menu takeover — see that file's own
-/// comment on why it can't just be a `WKUIDelegate` override: this bridge
-/// has no Objective-C block ABI, and macOS's context-menu-customization
-/// delegate methods are all completion-handler/block-based). Routed
-/// through `NSApp sendAction:to:from:` with a nil target so AppKit's
-/// standard responder-chain dispatch finds whatever's actually
-/// focused — the exact mechanism a *native* Edit-menu Cut/Copy/Paste/
-/// Select All item already uses when clicked, so this reaches WKWebView's
-/// own internal text handling exactly as reliably, rather than
-/// reimplementing clipboard access in JavaScript (fragile/sandboxed in a
-/// WKWebView, particularly for paste).
+/// Cut/Select All from `smtk.js`'s custom context menu (`../PLAN.md`'s
+/// native-context-menu takeover). Copy and Paste deliberately do NOT come
+/// through here — they go straight to the real clipboard below, because
+/// routing them through the host's own editing machinery never reliably
+/// reached a web-view selection (the user-visible "copy does nothing" bug).
 fn send_edit_action(action: &str) {
-    let sel_name = match action {
-        "cut" => "cut:",
-        "copy" => "copy:",
-        "paste" => "paste:",
-        "selectAll" => "selectAll:",
-        _ => return,
-    };
-    let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
-    objc::send3_id(app, sel("sendAction:to:from:"), sel(sel_name), NIL, NIL);
+    shell::edit_action(action);
 }
 
-/// The REAL clipboard (the responder-chain route above never reliably
-/// reached a WKWebView selection — the user-visible "copy does nothing"
-/// bug): smtk.js captures the selected text at context-menu-open time and
-/// ships it with the editAction message; this writes it straight onto the
-/// general NSPasteboard. `"public.utf8-plain-text"` is
-/// NSPasteboardTypeString's underlying UTI — used literally so the bridge
-/// needs no AppKit constant linkage.
-fn pasteboard_write(text: &str) {
-    let pb = objc::send0(objc::get_class("NSPasteboard"), sel("generalPasteboard"));
-    objc::send0(pb, sel("clearContents"));
-    objc::send2_id(
-        pb,
-        sel("setString:forType:"),
-        objc::nsstring(text),
-        objc::nsstring("public.utf8-plain-text"),
-    );
+/// The REAL clipboard: smtk.js captures the selected text at
+/// context-menu-open time and ships it with the editAction message; this
+/// writes it straight onto the system clipboard.
+fn clipboard_write(text: &str) {
+    shell::clipboard_write(text);
 }
 
-/// The paste half: read the general pasteboard's string (empty when it
-/// holds no text) — smtk.js inserts it at the focused field's cursor via
-/// `macvmPasteText`.
-fn pasteboard_read() -> String {
-    let pb = objc::send0(objc::get_class("NSPasteboard"), sel("generalPasteboard"));
-    let ns = objc::send1_id(
-        pb,
-        sel("stringForType:"),
-        objc::nsstring("public.utf8-plain-text"),
-    );
-    if ns.is_null() {
-        String::new()
-    } else {
-        objc::string_from_nsstring(ns)
-    }
-}
-
-fn dict_get_string(dict: Id, key: &str) -> String {
-    if dict.is_null() {
-        return String::new();
-    }
-    let value = objc::send1_id(dict, sel("objectForKey:"), objc::nsstring(key));
-    objc::string_from_nsstring(value)
+/// The paste half: read the clipboard's string (empty when it holds no text)
+/// — smtk.js inserts it at the focused field's cursor via `macvmPasteText`.
+fn clipboard_read() -> String {
+    shell::clipboard_read()
 }
 
 /// Run a toolbar action by name — shared by the native toolbar buttons
@@ -1408,6 +1298,18 @@ fn dict_get_string(dict: Id, key: &str) -> String {
 /// MACVM equivalent (`VmResponse::SmapplNavigate`, e.g. `Launcher launchers
 /// anElement openClassHierarchyOutliner` → `hierarchy`). Action names match the
 /// `TOOLBAR_BUTTONS` data-action strings.
+/// The native game pane is macOS-only and off by default (`Cargo.toml`'s
+/// `gamepane` feature; `../MIGRATION.md` §1 defers the game demos on
+/// Windows, where D3D11/XAudio2 would be their counterpart). Say so in the
+/// transcript rather than having the button do nothing at all, which reads
+/// as a bug.
+#[cfg(not(feature = "gamepane"))]
+fn report_no_game_pane() {
+    append_transcript(
+        "(game pane: not built in — it is macOS-only and off by default; see MIGRATION.md §1)",
+    );
+}
+
 fn navigate_toolbar(button: &str) {
     match button {
         "goBack" => {
@@ -1445,7 +1347,10 @@ fn navigate_toolbar(button: &str) {
         "workspace" => open_workspace(),
         "editor" => open_editor(),
         "canvas" => open_canvas(),
+        #[cfg(feature = "gamepane")]
         "gamePane" => open_game_pane(),
+        #[cfg(not(feature = "gamepane"))]
+        "gamePane" => report_no_game_pane(),
         "refresh" => reload_current_page(),
         "biggerText" => {
             bump_font_scale(FONT_SCALE_STEP as i32);
@@ -1461,12 +1366,10 @@ fn navigate_toolbar(button: &str) {
 
 // ── WKScriptMessageHandler: userContentController:didReceiveScriptMessage: ─
 
-extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: Id) {
-    let body = objc::send0(message, sel("body"));
-    let kind = dict_get_string(body, "kind");
-    match kind.as_str() {
+pub(crate) fn on_script_message(body: &ScriptMessage) {
+    match body.kind().as_str() {
         "doit" => {
-            let code = dict_get_string(body, "code");
+            let code = body.get("code");
             // SPEC §16.1: doits cross the GUI→VM channel to the worker
             // thread rather than running inline here. The worker (still a
             // stub — no real VM yet, ../PLAN.md G2) answers by echoing the
@@ -1478,7 +1381,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
                 vm.submit(vm_host::VmRequest::Doit { code });
             }
         }
-        "toolbar" => navigate_toolbar(&dict_get_string(body, "button")),
+        "toolbar" => navigate_toolbar(&body.get("button")),
         "clearTranscript" => {
             // Empty the persisted history so the clear survives navigation (the
             // next page's `statusbar_html` renders from this buffer), then clear
@@ -1488,7 +1391,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             eval_js("window.macvmClearTranscript && window.macvmClearTranscript()");
         }
         "navigate" => {
-            let href = dict_get_string(body, "href");
+            let href = body.get("href");
             let Some(nav) = NAV.get() else { return };
             let current_dir = {
                 let n = nav.lock().unwrap();
@@ -1519,19 +1422,19 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         "browserSelectPackage" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::BrowserSelectPackage {
-                    name: dict_get_string(body, "name"),
+                    name: body.get("name"),
                 });
             }
         }
         "browserSelectClass" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::BrowserSelectClass {
-                    name: dict_get_string(body, "name"),
+                    name: body.get("name"),
                 });
             }
         }
         "browserSelectSide" => {
-            let side = if dict_get_string(body, "side") == "class" {
+            let side = if body.get("side") == "class" {
                 vm_host::Side::Class
             } else {
                 vm_host::Side::Instance
@@ -1543,27 +1446,27 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         "browserSelectCategory" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::BrowserSelectCategory {
-                    name: dict_get_string(body, "name"),
+                    name: body.get("name"),
                 });
             }
         }
         "browserSelectMethod" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::BrowserSelectMethod {
-                    selector: dict_get_string(body, "name"),
+                    selector: body.get("name"),
                 });
             }
         }
         "browserSaveSource" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::BrowserSaveSource {
-                    text: dict_get_string(body, "text"),
-                    saved_package: dict_get_string(body, "savedPackage"),
-                    saved_class: dict_get_string(body, "savedClass"),
-                    saved_side: dict_get_string(body, "savedSide"),
-                    saved_category: dict_get_string(body, "savedCategory"),
-                    saved_method: dict_get_string(body, "savedMethod"),
-                    saved_target: dict_get_string(body, "savedTarget"),
+                    text: body.get("text"),
+                    saved_package: body.get("savedPackage"),
+                    saved_class: body.get("savedClass"),
+                    saved_side: body.get("savedSide"),
+                    saved_category: body.get("savedCategory"),
+                    saved_method: body.get("savedMethod"),
+                    saved_target: body.get("savedTarget"),
                 });
             }
         }
@@ -1600,12 +1503,12 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         "workspacePrintIt" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::WorkspacePrintIt {
-                    code: dict_get_string(body, "code"),
+                    code: body.get("code"),
                 });
             }
         }
         "workspaceTextChanged" => {
-            *WORKSPACE_TEXT.lock().unwrap() = Some(dict_get_string(body, "text"));
+            *WORKSPACE_TEXT.lock().unwrap() = Some(body.get("text"));
         }
         "canvasRunDemo" => {
             if let Some(vm) = VM.get() {
@@ -1618,7 +1521,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // answer drawn. The GUI holds no per-drawing knowledge.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::CanvasEval {
-                    code: dict_get_string(body, "code"),
+                    code: body.get("code"),
                 });
             }
         }
@@ -1627,10 +1530,10 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // answers a width*height*4 RGBA buffer, blitted via putImageData.
             // width/height arrive as strings (only dict_get_string exists).
             if let Some(vm) = VM.get() {
-                let width = dict_get_string(body, "width").parse().unwrap_or(0);
-                let height = dict_get_string(body, "height").parse().unwrap_or(0);
+                let width = body.get("width").parse().unwrap_or(0);
+                let height = body.get("height").parse().unwrap_or(0);
                 vm.submit(vm_host::VmRequest::CanvasEvalPixels {
-                    code: dict_get_string(body, "code"),
+                    code: body.get("code"),
                     width,
                     height,
                 });
@@ -1642,24 +1545,24 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             }
         }
         "editAction" => {
-            let action = dict_get_string(body, "action");
+            let action = body.get("action");
             match action.as_str() {
                 // Copy: the selected text rode in with the message
                 // (captured at menu-open in smtk.js) — write it to the
                 // real pasteboard. An empty payload falls back to the
                 // old responder-chain path (harmless, occasionally right).
                 "copy" => {
-                    let text = dict_get_string(body, "text");
+                    let text = body.get("text");
                     if text.is_empty() {
                         send_edit_action("copy");
                     } else {
-                        pasteboard_write(&text);
+                        clipboard_write(&text);
                     }
                 }
                 // Paste: read the pasteboard and hand the string back to
                 // the page; smtk.js inserts it at the focused cursor.
                 "paste" => {
-                    let text = pasteboard_read();
+                    let text = clipboard_read();
                     if !text.is_empty() {
                         eval_js(&format!("macvmPasteText({})", js_string_literal(&text)));
                     }
@@ -1673,8 +1576,8 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // `visual=` code and answers a fragment (D-G5, ../smappl.md).
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplRender {
-                    id: dict_get_string(body, "id"),
-                    code: dict_get_string(body, "code"),
+                    id: body.get("id"),
+                    code: body.get("code"),
                 });
             }
         }
@@ -1682,7 +1585,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // A rendered smappl widget was clicked — fire its action closure.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplAction {
-                    action_id: dict_get_string(body, "actionId"),
+                    action_id: body.get("actionId"),
                 });
             }
         }
@@ -1691,11 +1594,11 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // the image and live-compile it.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplAccept {
-                    cls: dict_get_string(body, "cls"),
-                    side: dict_get_string(body, "side"),
-                    sel: dict_get_string(body, "sel"),
-                    text: dict_get_string(body, "text"),
-                    widget_id: dict_get_string(body, "widgetId"),
+                    cls: body.get("cls"),
+                    side: body.get("side"),
+                    sel: body.get("sel"),
+                    text: body.get("text"),
+                    widget_id: body.get("widgetId"),
                 });
             }
         }
@@ -1703,9 +1606,9 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // Cmd+S in an outliner "＋ new method" template — create the method.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplNewMethod {
-                    cls: dict_get_string(body, "cls"),
-                    side: dict_get_string(body, "side"),
-                    text: dict_get_string(body, "text"),
+                    cls: body.get("cls"),
+                    side: body.get("side"),
+                    text: body.get("text"),
                 });
             }
         }
@@ -1713,7 +1616,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // Cmd+S in an outliner "＋ new class" template — create the class.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplNewClass {
-                    text: dict_get_string(body, "text"),
+                    text: body.get("text"),
                 });
             }
         }
@@ -1721,9 +1624,9 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // ⏎/Cmd+S in an outliner "＋ add instance/class variable" field.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplAddVar {
-                    cls: dict_get_string(body, "cls"),
-                    is_class_var: dict_get_string(body, "varKind") == "class",
-                    name: dict_get_string(body, "name"),
+                    cls: body.get("cls"),
+                    is_class_var: body.get("varKind") == "class",
+                    name: body.get("name"),
                 });
             }
         }
@@ -1731,25 +1634,25 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // Drill from a hierarchy outliner into a class's method browser.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplOpenClass {
-                    cls: dict_get_string(body, "cls"),
-                    root: dict_get_string(body, "root"),
-                    widget_id: dict_get_string(body, "widgetId"),
+                    cls: body.get("cls"),
+                    root: body.get("root"),
+                    widget_id: body.get("widgetId"),
                 });
             }
         }
         "smapplOpenHierarchy" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::SmapplOpenHierarchy {
-                    root: dict_get_string(body, "root"),
-                    widget_id: dict_get_string(body, "widgetId"),
+                    root: body.get("root"),
+                    widget_id: body.get("widgetId"),
                 });
             }
         }
         "find" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::Find {
-                    tool: dict_get_string(body, "tool"),
-                    query: dict_get_string(body, "query"),
+                    tool: body.get("tool"),
+                    query: body.get("query"),
                 });
             }
         }
@@ -1757,7 +1660,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // A find page loaded — fetch its combobox options from image_store.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::FindOptions {
-                    tool: dict_get_string(body, "tool"),
+                    tool: body.get("tool"),
                 });
             }
         }
@@ -1765,7 +1668,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // The editor's class picker fired (Enter on a class name). Rebuild
             // the page with that class's source. Pure main-thread image read —
             // no VM round trip, same as the find/inject-method-sources path.
-            let name = dict_get_string(body, "class");
+            let name = body.get("class");
             display_editor(if name.is_empty() { None } else { Some(&name) });
         }
         "editorSession" => {
@@ -1774,7 +1677,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // EditorDamage reply flows back through vm_bridge_drain.
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::EditorOpen {
-                    text: dict_get_string(body, "text"),
+                    text: body.get("text"),
                 });
             }
         }
@@ -1783,9 +1686,9 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
             // real caret offset (`at`, posted as a string) so the VM edits where
             // the user is. Answers an EditorDamage the JS terminal patches in.
             if let Some(vm) = VM.get() {
-                let at = dict_get_string(body, "at").parse::<i64>().unwrap_or(1);
+                let at = body.get("at").parse::<i64>().unwrap_or(1);
                 vm.submit(vm_host::VmRequest::EditorKey {
-                    key: dict_get_string(body, "key"),
+                    key: body.get("key"),
                     at,
                 });
             }
@@ -1793,7 +1696,7 @@ extern "C" fn on_script_message(_this: Id, _cmd: Sel, _controller: Id, message: 
         "editorCommand" => {
             if let Some(vm) = VM.get() {
                 vm.submit(vm_host::VmRequest::EditorCommand {
-                    name: dict_get_string(body, "name"),
+                    name: body.get("name"),
                 });
             }
         }
@@ -1835,157 +1738,108 @@ fn reload_current_page() {
     }
 }
 
-const NS_CONTROL_STATE_VALUE_ON: i64 = 1;
-const NS_CONTROL_STATE_VALUE_OFF: i64 = 0;
+/// A menu item was chosen. Both shells name their items with these same
+/// action strings (`shell/mac.rs`'s selectors, `shell/win.rs`'s command ids),
+/// so menu behaviour is defined once here rather than twice.
+///
+/// Themes are `theme:<index into Theme::ALL>` — one action for every theme,
+/// so adding a theme is purely a `Theme::ALL` entry with no second list to
+/// keep in sync. That is exactly how the old per-theme `selectXTheme:`
+/// handlers silently dropped newly-added themes from the menu.
+pub(crate) fn on_menu_action(action: &str) {
+    match action {
+        // World I/O: submit to the worker (which owns the image + world_dir),
+        // result reported to the transcript.
+        "saveWorld" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::ExportWorld);
+            }
+        }
+        "loadWorld" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::ImportWorld);
+            }
+        }
+        // Kills the current language thread and boots a fresh VM. Runs on the
+        // UI thread, which is independent of the (possibly wedged) worker, so
+        // this stays clickable even when a runaway doit has hung the VM — the
+        // whole reason they are on separate threads.
+        "restartVm" => {
+            if let Some(vm) = VM.get() {
+                vm.restart();
+            }
+        }
+        "help" => {
+            let help = macvm_help_index();
+            if let Some(nav) = NAV.get() {
+                nav.lock().unwrap().go(help.clone());
+            }
+            navigate_to(&help);
+        }
+        "cut" | "copy" | "paste" | "selectAll" => send_edit_action(action),
+        #[cfg(feature = "gamepane")]
+        "demoBreakout" => run_game_demo("Breakout launch."),
+        #[cfg(feature = "gamepane")]
+        "demoMandel" => run_game_demo("MandelZoom launch."),
+        #[cfg(feature = "gamepane")]
+        "demoParallelMandel" => run_game_demo("ParallelMandel launch."),
+        #[cfg(feature = "gamepane")]
+        "demoSpawnedMandel" => run_spawned_mandel_demo(),
+        #[cfg(feature = "gamepane")]
+        "demoCocoaPad" => {
+            if let Some(vm) = VM.get() {
+                vm.submit(vm_host::VmRequest::Doit {
+                    code: "CocoaPad launch.".to_string(),
+                });
+            }
+        }
+        other => {
+            if let Some(index) = other.strip_prefix("theme:") {
+                if let Some(&theme) = index.parse().ok().and_then(|i: usize| Theme::ALL.get(i)) {
+                    set_theme(theme);
+                    update_theme_menu_checkmarks();
+                    reload_current_page();
+                }
+            }
+        }
+    }
+}
 
-/// Reflect the active theme as a checkmark on every Theme-menu item.
+/// Reflect the active theme as a checkmark on the Theme menu.
 fn update_theme_menu_checkmarks() {
-    let Some(items) = THEME_MENU_ITEMS.get() else {
-        return;
-    };
     let current = current_theme();
-    for (theme, item) in items {
-        objc::send1_i64(
-            item.0,
-            sel("setState:"),
-            if *theme == current {
-                NS_CONTROL_STATE_VALUE_ON
-            } else {
-                NS_CONTROL_STATE_VALUE_OFF
-            },
-        );
+    if let Some(index) = Theme::ALL.iter().position(|&t| t == current) {
+        shell::set_theme_checkmark(index);
     }
 }
 
-/// The Theme menu's single action: the clicked item's `tag` is its index into
-/// `Theme::ALL` (set in `build_theme_menu`), so ONE handler serves every theme
-/// and adding a theme is purely a `Theme::ALL` entry — no new selector or IMP,
-/// no second list to keep in sync (which is exactly how the old per-theme
-/// `selectXTheme:` handlers silently dropped newly-added themes from the menu).
-extern "C" fn theme_menu_select(_this: Id, _cmd: Sel, sender: Id) {
-    let idx = objc::send0_i64(sender, sel("tag")) as usize;
-    if let Some(&theme) = Theme::ALL.get(idx) {
-        set_theme(theme);
-        update_theme_menu_checkmarks();
-        reload_current_page();
-    }
-}
-
-/// A small target object for the Theme menu's two actions. Not stored
-/// anywhere long-term, same as `build_quit_on_last_window_delegate` and
-/// `build_message_handler` below: this bridge never sends `release`, so an
-/// object's `alloc` retain count of 1 never drops to zero and it simply
-/// lives for the process's lifetime — the same reasoning that already
-/// makes those two delegates work without an explicit `static` holding
-/// them.
-fn build_theme_delegate() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmThemeDelegate");
-    // One action for every theme; the item's tag says which (see build_theme_menu).
-    objc::add_method(cls, sel("selectTheme:"), theme_menu_select as *const _, "v@:@");
-    objc::register_class(cls);
-    objc::alloc_init("MacvmThemeDelegate")
-}
-
-extern "C" fn open_macvm_help(_this: Id, _cmd: Sel, _sender: Id) {
-    let help = macvm_help_index();
-    if let Some(nav) = NAV.get() {
-        nav.lock().unwrap().go(help.clone());
-    }
-    navigate_to(&help);
-}
-
-/// Target object for the Help menu's item — same not-stored-long-term
-/// reasoning as `build_theme_delegate`.
-fn build_help_delegate() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmHelpDelegate");
-    objc::add_method(
-        cls,
-        sel("openMacvmHelp:"),
-        open_macvm_help as *const _,
-        "v@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmHelpDelegate")
-}
-
-/// The VM menu's "Restart VM Thread" action — kills the current language
-/// thread and boots a fresh VM (`vm_host::VmHost::restart`). Runs on the main
-/// thread, which is independent of the (possibly wedged) worker thread, so
-/// this stays clickable even when a runaway doit has hung the VM — the whole
-/// reason they're on separate threads.
-extern "C" fn restart_vm_thread(_this: Id, _cmd: Sel, _sender: Id) {
-    if let Some(vm) = VM.get() {
-        vm.restart();
-    }
-}
-
-/// The Demos menu's "Breakout" item: open the native game pane and start the
-/// Breakout demo game (`world/44_breakout.mst`). Same path as the
-/// `MACVM_GAMEPANE_DEMO` launch trigger.
-extern "C" fn run_breakout_demo(_this: Id, _cmd: Sel, _sender: Id) {
+/// Open the native game pane and launch a Smalltalk demo in the GUI's own VM
+/// (`docs/gamepane_design.md`). Same path as the `MACVM_GAMEPANE_DEMO` launch
+/// trigger.
+#[cfg(feature = "gamepane")]
+fn run_game_demo(code: &str) {
     open_game_pane();
     if let Some(vm) = VM.get() {
         vm.submit(vm_host::VmRequest::Doit {
-            code: "Breakout launch.".to_string(),
+            code: code.to_string(),
         });
     }
 }
 
-/// The Demos menu's "CocoaPad" item: the Cocoa-bridge capstone (C5) — a
-/// native NSWindow + text field + button built ENTIRELY in Smalltalk
-/// (world/50_cocoapad.mst): DNU keyword sends, onMain hops, and a
-/// Smalltalk block as the button's action. No game pane — the demo makes
-/// its own window.
-extern "C" fn run_cocoapad_demo(_this: Id, _cmd: Sel, _sender: Id) {
-    if let Some(vm) = VM.get() {
-        vm.submit(vm_host::VmRequest::Doit {
-            code: "CocoaPad launch.".to_string(),
-        });
-    }
-}
-
-/// The Demos menu's "Mandelbrot" item: open the native game pane and start the
-/// zooming-Mandelbrot demo (`world/45_mandelzoom.mst`). Same path as Breakout.
-extern "C" fn run_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
-    open_game_pane();
-    if let Some(vm) = VM.get() {
-        vm.submit(vm_host::VmRequest::Doit {
-            code: "MandelZoom launch.".to_string(),
-        });
-    }
-}
-
-/// The Demos menu's "Mandelbrot — parallel workers" item: the multi-Smalltalk-
-/// worker capstone (docs/multi-smalltalk-worker.md M4). `ParallelMandel` spawns
-/// 4 worker VMs from Smalltalk (`Worker spawn:` — the vm_host-registered boot
-/// closure boots each from the same image) and computes every frame of the
-/// zooming dive in parallel bands; the GUI VM only assembles and blits. Runs in
-/// the GUI's own VM, so the browser/Workspace machinery is untouched.
-extern "C" fn run_parallel_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
-    open_game_pane();
-    if let Some(vm) = VM.get() {
-        vm.submit(vm_host::VmRequest::Doit {
-            code: "ParallelMandel launch.".to_string(),
-        });
-    }
-}
-
-/// The Demos menu's "Mandelbrot — spawned VM" item: the real multi-VM demo.
-/// Spins up a genuinely SECOND VM instance (its own worker thread + fresh
-/// `VmHandle`, booted from the image — independent of the GUI's own `VM`), runs
-/// the single-dive `MandelVM` in it in the game pane, and tears that instance
-/// back down when the dive ends (`on_game_loop_stopped` → `teardown_spawned_demo`).
+/// The "Mandelbrot — spawned VM" demo: the real multi-VM case. Spins up a
+/// genuinely SECOND VM instance (its own worker thread + fresh `VmHandle`,
+/// booted from the image — independent of the GUI's own `VM`), runs the
+/// single-dive `MandelVM` in it in the game pane, and tears that instance back
+/// down when the dive ends (`on_game_loop_stopped` -> `teardown_spawned_demo`).
 /// The GUI's own VM never pauses — it keeps serving the Workspace/browser.
-extern "C" fn run_spawned_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
+#[cfg(feature = "gamepane")]
+fn run_spawned_mandel_demo() {
     if DEMO_VM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return; // one spawned demo at a time
     }
-    let bridge = DEMO_VM_BRIDGE
-        .get_or_init(|| MainThreadPtr(build_demo_vm_bridge()))
-        .0;
-    // Spawn the second VM: its own OS thread, its own VmHandle booted fresh from
-    // the image, its own response channel drained by `drainDemoVm:`.
-    let demo = vm_host::spawn(bridge, sel("drainDemoVm:"));
+    // Its own OS thread, its own VmHandle, and its own waker so its responses
+    // drain separately from the main VM's.
+    let demo = vm_host::spawn(shell::demo_waker());
     DEMO_VM.with(|d| *d.borrow_mut() = Some(demo));
     DEMO_VM_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     append_transcript("--- spawned a fresh VM instance to run MandelVM (one dive, then it exits) ---");
@@ -2000,11 +1854,13 @@ extern "C" fn run_spawned_mandel_demo(_this: Id, _cmd: Sel, _sender: Id) {
 }
 
 /// Drain the SPAWNED demo VM's responses (a separate channel from the main
-/// `VM`'s) and apply its game-draw commands to the shared pane. Collect the batch
-/// first and release the `DEMO_VM` borrow BEFORE applying: a `StopLoop` in the
-/// batch runs `teardown_spawned_demo`, which drops `DEMO_VM` and so needs a fresh
-/// borrow. `MandelVM` emits only game (and, on error, transcript) responses.
-extern "C" fn demo_vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
+/// `VM`'s) and apply its game-draw commands to the shared pane. Collect the
+/// batch first and release the `DEMO_VM` borrow BEFORE applying: a `StopLoop`
+/// in the batch runs `teardown_spawned_demo`, which drops `DEMO_VM` and so
+/// needs a fresh borrow. `MandelVM` emits only game (and, on error,
+/// transcript) responses.
+#[cfg(feature = "gamepane")]
+pub(crate) fn on_demo_vm_drain() {
     let responses = DEMO_VM.with(|d| {
         d.borrow()
             .as_ref()
@@ -2021,27 +1877,14 @@ extern "C" fn demo_vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
     game_pane::present_if_dirty();
 }
 
-/// The bridge object whose `drainDemoVm:` selector runs [`demo_vm_bridge_drain`]
-/// when the spawned VM's worker wakes the main thread.
-fn build_demo_vm_bridge() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmDemoVmBridge");
-    objc::add_method(
-        cls,
-        sel("drainDemoVm:"),
-        demo_vm_bridge_drain as *const _,
-        "v@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmDemoVmBridge")
-}
-
 /// End the spawned-VM demo: swap the browser back in (the main VM's content),
 /// drop the native pane, then drop the spawned `DEMO_VM` — closing its request
 /// channel lets its worker thread exit. The GUI's own `VM` is untouched
-/// throughout, so the Workspace/browser is live again immediately. Order matters:
-/// restore the webview BEFORE freeing the pane's GPU resources (as
+/// throughout, so the Workspace/browser is live again immediately. Order
+/// matters: restore the webview BEFORE freeing the pane's GPU resources (as
 /// `close_game_pane`), and take the `DEMO_VM` borrow only after the drain that
 /// triggered us has released it.
+#[cfg(feature = "gamepane")]
 fn teardown_spawned_demo() {
     DEMO_VM_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
     let prev = NAV
@@ -2049,112 +1892,30 @@ fn teardown_spawned_demo() {
         .and_then(|n| n.lock().unwrap().back())
         .unwrap_or_else(start_page);
     navigate_to(&prev);
-    if let (Some(window), Some(webview)) = (WINDOW.get(), WEBVIEW.get()) {
-        objc::send1_id(window.0, sel("makeFirstResponder:"), webview.0);
-    }
+    shell::focus_webview();
     game_pane::teardown();
     DEMO_VM.with(|d| *d.borrow_mut() = None);
     append_transcript("--- MandelVM finished; the spawned VM instance was torn down (the GUI VM never paused) ---");
 }
 
-/// Target object for the Demos menu's items — not stored long-term (same
-/// reasoning as `build_vm_delegate`: `alloc_init`'s retain keeps it alive for
-/// the app's lifetime).
-fn build_demos_delegate() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmDemosDelegate");
-    objc::add_method(
-        cls,
-        sel("runBreakoutDemo:"),
-        run_breakout_demo as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("runCocoaPadDemo:"),
-        run_cocoapad_demo as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("runMandelDemo:"),
-        run_mandel_demo as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("runSpawnedMandelDemo:"),
-        run_spawned_mandel_demo as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("runParallelMandelDemo:"),
-        run_parallel_mandel_demo as *const _,
-        "v@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmDemosDelegate")
-}
-
-/// Target object for the VM menu's item — same not-stored-long-term
-/// reasoning as `build_theme_delegate`.
-fn build_vm_delegate() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmVmDelegate");
-    objc::add_method(
-        cls,
-        sel("restartVmThread:"),
-        restart_vm_thread as *const _,
-        "v@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmVmDelegate")
-}
-
-extern "C" fn app_should_terminate_after_last_window_closed(
-    _this: Id,
-    _cmd: Sel,
-    _sender: Id,
-) -> bool {
-    true
-}
-
-fn build_quit_on_last_window_delegate() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmAppDelegate");
-    objc::add_method(
-        cls,
-        sel("applicationShouldTerminateAfterLastWindowClosed:"),
-        app_should_terminate_after_last_window_closed as *const _,
-        "B@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmAppDelegate")
-}
-
-fn build_message_handler() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmScriptMessageHandler");
-    objc::add_method(
-        cls,
-        sel("userContentController:didReceiveScriptMessage:"),
-        on_script_message as *const _,
-        "v@:@@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmScriptMessageHandler")
-}
-
 // ── VM bridge: the main-thread side of vm_host's worker thread ────────────
 
-/// Runs on the main thread, invoked via `performSelector:withObject:
-/// waitUntilDone:` from the VM worker thread (`vm_host::spawn`) whenever a
-/// response is ready. Drains every response queued since the last call
-/// (not just one) — `performSelector:` calls can coalesce in principle, and
-/// this is cheap and correct either way.
-extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
+/// Runs on the UI thread, woken by the VM worker thread (`vm_host::spawn`)
+/// whenever a response is ready. Drains every response queued since the last
+/// call (not just one) — wakeups can coalesce in principle, and this is cheap
+/// and correct either way.
+pub(crate) fn on_vm_drain() {
     let Some(vm) = VM.get() else { return };
     for response in vm.drain_responses() {
         match response {
             vm_host::VmResponse::Transcript(text) => append_transcript(&text),
+            #[cfg(feature = "gamepane")]
             vm_host::VmResponse::Game(cmd) => game_pane::apply_command(&cmd),
+            // The native game pane is macOS-only (`../MIGRATION.md` §1 defers
+            // the game demos); a guest that draws anyway is told so once, in
+            // the transcript, rather than silently drawing nothing.
+            #[cfg(not(feature = "gamepane"))]
+            vm_host::VmResponse::Game(_) => {}
             vm_host::VmResponse::EditorView { cursor, text } => {
                 // Blast the whole buffer + caret into the JS terminal, which
                 // just sets textarea.value and the selection — the VM is the
@@ -2306,6 +2067,7 @@ extern "C" fn vm_bridge_drain(_this: Id, _cmd: Sel, _arg: Id) {
     }
     // A whole batch of game draw commands (a frame) presents exactly once,
     // here, after they've all been applied to the pane (game_pane.rs).
+    #[cfg(feature = "gamepane")]
     game_pane::present_if_dirty();
 }
 
@@ -2328,280 +2090,11 @@ fn replace_pane(dom_id: &str, html: &str) {
     ));
 }
 
-fn build_vm_bridge() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmVmBridge");
-    objc::add_method(
-        cls,
-        sel("drainVmResponses:"),
-        vm_bridge_drain as *const _,
-        "v@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmVmBridge")
-}
-
-// ── Menu bar: File / Edit / Help (../PLAN.md G0) ───────────────────────────
-
-fn menu_item(title: &str, action: Option<&str>, key_equivalent: &str) -> Id {
-    let item = objc::send0(objc::get_class("NSMenuItem"), sel("alloc"));
-    objc::send3_id(
-        item,
-        sel("initWithTitle:action:keyEquivalent:"),
-        objc::nsstring(title),
-        action.map(objc::sel).unwrap_or(NIL),
-        objc::nsstring(key_equivalent),
-    )
-}
-
-fn separator_item() -> Id {
-    objc::send0(objc::get_class("NSMenuItem"), sel("separatorItem"))
-}
-
-fn submenu(title: &str, items: &[Id]) -> Id {
-    let menu_item = objc::send0(objc::get_class("NSMenuItem"), sel("alloc"));
-    let menu_item = objc::send3_id(
-        menu_item,
-        sel("initWithTitle:action:keyEquivalent:"),
-        objc::nsstring(title),
-        NIL,
-        objc::nsstring(""),
-    );
-    let menu = objc::alloc_init("NSMenu");
-    for &item in items {
-        objc::send1_id(menu, sel("addItem:"), item);
-    }
-    objc::send1_id(menu_item, sel("setSubmenu:"), menu);
-    menu_item
-}
-
-/// `NSApplicationActivationPolicyRegular` — a normal foreground app (Dock
-/// icon, menu bar, window activation). Without this, a bare executable
-/// (no `.app` bundle / `Info.plist`) defaults to behaving like a
-/// background agent: `run()` still returns control correctly at
-/// termination, but no window ever becomes visible or key. This is the
-/// exact detail MacModula2's `Cocoa.mod` `InitApp` calls out
-/// (`library/macrtmod/Cocoa.mod:42-43`) — missing it here was a real bug,
-/// caught by actually running the shell rather than just reading the code.
-const NS_APPLICATION_ACTIVATION_POLICY_REGULAR: i64 = 0;
-
-// File-menu world I/O: submit to the worker (which owns the image + world_dir),
-// result reported to the transcript.
-extern "C" fn save_world_to_files(_this: Id, _cmd: Sel, _sender: Id) {
-    if let Some(vm) = VM.get() {
-        vm.submit(vm_host::VmRequest::ExportWorld);
-    }
-}
-
-extern "C" fn load_world_from_files(_this: Id, _cmd: Sel, _sender: Id) {
-    if let Some(vm) = VM.get() {
-        vm.submit(vm_host::VmRequest::ImportWorld);
-    }
-}
-
-fn build_world_io_delegate() -> Id {
-    let cls = objc::allocate_class(objc::get_class("NSObject"), "MacvmWorldIoDelegate");
-    objc::add_method(
-        cls,
-        sel("saveWorldToFiles:"),
-        save_world_to_files as *const _,
-        "v@:@",
-    );
-    objc::add_method(
-        cls,
-        sel("loadWorldFromFiles:"),
-        load_world_from_files as *const _,
-        "v@:@",
-    );
-    objc::register_class(cls);
-    objc::alloc_init("MacvmWorldIoDelegate")
-}
-
-fn build_menu_bar() {
-    let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
-    objc::send1_i64(
-        app,
-        sel("setActivationPolicy:"),
-        NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
-    );
-
-    let app_menu = submenu("MACVM", &[menu_item("Quit MACVM", Some("terminate:"), "q")]);
-    // File menu: window control + world ↔ files (image_store export/import), so
-    // interactive edits can be checked into source control and pulled back.
-    let world_io_delegate = build_world_io_delegate();
-    let save_world_item = menu_item("Save World to Files", Some("saveWorldToFiles:"), "");
-    objc::send1_id(save_world_item, sel("setTarget:"), world_io_delegate);
-    let load_world_item = menu_item("Load World from Files", Some("loadWorldFromFiles:"), "");
-    objc::send1_id(load_world_item, sel("setTarget:"), world_io_delegate);
-    let file_menu = submenu(
-        "File",
-        &[
-            menu_item("Close Window", Some("performClose:"), "w"),
-            separator_item(),
-            save_world_item,
-            load_world_item,
-        ],
-    );
-    let edit_menu = submenu(
-        "Edit",
-        &[
-            menu_item("Cut", Some("cut:"), "x"),
-            menu_item("Copy", Some("copy:"), "c"),
-            menu_item("Paste", Some("paste:"), "v"),
-            separator_item(),
-            menu_item("Select All", Some("selectAll:"), "a"),
-        ],
-    );
-    // The VM menu: kill + restart the language thread. Cmd+R is free (no
-    // other menu binds it) and this action is a recovery hatch for a wedged
-    // VM, so a shortcut earns its keep.
-    let vm_delegate = build_vm_delegate();
-    let restart_item = menu_item("Restart VM Thread", Some("restartVmThread:"), "r");
-    objc::send1_id(restart_item, sel("setTarget:"), vm_delegate);
-    let vm_menu = submenu("VM", &[restart_item]);
-
-    // The Demos menu: launch a Smalltalk demo game in the native game pane
-    // (docs/gamepane_design.md).
-    let demos_delegate = build_demos_delegate();
-    let breakout_item = menu_item("Breakout — clear the wall (← →)", Some("runBreakoutDemo:"), "");
-    objc::send1_id(breakout_item, sel("setTarget:"), demos_delegate);
-    let mandel_item = menu_item("Mandelbrot — a live zooming dive", Some("runMandelDemo:"), "");
-    objc::send1_id(mandel_item, sel("setTarget:"), demos_delegate);
-    let spawned_item = menu_item(
-        "Mandelbrot — in a spawned VM (one dive)",
-        Some("runSpawnedMandelDemo:"),
-        "",
-    );
-    objc::send1_id(spawned_item, sel("setTarget:"), demos_delegate);
-    let parallel_item = menu_item(
-        "Mandelbrot — parallel workers (4 VMs)",
-        Some("runParallelMandelDemo:"),
-        "",
-    );
-    objc::send1_id(parallel_item, sel("setTarget:"), demos_delegate);
-    let cocoapad_item = menu_item(
-        "CocoaPad — a native window from Smalltalk",
-        Some("runCocoaPadDemo:"),
-        "",
-    );
-    objc::send1_id(cocoapad_item, sel("setTarget:"), demos_delegate);
-    let demos_menu = submenu(
-        "Demos",
-        &[
-            breakout_item,
-            mandel_item,
-            spawned_item,
-            parallel_item,
-            cocoapad_item,
-        ],
-    );
-
-    let theme_menu = build_theme_menu();
-    let help_delegate = build_help_delegate();
-    let help_item = menu_item("MACVM GUI Shell Help", Some("openMacvmHelp:"), "");
-    objc::send1_id(help_item, sel("setTarget:"), help_delegate);
-    let help_menu = submenu("Help", &[help_item]);
-
-    let main_menu = objc::alloc_init("NSMenu");
-    for &item in &[
-        app_menu, file_menu, edit_menu, vm_menu, demos_menu, theme_menu, help_menu,
-    ] {
-        objc::send1_id(main_menu, sel("addItem:"), item);
-    }
-    objc::send1_id(app, sel("setMainMenu:"), main_menu);
-}
-
-/// The Theme menu (`../PLAN.md` Theme menu): `preprocess::Theme::ALL`,
-/// each paired with its own native action selector below. Every item's
-/// target is explicitly set to a small delegate object rather than left
-/// `nil`, because `nil` dispatches through the responder chain looking for
-/// the selector, and nothing else in this app implements any of these
-/// `selectXTheme:` actions.
-fn build_theme_menu() -> Id {
-    let delegate = build_theme_delegate();
-
-    // Walk Theme::ALL (the single source of truth) — one item per theme, its
-    // tag its index into ALL, every item firing the one `selectTheme:` action.
-    // Adding a theme to ALL now adds it to the menu automatically.
-    let mut checkmark_entries = Vec::with_capacity(Theme::ALL.len());
-    let mut menu_items = Vec::with_capacity(Theme::ALL.len());
-    for (idx, &theme) in Theme::ALL.iter().enumerate() {
-        let item = menu_item(theme.menu_label(), Some("selectTheme:"), "");
-        objc::send1_id(item, sel("setTarget:"), delegate);
-        objc::send1_i64(item, sel("setTag:"), idx as i64);
-        checkmark_entries.push((theme, MainThreadPtr(item)));
-        menu_items.push(item);
-    }
-
-    THEME_MENU_ITEMS
-        .set(checkmark_entries)
-        .ok()
-        .expect("build_theme_menu called twice");
-    update_theme_menu_checkmarks();
-
-    submenu("Theme", &menu_items)
-}
-
-// ── Window + WKWebView ─────────────────────────────────────────────────────
-
-const STYLE_TITLED_CLOSABLE_MINIATURIZABLE_RESIZABLE: u64 = 15;
-const BACKING_BUFFERED: u64 = 2;
-const AUTORESIZING_WIDTH_HEIGHT_SIZABLE: u64 = 18; // NSViewWidthSizable(2) | NSViewHeightSizable(16)
-
-fn build_window_and_webview() {
-    let window = objc::send0(objc::get_class("NSWindow"), sel("alloc"));
-    let window = objc::send_window_init(
-        window,
-        sel("initWithContentRect:styleMask:backing:defer:"),
-        0.0,
-        0.0,
-        980.0,
-        760.0,
-        STYLE_TITLED_CLOSABLE_MINIATURIZABLE_RESIZABLE,
-        BACKING_BUFFERED,
-        false,
-    );
-    objc::send1_id(window, sel("setTitle:"), objc::nsstring("MACVM"));
-    objc::send0(window, sel("center"));
-
-    let config = objc::alloc_init("WKWebViewConfiguration");
-    let user_content_controller = objc::send0(config, sel("userContentController"));
-    objc::send2_id(
-        user_content_controller,
-        sel("addScriptMessageHandler:name:"),
-        build_message_handler(),
-        objc::nsstring("macvm"),
-    );
-
-    let webview = objc::send0(objc::get_class("WKWebView"), sel("alloc"));
-    let webview = objc::send_frame_config_init(
-        webview,
-        sel("initWithFrame:configuration:"),
-        0.0,
-        0.0,
-        980.0,
-        760.0,
-        config,
-    );
-    objc::send1_i64(
-        webview,
-        sel("setAutoresizingMask:"),
-        AUTORESIZING_WIDTH_HEIGHT_SIZABLE as i64,
-    );
-    objc::send1_id(window, sel("setContentView:"), webview);
-
-    WEBVIEW
-        .set(MainThreadPtr(webview))
-        .ok()
-        .expect("build_window_and_webview called twice");
-    WINDOW.set(MainThreadPtr(window)).ok();
-
-    objc::send1_id(window, sel("makeKeyAndOrderFront:"), NIL);
-}
-
 fn main() {
-    // Headless "eyes" command — render a page (with all smappls resolved by a
-    // real VM) to self-contained HTML, no Cocoa window. Guarded before
-    // `objc::bootstrap()` so it runs anywhere, not just a windowing session.
+    // Headless "eyes" commands — render a page (with all smappls resolved by
+    // a real VM) to self-contained HTML, seed/export the image, or run a
+    // `.mst` file. Guarded before `shell::init()` so they run anywhere, not
+    // just in a windowing session.
     let cli: Vec<String> = std::env::args().skip(1).collect();
     match cli.first().map(String::as_str) {
         Some("render") => return cmd_render(&cli[1..]),
@@ -2611,77 +2104,68 @@ fn main() {
         _ => {}
     }
 
-    // `macvm-gui mandelvm` — the standalone MandelVM demo window. It flows through
-    // the normal windowed setup below (bootstrap, window, a fresh VM worker), then
-    // opens straight into the game pane running MandelVM instead of the browser,
-    // and quits itself when the dive ends (see `on_game_loop_stopped`).
+    // `winvm-gui mandelvm` — the standalone MandelVM demo window. It flows
+    // through the normal windowed setup below, then opens straight into the
+    // game pane running MandelVM instead of the browser, and quits itself
+    // when the dive ends (see `on_game_loop_stopped`).
+    #[cfg(feature = "gamepane")]
     let mandelvm_mode = cli.first().map(|s| s == "mandelvm").unwrap_or(false);
 
-    objc::bootstrap();
-    // Cocoa bridge C3: this process is a GUI host — NSApplication's run
-    // loop will drain the main queue, so Smalltalk's sync main-thread hop
-    // (ObjcRef>>sendMain:args: / onMain, prim 242) is live. Headless hosts
-    // never call this; there the hop fails cleanly instead of hanging.
+    shell::init();
+    // Cocoa bridge C3: this process is a GUI host — the run loop will drain
+    // the main queue, so Smalltalk's sync main-thread hop (ObjcRef>>
+    // sendMain:args: / onMain, prim 242) is live. Headless hosts never call
+    // this; there the hop fails cleanly instead of hanging.
+    //
+    // The bridge is macOS-only *in the VM crate itself* (`runtime/mod.rs`
+    // gates the whole module: objc_msgSend, the objc_shim.m @try/@catch shim,
+    // AppKit delegates). There is nothing to enable on Windows, and its Win32
+    // counterpart arrives with the native shell (`../MIGRATION.md` §6).
+    #[cfg(target_os = "macos")]
     macvm::runtime::objc_bridge::enable_main_hop();
 
     let start = start_page();
     if !start.exists() {
         eprintln!(
-            "macvm-gui: {} not found — is CARGO_MANIFEST_DIR wired up correctly?",
+            "winvm-gui: {} not found — set MACVM_GUI_ROOT to the gui/ directory.",
             start.display()
         );
         std::process::exit(1);
     }
     NAV.set(Mutex::new(NavState::new(start.clone()))).ok();
 
-    let vm_bridge = build_vm_bridge();
-    VM.set(vm_host::spawn(vm_bridge, sel("drainVmResponses:")))
+    VM.set(vm_host::spawn(shell::waker()))
         .ok()
         .expect("VM.set called twice");
 
-    build_menu_bar();
-    build_window_and_webview();
+    // The window must exist before the menu bar (Windows attaches the menu to
+    // an HWND) and before the first navigation (there must be a web view to
+    // load into). The macOS shell is order-insensitive here, so this ordering
+    // is correct for both.
+    shell::create_window_and_webview();
+    shell::build_menu_bar();
+    update_theme_menu_checkmarks();
     navigate_to(&start);
 
     // Demo trigger (docs/gamepane_design.md): open the native game pane and
     // start a real Smalltalk-driven frame loop, exercising the whole M4 path
-    // (timer -> GameStep -> step block -> draw -> present). The env value picks
-    // the demo — "mandel" for the zooming Mandelbrot (world/45_mandelzoom.mst),
-    // anything else for Breakout (world/44_breakout.mst). The Demos menu items
-    // run the same doits.
+    // (timer -> GameStep -> step block -> draw -> present).
+    #[cfg(feature = "gamepane")]
     if mandelvm_mode {
         // Standalone MandelVM demo: skip the browser, open the game pane, and
         // run the single-dive MandelVM. `MANDELVM` makes the frame loop's stop
         // (dive finished, or Escape) quit the app instead of returning to a page.
         MANDELVM.store(true, std::sync::atomic::Ordering::Relaxed);
-        open_game_pane();
-        if let Some(vm) = VM.get() {
-            vm.submit(vm_host::VmRequest::Doit {
-                code: "MandelVM launch.".to_string(),
-            });
-        }
+        run_game_demo("MandelVM launch.");
     } else if let Some(demo) = std::env::var_os("MACVM_GAMEPANE_DEMO") {
-        open_game_pane();
-        if let Some(vm) = VM.get() {
-            let code = if demo.to_string_lossy().eq_ignore_ascii_case("mandel") {
-                "MandelZoom launch."
-            } else {
-                "Breakout launch."
-            };
-            vm.submit(vm_host::VmRequest::Doit {
-                code: code.to_string(),
-            });
-        }
+        run_game_demo(if demo.to_string_lossy().eq_ignore_ascii_case("mandel") {
+            "MandelZoom launch."
+        } else {
+            "Breakout launch."
+        });
     }
 
-    let app = objc::send0(objc::get_class("NSApplication"), sel("sharedApplication"));
-    // Quit when the (only) window closes, so a `cargo run` test session
-    // exits cleanly instead of lingering window-less — same pattern as
-    // MacModula2's demo lifecycle (src/newm2-runtime/src/objc.rs).
-    let delegate = build_quit_on_last_window_delegate();
-    objc::send1_id(app, sel("setDelegate:"), delegate);
     // Start the always-on metrics sampler that feeds the toolbar dashboard.
-    start_metrics_timer();
-    objc::send1_bool(app, sel("activateIgnoringOtherApps:"), true);
-    objc::send0(app, sel("run"));
+    shell::start_metrics_timer();
+    shell::run();
 }

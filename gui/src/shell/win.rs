@@ -115,6 +115,47 @@ fn hwnd() -> HWND {
     HWND(HWND_MAIN.load(Ordering::Relaxed) as *mut _)
 }
 
+// ── Asset URLs ─────────────────────────────────────────────────────────────
+
+/// URL for an asset under the GUI resource root, as an origin-relative URL on
+/// the virtual host (see this module's doc comment for why not `file://`).
+pub fn asset_url(relative: &str) -> String {
+    format!(
+        "{ASSET_ORIGIN}/{}",
+        crate::preprocess::percent_encode_path(&relative.replace('\\', "/"))
+    )
+}
+
+/// Base URL for a loaded page's own directory, so the page's relative links
+/// and images resolve against where it actually lives rather than against
+/// `.rendered/`.
+///
+/// The virtual host publishes [`crate::gui_root`], so an absolute directory
+/// has to be expressed relative to that root — and with `/` separators, since
+/// a Windows `\` is a path separator on disk but an ordinary character in a
+/// URL. A directory outside the root cannot be addressed on the virtual host
+/// at all; it falls back to the root, which keeps the page's chrome working
+/// and degrades only its own relative links (all corpus pages live under the
+/// root, so this is a guard, not a normal path).
+pub fn base_url(dir: &Path) -> String {
+    let root = crate::gui_root();
+    match dir.strip_prefix(&root) {
+        Ok(rel) => {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let rel = rel.trim_matches('/');
+            if rel.is_empty() {
+                format!("{ASSET_ORIGIN}/")
+            } else {
+                format!(
+                    "{ASSET_ORIGIN}/{}/",
+                    crate::preprocess::percent_encode_path(rel)
+                )
+            }
+        }
+        Err(_) => format!("{ASSET_ORIGIN}/"),
+    }
+}
+
 // ── Worker -> UI wakeup ────────────────────────────────────────────────────
 
 /// A thread-safe handle the VM worker uses to wake the UI thread
@@ -582,6 +623,18 @@ pub fn edit_action(action: &str) {
         "selectAll" => eval_js("document.execCommand('selectAll')"),
         _ => {}
     }
+}
+
+/// Return keyboard focus to the page. On Windows the web view is a child of
+/// the host window, so focus can sit on the bare host after a frame click.
+pub fn focus_webview() {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            unsafe {
+                let _ = controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+        }
+    });
 }
 
 // ── Timers and the event loop ──────────────────────────────────────────────

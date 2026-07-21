@@ -1439,7 +1439,12 @@ fn compile_method_full(
         // S14 step 8 (A5): the feedback profile this compile SAW — the
         // effectiveness check re-snapshots at trap time and declines the
         // recompile when nothing changed.
-        profile_hash: crate::compiler::feedback::snapshot_profile(vm, method),
+        // Customized (WINVM deltablue-storm fix): must be computed the
+        // same way `note_uncommon_trap`'s effectiveness check recomputes
+        // it, or the comparison is between different quantities.
+        profile_hash: crate::compiler::feedback::snapshot_profile_customized(
+            vm, method, rcvr_klass,
+        ),
         literal_off: blob.literal_off,
         relocs: blob.relocs,
         frame_slots: regalloc_result.frame_slots,

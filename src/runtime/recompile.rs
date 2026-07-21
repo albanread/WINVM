@@ -116,7 +116,11 @@ pub fn note_uncommon_trap(vm: &mut VmState, id: NmethodId) {
     };
 
     // A5 effectiveness: identical profile → identical decisions → decline.
-    let now_hash = crate::compiler::feedback::snapshot_profile(vm, method);
+    // Customized: includes the ICs of every send site's key_klass
+    // resolution, so a trap that warms a GRAFTED CALLEE's ICs (not the
+    // root's) still flips the hash — see `snapshot_profile_customized`.
+    let now_hash =
+        crate::compiler::feedback::snapshot_profile_customized(vm, method, key_klass);
     if now_hash == old_hash {
         vm.stats.recompile_declined_ineffective += 1;
         if vm.options.trace.is_enabled("deopt") {

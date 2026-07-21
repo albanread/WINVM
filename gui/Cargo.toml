@@ -52,21 +52,29 @@ features = [
 
 [features]
 default = []
-# The native Metal game pane (docs/gamepane_design.md) and the game demos.
-# OFF by default and macOS-only: it needs a MacGamePane checkout beside this
-# repo, and MIGRATION.md §1 defers the game demos (D3D11/XAudio2) on Windows.
-# A cargo *feature* rather than a bare `cfg(target_os)` because the path
-# dependencies below cannot even be resolved without that checkout present.
-gamepane = ["dep:macgamepane-graphics", "dep:macgamepane-audio", "dep:metal", "dep:core-graphics-types"]
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# MacGamePane game engine (docs/gamepane_design.md). The GUI crate owns AppKit,
-# so the native Metal game pane is built in here. `metal` is pinned to 0.33 to
-# match MacGamePane's boundary types (metal::Device / CommandBufferRef /
-# TextureRef) so the handles type-match.
-macgamepane-graphics = { path = "../../MacGamePane/graphics", optional = true }
-macgamepane-audio = { path = "../../MacGamePane/audio", optional = true }
-metal = { version = "0.33", optional = true }
-# CGSize for CAMetalLayer::set_drawable_size (same version the graphics crate
-# and the metal crate already use).
-core-graphics-types = { version = "0.2", optional = true }
+# The native Metal game pane (docs/gamepane_design.md) and the game demos —
+# macOS-only, and NOT buildable from this checkout as it stands.
+#
+# `MIGRATION.md` §1 defers the game demos on Windows (D3D11/XAudio2 would be
+# their counterpart), so the Windows port does not need them; `src/game_pane.rs`
+# and its call sites are gated on this feature and simply compile out.
+#
+# Re-enabling it on macOS takes two steps, because a cargo path dependency's
+# manifest must be READABLE for the workspace to resolve *at all* — even when
+# the dependency is `optional` and target-gated, and even when building for
+# another platform. Leaving them declared here is therefore not a no-op on
+# Windows: it breaks `cargo build` for the whole workspace with "failed to read
+# E:\MacGamePane\audio\Cargo.toml".
+#
+#   1. Restore the dependencies (checkout MacGamePane beside this repo first):
+#        [target.'cfg(target_os = "macos")'.dependencies]
+#        macgamepane-graphics  = { path = "../../MacGamePane/graphics", optional = true }
+#        macgamepane-audio     = { path = "../../MacGamePane/audio",    optional = true }
+#        metal                 = { version = "0.33", optional = true }   # pinned to
+#        core-graphics-types   = { version = "0.2",  optional = true }   # MacGamePane's
+#      (`metal` is pinned to 0.33 to match MacGamePane's boundary types —
+#       metal::Device / CommandBufferRef / TextureRef — so the handles type-match.)
+#   2. Add them to this feature:
+#        gamepane = ["dep:macgamepane-graphics", "dep:macgamepane-audio",
+#                    "dep:metal", "dep:core-graphics-types"]
+gamepane = []

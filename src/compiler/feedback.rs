@@ -191,6 +191,65 @@ pub fn snapshot_profile(_vm: &VmState, method: MethodOop) -> u64 {
     h
 }
 
+/// The CUSTOMIZED profile hash: [`snapshot_profile`] plus, for every send
+/// site in the root method, the ICs of the method that site resolves to
+/// against `key_klass` — the same resolution B3 self-devirt grafting uses.
+///
+/// Why the plain hash was not enough, found on deltablue: `markInputs:`
+/// (one method on AbstractConstraint) crossed the compile threshold on
+/// EqualityConstraint receivers, so when a ScaleConstraint FIRST received
+/// it, the customized compile happened immediately — grafting
+/// `ScaleConstraint>>inputsDo:`, a method that had never executed. Every
+/// send in that graft lowered as an Empty-IC trap, by design ("first call
+/// is the trap"). The traps then warmed `inputsDo:`'s OWN ICs — but the
+/// effectiveness check hashed only the root method and its literal
+/// blocks, saw no change, and declined the recompile forever: a permanent
+/// deopt storm (141k traps in a 100-solve run at threshold=20, the whole
+/// gap between t=20's 103ms and t=1000's 55ms). S24 B5 5b fixed exactly
+/// this for grafted BLOCKS, on this same benchmark; this is the method
+/// flavor.
+///
+/// Deliberately OVER-inclusive rather than a faithful replay of the
+/// inliner's decisions: every send site is resolved against `key_klass`,
+/// whether or not it is a self-send and whether or not the inliner took
+/// it. Both producers of the hash (the compile, and the decline check)
+/// compute it identically, so determinism holds; the cost of including a
+/// callee the graft ignored is at worst one extra recompile — and this
+/// hash is only ever CONSULTED while the method is already storming,
+/// where an extra recompile attempt is precisely the desired behaviour
+/// (`MAX_VERSIONS` still caps thrash). Duplicating the inliner's real
+/// policy here would be exact today and silently wrong after its next
+/// change.
+pub fn snapshot_profile_customized(
+    vm: &mut VmState,
+    method: MethodOop,
+    key_klass: crate::oops::wrappers::KlassOop,
+) -> u64 {
+    let mut h = snapshot_profile(vm, method);
+    let fnv = |h: &mut u64, byte: u8| {
+        *h ^= byte as u64;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    let len = method.bytecode_len();
+    let mut bci = 0;
+    while bci < len {
+        let (instr, next) = decode_at(method, bci);
+        if let Instr::Send { ic, super_: false } = instr {
+            let ic_view = crate::interpreter::ic::InterpreterIc::at(method, ic);
+            if let Some(callee) = crate::runtime::lookup::lookup(vm, key_klass, ic_view.selector())
+            {
+                // Never the root itself (a self-recursive send would loop).
+                if callee.oop().raw() != method.oop().raw() {
+                    fnv(&mut h, 0xC7);
+                    snapshot_into(callee, &mut h, 1);
+                }
+            }
+        }
+        bci = next;
+    }
+    h
+}
+
 /// One method's (or block's) send-IC states folded into `h`, recursing into
 /// literal blocks (S24 B5 5b): a compile GRAFTS block bodies inline and reads
 /// THEIR ICs for lowering decisions, so a trap inside a grafted block that

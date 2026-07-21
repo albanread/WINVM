@@ -71,7 +71,7 @@
                      // needs one; see this module's doc comment.
 
 use crate::browser_render::{self, BrowserSelection, SourceEditTarget};
-use crate::objc::{self, Id, Sel};
+use crate::shell::Waker;
 use macvm::embed::{GameCommand, GameSink, TranscriptSink, VmHandle, VmLiveStats, VmMetrics};
 use macvm_mock_vm::MockWorld;
 pub use macvm_mock_vm::Side;
@@ -517,30 +517,14 @@ pub enum VmResponse {
     WorkerIdle,
 }
 
-/// `Id`/`Sel` are raw pointers, not `Send` by default. Safe to send into the
-/// worker thread here specifically because the only use they're put to is
-/// as arguments to `performSelector:withObject:waitUntilDone:`
-/// (`objc.rs`), which is itself documented as safe to call from any
-/// thread — unlike arbitrary AppKit/WebKit message sends, which are
-/// main-thread-only. `Clone`/`Copy` (both fields are plain pointers) so
-/// `ChannelTranscript` (S21) can hold its own copy alongside the worker
-/// loop's.
-#[derive(Clone, Copy)]
-struct CrossThreadObjcRef(Id, Sel);
-unsafe impl Send for CrossThreadObjcRef {}
-
-impl CrossThreadObjcRef {
-    /// Wake the main thread to drain responses. A NIL target means "no main
-    /// thread to wake" (tests drive `drain_responses` directly) — short-
-    /// circuited here so a headless test needs no Objective-C runtime at
-    /// all, rather than relying on `objc_msgSend`-to-nil being a no-op.
-    fn notify(self) {
-        if self.0.is_null() {
-            return;
-        }
-        objc::perform_selector_on_main_thread(self.0, self.1, objc::NIL, false);
-    }
-}
+// The waker itself lives in `crate::shell` — waking the UI thread is the one
+// piece of this module that is platform-specific (a `performSelectorOnMain
+// Thread:` on macOS, a `PostMessageW` on Windows). Both are documented as
+// safe to call from any thread, which is the property this module depends on;
+// both are `Copy` so `ChannelTranscript` (S21) can hold its own copy
+// alongside the worker loop's; and both short-circuit when they have no UI
+// thread behind them, so a headless test needs no windowing system at all
+// (`Waker::none`).
 
 /// How long `VmHost::submit` waits for ANY response before assuming the
 /// worker thread is gone and respawning (S21 step 3 — "if the language
@@ -568,7 +552,7 @@ struct HostInner {
     /// TIMEOUT`'s own doc for why).
     #[allow(dead_code)]
     worker: std::thread::JoinHandle<()>,
-    wake: CrossThreadObjcRef,
+    wake: Waker,
     world_dir: std::path::PathBuf,
     timeout: Duration,
     /// `Some(t)` from the moment a request is sent until the worker signals
@@ -682,7 +666,7 @@ struct WorkerHandles {
     worker: std::thread::JoinHandle<()>,
 }
 
-fn spawn_worker(wake: CrossThreadObjcRef, world_dir: std::path::PathBuf) -> WorkerHandles {
+fn spawn_worker(wake: Waker, world_dir: std::path::PathBuf) -> WorkerHandles {
     let (request_tx, request_rx) = mpsc::channel::<VmRequest>();
     let (response_tx, response_rx) = mpsc::channel::<VmResponse>();
     let notices = response_tx.clone();
@@ -721,26 +705,20 @@ fn respawn(inner: &mut HostInner, notice: &str) {
 const RESPAWN_NOTICE_TIMEOUT: &str =
     "--- the language thread stopped responding; a fresh one has been started ---";
 
-/// Spawn the VM worker thread and wire it to wake `main_thread_target` (via
-/// `drain_selector`) on the main thread whenever a response is ready.
-/// `drain_selector`'s method should call [`VmHost::drain_responses`] and
-/// apply each one (see `main.rs::build_vm_bridge`/`vm_bridge_drain`). The
-/// world directory defaults to `world` (relative to the process's own
-/// launch directory, same convention as the CLI's `--world`, `main.rs::
-/// load_world_with_warning`), overridable via `MACVM_WORLD_PATH` — reading
-/// (not mutating) an env var here is race-free even under a parallel test
-/// runner (see `spawn_with_world_and_timeout`'s own doc for why tests use
-/// an explicit path instead of this env var regardless).
-pub fn spawn(main_thread_target: Id, drain_selector: Sel) -> VmHost {
+/// Spawn the VM worker thread and wire it to wake the UI thread via `wake`
+/// whenever a response is ready. The woken handler should call
+/// [`VmHost::drain_responses`] and apply each one (see
+/// `main.rs::on_vm_drain`). The world directory defaults to `world` (relative
+/// to the process's own launch directory, same convention as the CLI's
+/// `--world`), overridable via `MACVM_WORLD_PATH` — reading (not mutating) an
+/// env var here is race-free even under a parallel test runner (see
+/// `spawn_with_world_and_timeout`'s own doc for why tests use an explicit
+/// path instead of this env var regardless).
+pub fn spawn(wake: Waker) -> VmHost {
     let world_dir = std::env::var_os("MACVM_WORLD_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("world"));
-    spawn_with_world_and_timeout(
-        main_thread_target,
-        drain_selector,
-        world_dir,
-        WORKER_RESPONSE_TIMEOUT,
-    )
+    spawn_with_world_and_timeout(wake, world_dir, WORKER_RESPONSE_TIMEOUT)
 }
 
 /// `spawn`'s fully-parameterized form — a testability seam, not a second
@@ -753,12 +731,10 @@ pub fn spawn(main_thread_target: Id, drain_selector: Sel) -> VmHost {
 /// much shorter `timeout` (so a respawn test doesn't need to sleep 30 real
 /// seconds).
 fn spawn_with_world_and_timeout(
-    main_thread_target: Id,
-    drain_selector: Sel,
+    wake: Waker,
     world_dir: std::path::PathBuf,
     timeout: Duration,
 ) -> VmHost {
-    let wake = CrossThreadObjcRef(main_thread_target, drain_selector);
     let w = spawn_worker(wake, world_dir.clone());
     VmHost {
         inner: Mutex::new(HostInner {
@@ -778,7 +754,7 @@ fn worker_loop(
     requests: Receiver<VmRequest>,
     responses: Sender<VmResponse>,
     self_requests: Sender<VmRequest>,
-    wake: CrossThreadObjcRef,
+    wake: Waker,
     world_dir: &Path,
 ) {
     // Owned entirely by this thread — no `Mutex`, no `static`. The UI
@@ -903,7 +879,7 @@ fn worker_loop(
 /// request, since `handle` never returns in that case.
 struct ChannelTranscript {
     responses: Sender<VmResponse>,
-    wake: CrossThreadObjcRef,
+    wake: Waker,
 }
 
 impl TranscriptSink for ChannelTranscript {
@@ -924,7 +900,7 @@ impl TranscriptSink for ChannelTranscript {
 /// `main.rs`'s drain applies it to the native Metal pane.
 struct ChannelGameSink {
     responses: Sender<VmResponse>,
-    wake: CrossThreadObjcRef,
+    wake: Waker,
 }
 
 impl GameSink for ChannelGameSink {
@@ -960,7 +936,7 @@ pub(crate) fn gui_vm_options() -> macvm::runtime::VmOptions {
 /// `.mst` fallback when the image database can't be established.
 fn boot_real_vm(
     responses: Sender<VmResponse>,
-    wake: CrossThreadObjcRef,
+    wake: Waker,
     world_dir: &Path,
 ) -> Option<VmHandle> {
     let opts = gui_vm_options();
@@ -1050,7 +1026,7 @@ fn import_world_response(image: Option<&image_store::Image>, world_dir: &Path) -
 fn boot_vm_from_image(
     image: &image_store::Image,
     responses: Sender<VmResponse>,
-    wake: CrossThreadObjcRef,
+    wake: Waker,
 ) -> Option<VmHandle> {
     let opts = gui_vm_options();
     let mut vm = VmHandle::boot_without_world(opts);
@@ -3240,20 +3216,32 @@ mod tests {
 
         // A shape that genuinely isn't built (an unknown send) renders nothing,
         // so the GUI keeps the G0 placeholder box.
-        let unbuildable = handle(
-            VmRequest::SmapplRender {
-                id: "s1".to_string(),
-                code: "Object doesNotExistXyz".to_string(),
-            },
-            &mut world,
-            &mut selection,
-            None,
-            &mut vm,
-        );
-        assert!(
-            unbuildable.is_empty(),
-            "an unbuildable shape must yield no fragment, got {unbuildable:?}"
-        );
+        //
+        // macOS-only for now: reaching this asserts that the DNU the unknown
+        // send raises is CAUGHT — that is guest-fatal recovery (`siglongjmp`
+        // back to `eval`'s `sigsetjmp`), and on Windows both are still stubs,
+        // so the abort would take the whole test binary down rather than fail
+        // this assertion. See `worker_survives_an_unhandled_runtime_error_
+        // and_serves_the_next_request` for the full note and `../MIGRATION.md`
+        // §6 for the tracked follow-up. The rest of this round trip is
+        // platform-neutral and does run on Windows.
+        #[cfg(target_os = "macos")]
+        {
+            let unbuildable = handle(
+                VmRequest::SmapplRender {
+                    id: "s1".to_string(),
+                    code: "Object doesNotExistXyz".to_string(),
+                },
+                &mut world,
+                &mut selection,
+                None,
+                &mut vm,
+            );
+            assert!(
+                unbuildable.is_empty(),
+                "an unbuildable shape must yield no fragment, got {unbuildable:?}"
+            );
+        }
 
         // CodeView (gui/smappl.md §3.5) IS built now — it renders a source box,
         // with the source HTML-escaped once (a `<` in the source → `&lt;`).
@@ -4361,8 +4349,7 @@ mod tests {
             image_store::import::import_world_dir(&img, &test_world_dir()).unwrap();
         }
         let host = spawn_with_world_and_timeout(
-            objc::NIL,
-            objc::NIL,
+            Waker::none(),
             tmp_dir,
             Duration::from_secs(30),
         );
@@ -4405,8 +4392,22 @@ mod tests {
     /// panic was fixed the guest-fatal recovery does its job and the worker
     /// survives, which is the behavior we actually want and now assert.)
     ///
-    /// Wake target is NIL — `CrossThreadObjcRef::notify` short-circuits, so
-    /// this needs no Objective-C runtime / NSApplication (headless-safe).
+    /// Wake target is absent — `Waker::notify` short-circuits, so
+    /// this needs no windowing system (headless-safe).
+    ///
+    /// **macOS-only until Windows guest-fatal recovery lands** (the known
+    /// Phase-2 follow-up in `../MIGRATION.md` §6, not a GUI-port regression).
+    /// The recovery this asserts *is* `siglongjmp` back to `eval`'s
+    /// `sigsetjmp`, and on Windows both are stubs:
+    /// `codecache::deopt_trap::siglongjmp` calls `std::process::abort()`
+    /// (which is what surfaces as `STATUS_STACK_BUFFER_OVERRUN`/0xc0000409).
+    /// So on Windows today a DNU reports its error to the transcript and then
+    /// takes the process down — this test would not fail, it would abort the
+    /// whole test binary and take every sibling test with it.
+    ///
+    /// Re-enable by deleting this gate once the `catch_unwind`-based recovery
+    /// `MIGRATION.md` proposes exists; it is the acceptance test for it.
+    #[cfg(target_os = "macos")]
     #[test]
     fn worker_survives_an_unhandled_runtime_error_and_serves_the_next_request() {
         // Isolate the image to a temp dir, pre-seeded once, so the worker boots
@@ -4423,8 +4424,7 @@ mod tests {
 
         // A NIL SEL is fine: notify() never dereferences it (NIL target).
         let host = spawn_with_world_and_timeout(
-            objc::NIL,
-            objc::NIL,
+            Waker::none(),
             tmp_dir.clone(),
             Duration::from_millis(150),
         );
@@ -4569,8 +4569,7 @@ mod tests {
             image_store::import::import_world_dir(&img, &test_world_dir()).unwrap();
         }
         let host = spawn_with_world_and_timeout(
-            objc::NIL,
-            objc::NIL,
+            Waker::none(),
             tmp_dir.clone(),
             Duration::from_secs(30),
         );

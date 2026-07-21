@@ -363,29 +363,32 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
     Some(tag[start..start + len].to_string())
 }
 
-/// Absolute `file://` URL for a path under the GUI resource root — resolved
-/// at RUNTIME via [`crate::gui_root`] (which honors `MACVM_GUI_ROOT`), NOT the
-/// build-time `CARGO_MANIFEST_DIR`. This is what builds the live page's theme
-/// `<link rel="stylesheet">` and smtk.js `<script src>` (see `chrome_head`),
-/// so a baked build-time path is doubly wrong in a packaged `.app`: it names
-/// the dev checkout (absent on another machine) AND falls outside the
-/// webview's `loadFileURL:allowingReadAccessToURL:<gui_root>` grant, so the
-/// stylesheet/script silently load as nothing — the exact "no theme CSS /
-/// dead themes in the app" symptom. The path is percent-encoded because the
-/// bundled root contains a space (`~/Library/Application Support/MACVM/…`),
-/// which an unencoded `file://` href cannot carry.
+/// URL for an asset under the GUI resource root — the live page's theme
+/// `<link rel="stylesheet">` and smtk.js `<script src>` (see `chrome_head`).
+///
+/// The scheme is the shell's business, because the two hosts grant local
+/// resource access in fundamentally different ways: WKWebView widens a
+/// `file://` page's sandbox via `loadFileURL:allowingReadAccessToURL:`, while
+/// WebView2 has no such grant and instead publishes the tree at an
+/// `http://` virtual host. Both are resolved at RUNTIME from
+/// [`crate::gui_root`] (which honors `MACVM_GUI_ROOT`), never the build-time
+/// `CARGO_MANIFEST_DIR` — a baked build-time path names the dev checkout
+/// (absent on another machine) and falls outside the grant, so the
+/// stylesheet/script silently load as nothing.
 fn gui_file_url(relative: &str) -> String {
-    let full = format!("{}/{relative}", crate::gui_root().to_string_lossy());
-    format!("file://{}", percent_encode_path(&full))
+    crate::shell::asset_url(relative)
 }
 
-/// Percent-encode a filesystem path for embedding in a `file://` URL: keeps
-/// the path separator and the RFC 3986 unreserved set literal, byte-encodes
-/// everything else (so a space becomes `%20` and any non-ASCII byte is UTF-8
-/// percent-encoded). Enough for a `<link href>`/`<script src>` WKWebView must
-/// resolve; the asset suffixes we pass are plain ASCII, so their `assets/…`
-/// text survives verbatim (the theme tests assert on it).
-fn percent_encode_path(path: &str) -> String {
+/// Percent-encode a filesystem path for embedding in a URL: keeps the path
+/// separator and the RFC 3986 unreserved set literal, byte-encodes everything
+/// else (so a space becomes `%20` and any non-ASCII byte is UTF-8
+/// percent-encoded). Enough for a `<link href>`/`<script src>` the web view
+/// must resolve; the asset suffixes we pass are plain ASCII, so their
+/// `assets/…` text survives verbatim (the theme tests assert on it).
+///
+/// `pub(crate)` because both shells build their URLs with it — the encoding
+/// rule is the same whether the result is a `file://` or an `http://` URL.
+pub(crate) fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {
         match b {
@@ -601,11 +604,11 @@ fn statusbar_html(transcript: &str) -> String {
 /// links/images would resolve against `.rendered/` instead of wherever the
 /// original file actually lives.
 fn base_href_tag(dir: &Path) -> String {
-    // Percent-encode for the same reason `gui_file_url` does: in a packaged
-    // `.app` this directory lives under the spaced bundle root
-    // (`~/Library/Application Support/…`), and an unencoded `file://` base
-    // silently breaks every relative link/image on the page.
-    format!("<base href=\"file://{}/\">", percent_encode_path(&dir.to_string_lossy()))
+    // The scheme is the shell's (see `gui_file_url`); the percent-encoding is
+    // needed either way, because in a packaged build this directory can live
+    // under a spaced root and an unencoded base silently breaks every
+    // relative link and image on the page.
+    format!("<base href=\"{}\">", crate::shell::base_url(dir))
 }
 
 /// The `zoom` CSS property (non-standard, but WebKit implements it fully —
@@ -1048,6 +1051,7 @@ mod tests {
     /// root (`~/Library/Application Support/…`). A build-time link there is
     /// absent on another machine and outside the webview's read-access grant,
     /// so it loads as nothing.
+    #[cfg(target_os = "macos")]
     #[test]
     fn theme_links_use_runtime_gui_root_and_encode_spaces() {
         let prev = std::env::var_os("MACVM_GUI_ROOT");
@@ -1066,6 +1070,31 @@ mod tests {
         assert!(
             head.contains("file:///tmp/My%20Bundle/gui/assets/smtk.js"),
             "smtk.js src must be rooted at the runtime gui_root: {head}"
+        );
+    }
+
+    /// The Windows counterpart. WebView2 cannot load `file://` subresources at
+    /// all, so the shell publishes the GUI tree at a virtual host instead
+    /// (`shell::win`'s module doc) and asset links must be origin-relative
+    /// URLs under it. A `file://` link here is the exact same user-visible
+    /// failure the macOS test guards — an unstyled page with dead icons — so
+    /// it is asserted against explicitly rather than only implied.
+    #[cfg(windows)]
+    #[test]
+    fn theme_links_resolve_against_the_asset_origin() {
+        let head = chrome_head_extra(Path::new("."), Theme::Dark, 100);
+        let origin = crate::shell::ASSET_ORIGIN;
+        assert!(
+            head.contains(&format!("{origin}/assets/dark.css")),
+            "theme stylesheet must resolve against the virtual host: {head}"
+        );
+        assert!(
+            head.contains(&format!("{origin}/assets/smtk.js")),
+            "smtk.js src must resolve against the virtual host: {head}"
+        );
+        assert!(
+            !head.contains("file://"),
+            "no file:// URL may survive into a WebView2 page — it silently loads as nothing: {head}"
         );
     }
 
