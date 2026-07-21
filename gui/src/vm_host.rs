@@ -772,8 +772,9 @@ fn worker_loop(
     // can't be established at all, fall back to the old `.mst` boot + mock
     // seed so the GUI still works.
     let image_path = resolve_image_path(world_dir);
+    eprintln!("PROBE worker_loop: image_path={}", image_path.display());
     let (image, mut vm) = match open_or_seed_image(world_dir, &image_path) {
-        Ok(img) => match boot_vm_from_image(&img, responses.clone(), wake) {
+        Ok(img) => match { eprintln!("PROBE: image opened, booting vm"); let r = boot_vm_from_image(&img, responses.clone(), wake); eprintln!("PROBE: boot_vm_from_image -> {}", r.is_some()); r } {
             Some(vm) => (Some(img), vm),
             // The image opened but the world load failed — most likely a
             // STALE image written by an older importer. Fall back to the
@@ -4650,6 +4651,22 @@ mod tests {
     /// through the actual DB-boot path the real GUI uses. Checks two calls a
     /// moment apart return distinct, increasing, real epoch-millisecond
     /// values — not just that it runs without erroring.
+    ///
+    /// **macOS-only: the WORLD's clock is POSIX, not the GUI's.**
+    /// `world/30_date_time.mst` implements this with `mmap` + `clock_gettime`
+    /// and hardcoded macOS `PROT_*`/`MAP_*` flag values; neither symbol exists
+    /// on Windows, so the FFI resolver correctly reports "no exported symbol
+    /// named mmap" and the resulting guest error aborts the process (see the
+    /// guest-fatal note on
+    /// `worker_survives_an_unhandled_runtime_error_and_serves_the_next_request`).
+    ///
+    /// This is the same class of gap `../MIGRATION.md` M1 already records for
+    /// the four FFI-dependent world test files, and the fix belongs to the
+    /// world, not this crate: a Windows `Time` built on
+    /// `GetSystemTimeAsFileTime` through the winkb resolver that the Win32 FFI
+    /// work already landed. Durations are unaffected — `millisecondsToRun:`
+    /// deliberately uses the VM's own monotonic `Smalltalk millisecondClock`.
+    #[cfg(target_os = "macos")]
     #[test]
     fn time_millisecond_clock_value_works_through_a_db_booted_vm() {
         let world_dir = test_world_dir();
