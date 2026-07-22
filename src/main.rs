@@ -24,6 +24,8 @@ use macvm::oops::Oop;
 use macvm::runtime::{VmOptions, VmState};
 
 fn main() {
+    #[cfg(windows)]
+    bench_pin::maybe_pin_benchmark_cpu();
     if std::env::args().any(|a| a == "--selftest-alloc-loop") {
         selftest_alloc_loop();
     }
@@ -440,4 +442,127 @@ fn selftest_probe_foreign() -> ! {
     }
     eprintln!("selftest-probe-foreign: read of address 8 did not fault (BUG)");
     std::process::exit(1);
+}
+
+/// `MACVM_BENCH_CPU` — pin the VM to one PERFORMANCE core for benchmarking.
+///
+/// This machine (i7-12700, and hybrid Intel parts generally) mixes P- and
+/// E-cores and throttles on temperature; Windows freely migrates the
+/// process between core classes mid-run, which showed up as bench numbers
+/// drifting 2x between sessions (PERF.md 2026-07-22: Cog's own arith read
+/// 48, 116, and 50 ms across three sessions of identical code). Pinning
+/// one P-core removes the core-class lottery; the thermal drift remains,
+/// which is why PERF.md's same-session rule still stands.
+///
+/// Values: `perf` — detect the highest `EfficiencyClass` cores via
+/// `GetLogicalProcessorInformationEx(RelationProcessorCore)` and pin to
+/// the SECOND such core (core 0 eats a disproportionate share of system
+/// interrupts); or an explicit logical-CPU index. Either form also raises
+/// the process to HIGH_PRIORITY_CLASS. Off by default — an ordinary run
+/// should share the machine like any other process.
+#[cfg(windows)]
+mod bench_pin {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn GetCurrentProcess() -> isize;
+        fn SetThreadAffinityMask(thread: isize, mask: usize) -> usize;
+        fn SetPriorityClass(process: isize, class: u32) -> i32;
+        fn GetLogicalProcessorInformationEx(
+            relationship: u32,
+            buffer: *mut u8,
+            returned_length: *mut u32,
+        ) -> i32;
+    }
+    const HIGH_PRIORITY_CLASS: u32 = 0x0000_0080;
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+
+    /// Every physical core's `(efficiency_class, group0_mask)`, decoded from
+    /// the variable-length `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` records.
+    fn cores() -> Vec<(u8, usize)> {
+        let mut len: u32 = 0;
+        unsafe {
+            GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len)
+        };
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; len as usize];
+        let ok = unsafe {
+            GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len)
+        };
+        if ok == 0 {
+            return Vec::new();
+        }
+        // Record layout: u32 Relationship, u32 Size, then for
+        // RelationProcessorCore a PROCESSOR_RELATIONSHIP: u8 Flags,
+        // u8 EfficiencyClass, u8 Reserved[20], u16 GroupCount, then
+        // GroupCount GROUP_AFFINITY entries (usize Mask, u16 Group,
+        // u16 Reserved[3]). Only group 0 is read — this machine (and any
+        // machine under 64 logical CPUs) has exactly one group.
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= len as usize {
+            let rel = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
+            if size == 0 {
+                break;
+            }
+            if rel == RELATION_PROCESSOR_CORE {
+                let eff = buf[off + 9];
+                // PROCESSOR_RELATIONSHIP: Flags(1) EfficiencyClass(1)
+                // Reserved(20) GroupCount(2) then — already 8-aligned at
+                // +32 from the record start — GROUP_AFFINITY.Mask.
+                let mask_off = off + 32;
+                if mask_off + 8 <= off + size {
+                    let mask =
+                        usize::from_le_bytes(buf[mask_off..mask_off + 8].try_into().unwrap());
+                    out.push((eff, mask));
+                }
+            }
+            off += size;
+        }
+        out
+    }
+
+    pub fn maybe_pin_benchmark_cpu() {
+        let Ok(spec) = std::env::var("MACVM_BENCH_CPU") else {
+            return;
+        };
+        let mask: usize = if spec == "perf" {
+            let cores = cores();
+            let best = cores.iter().map(|&(e, _)| e).max().unwrap_or(0);
+            let perf: Vec<usize> = cores
+                .iter()
+                .filter(|&&(e, _)| e == best)
+                .map(|&(_, m)| m)
+                .collect();
+            // Second P-core when there is one (core 0 takes the system's
+            // interrupt load); one logical CPU only — its own hyperthread
+            // sibling is excluded by taking the lowest bit.
+            match perf.get(1).or_else(|| perf.first()) {
+                Some(&m) if m != 0 => m & m.wrapping_neg(),
+                _ => {
+                    eprintln!("MACVM_BENCH_CPU=perf: no cores detected; not pinning");
+                    return;
+                }
+            }
+        } else {
+            match spec.parse::<u8>() {
+                Ok(n) if n < 64 => 1usize << n,
+                _ => {
+                    eprintln!("MACVM_BENCH_CPU={spec}: expected `perf` or a logical CPU index");
+                    return;
+                }
+            }
+        };
+        unsafe {
+            if SetThreadAffinityMask(GetCurrentThread(), mask) == 0 {
+                eprintln!("MACVM_BENCH_CPU: SetThreadAffinityMask({mask:#x}) failed; not pinned");
+                return;
+            }
+            SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        }
+        eprintln!("[bench] pinned to logical CPU mask {mask:#x}, HIGH priority");
+    }
 }

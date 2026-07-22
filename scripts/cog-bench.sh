@@ -19,8 +19,20 @@ IMG=$(ls "$COG"/image/*.image 2>/dev/null | head -1)
 # Cog-side fileIn (harness + classes + macro drivers with checksums).
 python scripts/mst2st.py "$COG/cog-all.st" --assemble >/dev/null
 
-echo "=== COG ($(cat "$COG"/image/pharo.version 2>/dev/null || echo Pharo)) ==="
-"$COG"/vm/PharoConsole.exe --headless "$IMG" st "$COG"/cog-all.st 2>&1 | grep -vE "sqMakeMemory|^\["
+# Both VMs are PINNED to the same single P-core (logical CPU 2, mask 0x4)
+# at HIGH priority: this machine mixes P- and E-cores and Windows migrates
+# processes between the classes mid-run, which made identical code read
+# 2x apart across sessions (PERF.md 2026-07-22). Pinning removes the
+# core-class lottery; thermal drift remains, so the same-session rule
+# still applies. WINVM pins itself via MACVM_BENCH_CPU (auto-detects the
+# performance class); Cog is pinned from outside via PowerShell.
+echo "=== COG ($(cat "$COG"/image/pharo.version 2>/dev/null || echo Pharo)) — pinned ==="
+powershell -NoProfile -Command "
+  \$p = Start-Process -FilePath '$COG/vm/PharoConsole.exe' \
+      -ArgumentList '--headless','$IMG','st','$COG/cog-all.st' \
+      -NoNewWindow -PassThru -RedirectStandardOutput '$COG/cog-out.txt';
+  \$p.ProcessorAffinity = 4; \$p.PriorityClass = 'High'; \$p.WaitForExit()"
+grep -vE "sqMakeMemory|^\[" "$COG"/cog-out.txt
 
 cat > /tmp/winvm-cog-bench.mst <<'MST'
 Object subclass: Runner [
@@ -38,5 +50,5 @@ Runner show: 'alloc    ' block: [ BenchmarkDashboard benchAlloc ].
 Runner show: 'richards ' block: [ BenchmarkDashboard benchRichards ].
 Runner show: 'deltablue' block: [ BenchmarkDashboard benchDeltaBlue ].
 MST
-echo "=== WINVM threshold=20 ==="
-MACVM_JIT=threshold=20 ./target/release/macvm.exe run /tmp/winvm-cog-bench.mst --world world 2>&1 | tail -7
+echo "=== WINVM threshold=20 — pinned ==="
+MACVM_BENCH_CPU=perf MACVM_JIT=threshold=20 ./target/release/macvm.exe run /tmp/winvm-cog-bench.mst --world world 2>&1 | tail -7

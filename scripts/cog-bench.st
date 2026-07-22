@@ -54,19 +54,22 @@ check: name got: got want: want
 		Stdio stdout nextPutAll: name; nextPutAll: ' WRONG RESULT '; print: got; lf; flush.
 		Smalltalk exitFailure ]!
 run: name block: aBlock check: want
+	"Microsecond clock, reported in ms: Windows quantizes the millisecond
+	 clock to the 15.6 ms timer tick, which rendered every sub-33 ms Cog
+	 number as 0, 15/16, or 31/33 (2026-07-22 pinned sessions)."
 	| times cold t0 r |
-	t0 := Time millisecondClockValue.
+	t0 := Time microsecondClockValue.
 	10 timesRepeat: [ r := aBlock value ].
 	self check: name got: r want: want.
-	cold := Time millisecondClockValue - t0.
+	cold := Time microsecondClockValue - t0.
 	times := OrderedCollection new.
 	6 timesRepeat: [
-		t0 := Time millisecondClockValue.
+		t0 := Time microsecondClockValue.
 		10 timesRepeat: [ r := aBlock value ].
-		times add: Time millisecondClockValue - t0 ].
+		times add: Time microsecondClockValue - t0 ].
 	self check: name got: r want: want.
-	Stdio stdout nextPutAll: name; nextPutAll: ' cold='; print: cold;
-		nextPutAll: ' warm='; print: (self median: times); lf; flush!
+	Stdio stdout nextPutAll: name; nextPutAll: ' cold_us='; print: cold;
+		nextPutAll: ' warm_us='; print: (self median: times); lf; flush!
 runAll
 	self run: 'arith    ' block: [ self benchArith ] check: 1124997749998000000.
 	self run: 'fib      ' block: [ self benchFib ] check: 2178309.
