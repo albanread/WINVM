@@ -1945,6 +1945,14 @@ pub fn emit(
 
 fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
     match *ir {
+        // WINVM x86-64-only lowerings: `ref_eq_kind`/`bool_not_speculatable`
+        // are cfg-gated off on aarch64, so these ops can never reach this
+        // emitter. The arms exist to keep the match exhaustive; lift the
+        // ir.rs cfg gate only together with real A64 sequences here
+        // (`cmp`+`csel` for RefCmpVal; two literal compares for BoolNot).
+        Ir::RefCmpVal { .. } | Ir::BoolNot { .. } => {
+            unreachable!("RefCmpVal/BoolNot are not lowered on aarch64 (ir.rs cfg gate)")
+        }
         // ── Float fast-path (`docs/float_fastpath_design.md`) ──────────────
         Ir::FUnbox { dst, src, fail } => e.emit_funbox(dst, src, fail),
         Ir::FBox { dst, src } => e.emit_fbox(dst, src),
@@ -2239,6 +2247,7 @@ mod tests {
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
         IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks,
             vregs,
             pool: Vec::new(),
@@ -2660,6 +2669,7 @@ mod tests {
         // pool[0]=nil, [1]=mark(raw imm), [2]=klass oop.
         let method = IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks: vec![IrBlock {
                 id: BlockId(0),
                 bci: 0,
@@ -3076,6 +3086,7 @@ mod tests {
         };
         let method = IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks: vec![block0],
             vregs,
             pool: Vec::new(),

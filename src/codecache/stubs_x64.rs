@@ -798,6 +798,7 @@ mod tests {
 
     fn hand_method(blocks: Vec<IrBlock>, nvregs: usize, argc: u8) -> IrMethod {
         IrMethod {
+            is_osr: false,
             blocks,
             vregs: (0..nvregs)
                 .map(|_| VRegInfo {

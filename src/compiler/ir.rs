@@ -248,6 +248,31 @@ pub enum Ir {
         b: VReg,
         fail: BlockId,
     },
+    /// Identity comparison — `==` (`neq` for `~~`). The frontend PINS
+    /// identity as non-redefinable (codegen.rs's nil-guard family already
+    /// compiles `x == nil` relying on exactly that), so this lowers to a
+    /// raw pointer compare selecting `true`/`false`: NO guard, NO fail
+    /// edge, sound for every operand pair. The send census that motivated
+    /// it: richards spends ~130k sends per run dispatching `==` to the
+    /// identity primitive.
+    RefCmpVal {
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+        /// `~~`: select the other way around.
+        neq: bool,
+    },
+    /// Speculated boolean negation — `not` on evidence-boolean sites.
+    /// GUARDED: `src` must be the `true` or `false` object, anything else
+    /// branches to `fail` (a reexecute trap re-sending #not generically —
+    /// correct lookup for any receiver). Lowered only when the LIVE
+    /// `True>>not`/`False>>not` are the canonical single-op flips, pinned
+    /// by inline deps so a redefinition invalidates the nmethod.
+    BoolNot {
+        dst: VReg,
+        src: VReg,
+        fail: BlockId,
+    },
     /// ── Float fast-path (`docs/float_fastpath_design.md`) ──────────────────
     /// Unbox a boxed `Double` oop into an FP vreg. GUARDED: `src` must be a
     /// Double, else branch to `fail` (a cold `UncommonTrap` re-executing the
@@ -428,10 +453,14 @@ impl Ir {
                 f(*obj);
                 f(*val);
             }
-            Ir::SmiArith { a, b, .. } | Ir::SmiCmpBr { a, b, .. } | Ir::SmiCmpVal { a, b, .. } => {
+            Ir::SmiArith { a, b, .. }
+            | Ir::SmiCmpBr { a, b, .. }
+            | Ir::SmiCmpVal { a, b, .. }
+            | Ir::RefCmpVal { a, b, .. } => {
                 f(*a);
                 f(*b);
             }
+            Ir::BoolNot { src, .. } => f(*src),
             Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
                 f(*a);
                 f(*b);
@@ -505,6 +534,8 @@ impl Ir {
             | Ir::ArrayAt { dst, .. }
             | Ir::ArrayAtPut { dst, .. }
             | Ir::SmiCmpVal { dst, .. }
+            | Ir::RefCmpVal { dst, .. }
+            | Ir::BoolNot { dst, .. }
             | Ir::CallSend { dst, .. }
             | Ir::FUnbox { dst, .. }
             | Ir::FBox { dst, .. }
@@ -692,6 +723,10 @@ enum NonLeafOutcome {
 pub struct IrMethod {
     /// OSR-heal: see `Nmethod::osr_cold_sends` (copied there by the driver).
     pub osr_cold_sends: u16,
+    /// True for an OSR compilation. F7 consumer: the prologue nil-fill
+    /// shrink (regalloc) must NOT trust entry-block defs when the OSR
+    /// entry jumps straight to the loop header, bypassing them.
+    pub is_osr: bool,
     pub blocks: Vec<IrBlock>,
     pub vregs: Vec<VRegInfo>,
     pub pool: Vec<PoolEntry>,
@@ -1671,6 +1706,95 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// Cog-parity special selector `==`/`~~` (identity): `Some(neq)` when
+    /// send site `ic_idx` of `holder` is the one-argument identity test.
+    /// No feedback consulted and no target check — the frontend pins
+    /// identity as non-redefinable (codegen.rs compiles the nil-guard
+    /// family on that exact invariant), so a raw pointer compare is the
+    /// send's semantics for EVERY receiver. x86-64 only until the AArch64
+    /// emitter grows its `RefCmpVal` arm.
+    fn ref_eq_kind(&self, holder: MethodOop, ic_idx: u16) -> Option<bool> {
+        if !cfg!(target_arch = "x86_64") {
+            return None;
+        }
+        let ic = InterpreterIc::at(holder, ic_idx);
+        if ic.argc() != 1 {
+            return None;
+        }
+        match ic.selector().as_string().as_str() {
+            "==" => Some(false),
+            "~~" => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Boolean-`not` speculation gate: the site's evidence is boolean-only
+    /// (Empty, Mono on True/False, or Poly over exactly those two) AND the
+    /// live `True>>not` / `False>>not` are the canonical single-op flips
+    /// (`^false` / `^true`). The caller records the two inline deps. The
+    /// evidence gate is what makes the speculation storm-proof: a wrong
+    /// guess traps once, the trap warms the IC with the non-boolean klass,
+    /// and the recompile (customized hash sees it) declines here.
+    fn bool_not_speculatable(&self, holder: MethodOop, ic_idx: u16) -> bool {
+        if !cfg!(target_arch = "x86_64") {
+            return false;
+        }
+        let ic = InterpreterIc::at(holder, ic_idx);
+        if ic.argc() != 0 || ic.selector().as_string() != "not" {
+            return false;
+        }
+        let u = &self.vm.universe;
+        let (tk, fk) = (u.true_klass.oop().raw(), u.false_klass.oop().raw());
+        let guard = ic.guard();
+        let boolean_only = if guard.raw() == u.nil_obj.raw()
+            || guard.raw() == tk
+            || guard.raw() == fk
+        {
+            true
+        } else if matches!(
+            crate::interpreter::ic::ic_state(holder, ic_idx),
+            crate::interpreter::ic::IcState::Poly(_)
+        ) {
+            match crate::oops::wrappers::ArrayOop::try_from(ic.target()) {
+                Some(pairs) => (0..pairs.len() / 2).all(|i| {
+                    let k = pairs.at(2 * i).raw();
+                    k == tk || k == fk || k == u.nil_obj.raw()
+                }),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !boolean_only {
+            return false;
+        }
+        // Both live implementations must BE the canonical flips — a
+        // redefined True>>not must never be constant-folded to the flip.
+        let canonical = |k: KlassOop, want_true_push: bool| -> bool {
+            let Some(m) = crate::compiler::feedback::resolve_method_ro(self.vm, k, ic.selector())
+            else {
+                return false;
+            };
+            if m.primitive() != 0 {
+                return false;
+            }
+            use crate::bytecode::opcode::decode_at;
+            let len = m.bytecode_len();
+            let (i0, n0) = decode_at(m, 0);
+            let push_ok = match i0 {
+                Instr::PushTrue => want_true_push,
+                Instr::PushFalse => !want_true_push,
+                _ => false,
+            };
+            if !push_ok || n0 >= len {
+                return false;
+            }
+            let (i1, n1) = decode_at(m, n0);
+            matches!(i1, Instr::ReturnTos) && n1 >= len
+        };
+        canonical(self.vm.universe.true_klass, false) && canonical(self.vm.universe.false_klass, true)
+    }
+
     /// S15 (the sieve fix): is send site `ic_idx` a mono-Array-guarded
     /// `at:` / `at:put:` primitive — the intrinsify-to-`ArrayAt`/
     /// `ArrayAtPut` class? Exactly `is_smi_inlinable`'s shape, one klass
@@ -2424,6 +2548,37 @@ impl<'a> Translator<'a> {
                     // the root's smi-inline path minus branch fusion; the fail
                     // edge is an InlineSite-chained reexecute trap (`a`/`b`
                     // still on the recorded stack).
+                    // Cog-parity special selectors in the SPLICED body —
+                    // same lowerings as the root arm (identity: unguarded;
+                    // not: boolean-guarded flip with an inlined-frame trap).
+                    if let Some(neq) = self.ref_eq_kind(callee, ic) {
+                        let b_op = cstack.pop().expect("ref-eq fuse: missing rhs");
+                        let a_op = cstack.pop().expect("ref-eq fuse: missing lhs");
+                        let dst = self.fresh(true);
+                        code.push(Ir::RefCmpVal {
+                            dst,
+                            a: a_op,
+                            b: b_op,
+                            neq,
+                        });
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
+                    if self.bool_not_speculatable(callee, ic) {
+                        self.record_inline_dep(self.vm.universe.true_klass, inner_sel);
+                        self.record_inline_dep(self.vm.universe.false_klass, inner_sel);
+                        let src = cstack.pop().expect("bool-not fuse: missing receiver");
+                        let mut reexec = cstack.clone();
+                        reexec.push(src);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let dst = self.fresh(true);
+                        code.push(Ir::BoolNot { dst, src, fail });
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
                     if let Some(is_put) = array_op_kind_on(self.vm, callee, ic) {
                         // S15: in-body array intrinsic (see the root arm).
                         let val = if is_put {
@@ -3333,6 +3488,59 @@ impl<'a> Translator<'a> {
                                     fail,
                                 }),
                             }
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        // Cog-parity special selectors in the CFG-spliced
+                        // body. The UNGUARDED identity compare must never
+                        // see a phantom operand (an elided-closure filler
+                        // holds `callee_self`, not the closure) — screened
+                        // on the top two shadow entries; `not`'s boolean
+                        // guard traps correctly on a filler, but is
+                        // screened too so the reexec stack stays exact.
+                        if self
+                            .ref_eq_kind(callee, ic)
+                            .filter(|_| {
+                                !cstack_ph.iter().rev().take(2).any(|&ph| ph)
+                            })
+                            .is_some()
+                        {
+                            let neq = self
+                                .ref_eq_kind(callee, ic)
+                                .expect("guard just matched");
+                            cstack_ph.truncate(cstack.len().saturating_sub(2));
+                            let b_op = cstack.pop().expect("ref-eq fuse: missing rhs");
+                            let a_op = cstack.pop().expect("ref-eq fuse: missing lhs");
+                            let dst = self.fresh(true);
+                            bcode.push(Ir::RefCmpVal {
+                                dst,
+                                a: a_op,
+                                b: b_op,
+                                neq,
+                            });
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
+                        if self.bool_not_speculatable(callee, ic)
+                            && !cstack_ph.last().copied().unwrap_or(false)
+                        {
+                            self.record_inline_dep(self.vm.universe.true_klass, inner_sel);
+                            self.record_inline_dep(self.vm.universe.false_klass, inner_sel);
+                            cstack_ph.truncate(cstack.len().saturating_sub(1));
+                            let src = cstack.pop().expect("bool-not fuse: missing receiver");
+                            let mut reexec = cstack.clone();
+                            reexec.push(src);
+                            let fail = self.fresh_inlined_trap_block(
+                                inner_bci,
+                                reexec,
+                                inline_proto.clone(),
+                            );
+                            let dst = self.fresh(true);
+                            bcode.push(Ir::BoolNot { dst, src, fail });
                             cstack.push(dst);
                             cstack_ph.push(false);
                             bci = next;
@@ -4404,6 +4612,71 @@ impl<'a> Translator<'a> {
             // (the IC only guards the receiver) re-executes the WHOLE send
             // interpreted, taking the primitive's own Smalltalk fallback —
             // byte-identical semantics.
+            // Cog-parity special selectors (send census: richards spends
+            // ~130k sends/run on identity `==` and ~90k on boolean `not`).
+            // Identity lowers unguarded (pinned non-redefinable); `not`
+            // lowers to a boolean-guarded flip with a reexecute-trap fail
+            // edge. Phantom operands (escape-mode elided-closure fillers)
+            // must not reach the UNGUARDED compare, hence the stack_sites
+            // screens.
+            Instr::Send { ic, .. }
+                if self.ref_eq_kind(self.method, ic).is_some()
+                    && !(self.escape.is_some()
+                        && stack.len() >= 2
+                        && (stack.len() - 2..stack.len()).any(|ix| {
+                            stack_sites.get(ix).is_some_and(|s| s.is_some())
+                        })) =>
+            {
+                let neq = self
+                    .ref_eq_kind(self.method, ic)
+                    .expect("guard just matched");
+                let b = stack.pop().expect("==: missing arg operand");
+                let a = stack.pop().expect("==: missing receiver operand");
+                let dst = self.fresh(true);
+                code.push(Ir::RefCmpVal { dst, a, b, neq });
+                stack.push(dst);
+            }
+            Instr::Send { ic, .. }
+                if self.bool_not_speculatable(self.method, ic)
+                    && !(self.escape.is_some()
+                        && !stack.is_empty()
+                        && stack_sites
+                            .get(stack.len() - 1)
+                            .is_some_and(|s| s.is_some())) =>
+            {
+                let selector = InterpreterIc::at(self.method, ic).selector();
+                self.record_inline_dep(self.vm.universe.true_klass, selector);
+                self.record_inline_dep(self.vm.universe.false_klass, selector);
+                // Fail-only trap block, no continuation split — the same
+                // mid-block shape as the array intrinsics above.
+                let reexec_stack = stack.clone();
+                let fail_id = self.fresh_block_id();
+                self.finish_block(IrBlock {
+                    id: fail_id,
+                    bci,
+                    code: vec![Ir::UncommonTrap { bci }],
+                    entry_stack: Vec::new(),
+                    deopt_sites: vec![(
+                        0,
+                        DeoptRaw {
+                            stack: reexec_stack,
+                            bci,
+                            kind: SafepointKind::UncommonTrap,
+                            reexecute: true,
+                            stack_closures: Vec::new(),
+                            inline: None,
+                        },
+                    )],
+                });
+                let src = stack.pop().expect("not: missing receiver operand");
+                let dst = self.fresh(true);
+                code.push(Ir::BoolNot {
+                    dst,
+                    src,
+                    fail: fail_id,
+                });
+                stack.push(dst);
+            }
             Instr::Send { ic, .. } if self.vec_send_kind(ic).is_some() => {
                 let kind = self.vec_send_kind(ic).expect("guard just confirmed Some");
                 let reexec_stack = stack.clone();
@@ -6359,10 +6632,14 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *obj = f(*obj);
             *val = f(*val);
         }
-        Ir::SmiArith { a, b, .. } | Ir::SmiCmpBr { a, b, .. } | Ir::SmiCmpVal { a, b, .. } => {
+        Ir::SmiArith { a, b, .. }
+        | Ir::SmiCmpBr { a, b, .. }
+        | Ir::SmiCmpVal { a, b, .. }
+        | Ir::RefCmpVal { a, b, .. } => {
             *a = f(*a);
             *b = f(*b);
         }
+        Ir::BoolNot { src, .. } => *src = f(*src),
         Ir::FArith { a, b, .. } | Ir::FCmpBr { a, b, .. } | Ir::FCmpVal { a, b, .. } => {
             *a = f(*a);
             *b = f(*b);
@@ -6531,6 +6808,7 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                     | Ir::SmiArith { fail, .. }
                     | Ir::SmiCmpVal { fail, .. }
                     | Ir::SmiCmpBr { fail, .. }
+                    | Ir::BoolNot { fail, .. }
                     | Ir::GuardKlass { fail, .. } => {
                         fail_rewrites.push((*fail, alias.clone()));
                     }
@@ -8625,6 +8903,7 @@ pub fn convert(
 
     let mut irm = IrMethod {
         osr_cold_sends: t.osr_cold_sends,
+        is_osr: osr,
         blocks: ir_blocks,
         vregs: t.vregs,
         pool: t.pool.entries,

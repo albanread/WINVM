@@ -78,6 +78,8 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "SmiArith",
     "SmiCmpBr",
     "SmiCmpVal",
+    "RefCmpVal",
+    "BoolNot",
     "StoreField",
     "ArrayAt",
     "ArrayAtPut",
@@ -1646,6 +1648,47 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.store_def(*dst, d);
         }
 
+        Ir::RefCmpVal { dst, a, b, neq } => {
+            // Identity: one raw compare, branchless boolean select — the
+            // same tail as SmiCmpVal minus every guard (identity is sound
+            // for any operand pair; see the IR doc).
+            let ra = e.read_into(*a, SCRATCH0);
+            let rb = e.read_into(*b, SCRATCH1);
+            e.asm.emit("cmp", &[r64(ra), r64(rb)]);
+            let d = e.def_reg(*dst, RAX);
+            let false_lit = e.literal_ids[e.method.false_lit.0 as usize];
+            let true_lit = e.literal_ids[e.method.true_lit.0 as usize];
+            e.asm.load_literal(d, false_lit);
+            e.asm.load_literal(SCRATCH0, true_lit);
+            let cond = if *neq { CmpOp::Ne } else { CmpOp::Eq };
+            e.asm
+                .emit(cmp_cond(cond).cmov(), &[r64(d), r64(SCRATCH0)]);
+            e.store_def(*dst, d);
+        }
+
+        Ir::BoolNot { dst, src, fail } => {
+            // dst = src == true ? false : src == false ? true : trap.
+            // Two rip-relative literal compares; the cold edge re-executes
+            // the #not send generically (correct lookup for any receiver).
+            let s = e.read_into(*src, SCRATCH0);
+            let cold = e.labels[fail.0 as usize];
+            let true_lit = e.literal_ids[e.method.true_lit.0 as usize];
+            let false_lit = e.literal_ids[e.method.false_lit.0 as usize];
+            let d = e.def_reg(*dst, RAX);
+            let not_true = e.asm.new_label();
+            let done = e.asm.new_label();
+            e.asm.cmp_literal(s, true_lit);
+            e.asm.jcc(Cond::Ne, not_true);
+            e.asm.load_literal(d, false_lit);
+            e.asm.jmp(done);
+            e.asm.bind(not_true);
+            e.asm.cmp_literal(s, false_lit);
+            e.asm.jcc(Cond::Ne, cold);
+            e.asm.load_literal(d, true_lit);
+            e.asm.bind(done);
+            e.store_def(*dst, d);
+        }
+
         Ir::ArrayAtPut {
             dst,
             arr,
@@ -1952,6 +1995,8 @@ pub fn ir_op_name(op: &Ir) -> &'static str {
         Ir::ArrayAtPut { .. } => "ArrayAtPut",
         Ir::SmiCmpBr { .. } => "SmiCmpBr",
         Ir::SmiCmpVal { .. } => "SmiCmpVal",
+        Ir::RefCmpVal { .. } => "RefCmpVal",
+        Ir::BoolNot { .. } => "BoolNot",
         Ir::FUnbox { .. } => "FUnbox",
         Ir::FBox { .. } => "FBox",
         Ir::FArith { .. } => "FArith",
@@ -2006,6 +2051,7 @@ mod tests {
             spliced_multibb: 0,
             splice_declined_budget: 0,
             osr_cold_sends: 0,
+            is_osr: false,
             safepoints: Vec::new(),
             true_lit: PoolLit(0),
             false_lit: PoolLit(0),

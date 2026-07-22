@@ -1222,12 +1222,34 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // nil-fills these in the prologue, which is what makes `extra_oop_live`'s
     // earlier-safepoint facts sound on paths that never wrote the slot (see
     // `compute_intervals`' own task-#94 comment).
+    // F7 (x64_codegen_perf.md): a slot whose vreg is UNCONDITIONALLY
+    // written before the first safepoint needs no prologue nil-fill — the
+    // entry block's leading defs (every `Param`, the immediate temp
+    // initializers) execute on every path before any safepoint can scan
+    // or materialize the slot. Not applied to OSR compiles: their entry
+    // jumps straight to the loop header, bypassing the entry block.
+    let entry_early_defs: std::collections::HashSet<u32> = if method.is_osr {
+        Default::default()
+    } else {
+        let entry = &method.blocks[block_order[0].0 as usize];
+        let mut set = std::collections::HashSet::new();
+        for op in &entry.code {
+            if is_safepoint(op) {
+                break;
+            }
+            op.defs(|v| {
+                set.insert(v.0);
+            });
+        }
+        set
+    };
     let mut deopt_nil_init_slots: Vec<SpillSlot> = {
         let referenced: std::collections::HashSet<u32> =
             extra_oop_live.iter().map(|&(v, _)| v.0).collect();
         intervals
             .iter()
             .filter(|iv| referenced.contains(&iv.vreg.0))
+            .filter(|iv| !entry_early_defs.contains(&iv.vreg.0))
             .filter_map(|iv| match iv.assignment {
                 Some(Assignment::Spill(slot)) => Some(slot),
                 _ => None,
@@ -1256,6 +1278,7 @@ mod tests {
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>) -> IrMethod {
         IrMethod {
             osr_cold_sends: 0,
+            is_osr: false,
             blocks,
             vregs,
             pool: Vec::new(),
