@@ -14,8 +14,13 @@ IMG=$(ls "$COG"/image/*.image 2>/dev/null | head -1)
 [ -n "$IMG" ] || { echo "no Pharo at $COG — see setup comment"; exit 2; }
 [ -x ./target/release/macvm.exe ] || { echo "build first: cargo build --release"; exit 2; }
 
+# Richards + DeltaBlue are translated from world/41a on the fly, so the
+# .mst stays the single source of truth. --assemble emits the complete
+# Cog-side fileIn (harness + classes + macro drivers with checksums).
+python scripts/mst2st.py "$COG/cog-all.st" --assemble >/dev/null
+
 echo "=== COG ($(cat "$COG"/image/pharo.version 2>/dev/null || echo Pharo)) ==="
-"$COG"/vm/PharoConsole.exe --headless "$IMG" st scripts/cog-bench.st 2>&1 | grep -vE "sqMakeMemory|^\["
+"$COG"/vm/PharoConsole.exe --headless "$IMG" st "$COG"/cog-all.st 2>&1 | grep -vE "sqMakeMemory|^\["
 
 cat > /tmp/winvm-cog-bench.mst <<'MST'
 Object subclass: Runner [
@@ -30,6 +35,8 @@ Runner show: 'fib      ' block: [ BenchmarkDashboard benchFib ].
 Runner show: 'sieve    ' block: [ BenchmarkDashboard benchSieve ].
 Runner show: 'dict     ' block: [ BenchmarkDashboard benchDict ].
 Runner show: 'alloc    ' block: [ BenchmarkDashboard benchAlloc ].
+Runner show: 'richards ' block: [ BenchmarkDashboard benchRichards ].
+Runner show: 'deltablue' block: [ BenchmarkDashboard benchDeltaBlue ].
 MST
 echo "=== WINVM threshold=20 ==="
-MACVM_JIT=threshold=20 ./target/release/macvm.exe run /tmp/winvm-cog-bench.mst --world world 2>&1 | tail -5
+MACVM_JIT=threshold=20 ./target/release/macvm.exe run /tmp/winvm-cog-bench.mst --world world 2>&1 | tail -7

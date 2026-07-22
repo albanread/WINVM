@@ -596,6 +596,8 @@ warm; results checksum-verified on both VMs. Warm ms per 10 reps:
 | fib | 135-183 | 194-196 | 1.1-1.4 |
 | sieve | <1 | ~~28-29~~ 3 | ~~>=30~~ **~3 (smi-speculation fix, same day)** |
 | alloc | 17-34 | 138-141 | **4-8 — the other loss** |
+| richards | 33 | 81 | 2.5 |
+| deltablue | <1 | 7 | **>=7** |
 
 Reading, with causes separated by confidence:
 
@@ -626,6 +628,14 @@ Reading, with causes separated by confidence:
 - **fib, 1.1-1.4x behind:** send-heavy recursion; plausibly the same
   send-overhead story as sieve's loop overhead, at smaller magnitude.
 
-Not yet baselined against Cog: richards, deltablue (need a chunk-format
-port of `world/41a`), floats, and anything block-heavy.
+Richards and DeltaBlue are baselined via `scripts/mst2st.py`, which
+translates `world/41a` to Pharo chunk format on the fly (the .mst stays
+the single source of truth; Pharo's own `Variable` system class is
+renamed `DBVariable` in the translation). Both macro results are
+checksum-asserted on both VMs. The macro story matches the micro one:
+both are send/alloc-heavy, and the two residual losses — allocation
+crossing into Rust, and spill-all send overhead — are exactly what they
+exercise. fib reached PARITY (175 vs 181) after the smi-speculation fix.
+
+Still not baselined: floats, anything block-heavy.
 
