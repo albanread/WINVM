@@ -273,6 +273,17 @@ struct Emitter<'a> {
     asm: X64Assembler,
     /// vreg → where it lives, indexed by `VReg.0`.
     assignment: Vec<Option<Assignment>>,
+    /// S14 residency, x64 (2026-07 — the ARM-parity gap): a spilled vreg
+    /// whose interval regalloc gave a callee-saved home. Reads prefer it;
+    /// every def writes THROUGH it (the canonical slot stays authoritative
+    /// — oop maps scan slots, never registers). `None` for everyone else.
+    resident: Vec<Option<u8>>,
+    /// The resident intervals as `(start, end, reg, slot, is_fp)` — the
+    /// Rust-reaching slow paths re-load from the canonical slot, because
+    /// their call may have GC'd and moved the oop the register holds.
+    /// (A resident interval never spans a `CallSend` — regalloc's
+    /// `!crosses_call` gate — so compiled callees can't clobber it.)
+    resident_reloads: Vec<(u32, u32, u8, SpillSlot, bool)>,
     /// One label per basic block.
     labels: Vec<Label>,
     /// `PoolLit` index → the interned literal-pool entry.
@@ -299,6 +310,12 @@ impl<'a> Emitter<'a> {
     /// Resolve `v` into a register ready to READ. A spilled vreg is
     /// reloaded into `scratch`; a register-resident one is returned as-is.
     fn read_into(&mut self, v: VReg, scratch: u8) -> u8 {
+        // Residency: the register mirrors the canonical slot at every
+        // instruction boundary (write-through defs; slow-path reloads
+        // after any GC opportunity) — read it, skip the load.
+        if let Some(rr) = self.resident[v.0 as usize] {
+            return rr;
+        }
         match self.assignment[v.0 as usize] {
             Some(Assignment::Reg(r)) => r,
             Some(Assignment::Spill(slot)) => {
@@ -331,7 +348,41 @@ impl<'a> Emitter<'a> {
         if let Some(Assignment::Spill(slot)) = self.assignment[v.0 as usize] {
             self.asm
                 .emit("mov", &[mem(RBP, spill_offset(slot)), r64(reg)]);
+            // Write-through: the resident copy must mirror the slot at
+            // every boundary, or the next read sees a stale register.
+            if let Some(rr) = self.resident[v.0 as usize] {
+                if rr != reg {
+                    self.asm.emit("mov", &[r64(rr), r64(reg)]);
+                }
+            }
         }
+    }
+
+    /// Reload every resident register whose interval is live at `pos` from
+    /// its canonical slot — emitted on the Rust-reaching SLOW paths only
+    /// (their call may have GC'd, moving the oops the residents point at;
+    /// the fast paths neither call nor GC, so residents stay valid there
+    /// and cost nothing). Zero instructions for a method with no residents.
+    fn emit_resident_reloads_at(&mut self, pos: u32) {
+        let live: Vec<(u8, SpillSlot, bool)> = self
+            .resident_reloads
+            .iter()
+            .filter(|&&(st, en, _, _, _)| st <= pos && en > pos)
+            .map(|&(_, _, rr, slot, fp)| (rr, slot, fp))
+            .collect();
+        for (rr, slot, fp) in live {
+            if fp {
+                self.asm
+                    .emit("movsd", &[xmm(rr), mem(RBP, spill_offset(slot))]);
+            } else {
+                self.asm
+                    .emit("mov", &[r64(rr), mem(RBP, spill_offset(slot))]);
+            }
+        }
+    }
+
+    fn emit_resident_reloads(&mut self) {
+        self.emit_resident_reloads_at(self.pos);
     }
 
     // ── Floating point (Phase 5) ────────────────────────────────────
@@ -775,6 +826,14 @@ pub fn emit_x64(
     for iv in &regalloc.intervals {
         assignment[iv.vreg.0 as usize] = iv.assignment;
     }
+    let mut resident: Vec<Option<u8>> = vec![None; method.vregs.len()];
+    let mut resident_reloads: Vec<(u32, u32, u8, SpillSlot, bool)> = Vec::new();
+    for iv in &regalloc.intervals {
+        if let (Some(rr), Some(Assignment::Spill(slot))) = (iv.resident_reg, iv.assignment) {
+            resident[iv.vreg.0 as usize] = Some(rr);
+            resident_reloads.push((iv.start, iv.end, rr, slot, iv.is_fp));
+        }
+    }
     // Runtime entry points get pool words of their own, kinded
     // `RuntimeAddr` so the GC leaves them alone (they are not oops).
     let stub_poll_lit = asm.literal_u64(rt.stub_poll, Some(RelocKind::RuntimeAddr));
@@ -793,6 +852,8 @@ pub fn emit_x64(
     let mut e = Emitter {
         asm,
         assignment,
+        resident,
+        resident_reloads,
         labels,
         literal_ids,
         epilogue,
@@ -998,6 +1059,12 @@ pub fn emit_x64(
                 .emit("mov", &[mem(RBP, spill_offset(slot)), r64(SCRATCH0)]);
         }
 
+        // Residents must be established before the header reads them —
+        // this entry bypasses the body's write-through defs entirely.
+        // (An earlier note here said the x64 emitter never reads
+        // `resident_reg`; that stopped being true when residency landed,
+        // and skipping this reload would hand the loop garbage registers.)
+        e.emit_resident_reloads_at(req.reload_pos);
         let hl = e.labels[req.header.0 as usize];
         e.asm.jmp(hl);
         entry_off
@@ -1410,6 +1477,7 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             let ret_pc = e.emit_runtime_call(lit);
             // Allocation can scavenge, so this is a safepoint.
             e.record_safepoint_at(ret_pc);
+            e.emit_resident_reloads();
             if d != RAX {
                 e.asm.emit("mov", &[r64(d), r64(RAX)]);
             }
@@ -1596,6 +1664,9 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             let ret_pc = e.emit_runtime_call(lit);
             // A real allocation may scavenge, so this is a safepoint.
             e.record_safepoint_at(ret_pc);
+            // The slow call may have GC'd — re-sync residents (slow path
+            // only; the inline bump branched straight to `done`).
+            e.emit_resident_reloads();
             if d != RAX {
                 e.asm.emit("mov", &[r64(d), r64(RAX)]);
             }
@@ -1628,6 +1699,9 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             // merge; the safepoint belongs to the call.
             let ret_pc = e.emit_runtime_call(lit);
             e.record_safepoint_at(ret_pc);
+            // The slow call may have GC'd — re-sync residents before the
+            // fast path merges back in.
+            e.emit_resident_reloads();
             e.asm.bind(skip);
         }
 
@@ -2152,6 +2226,8 @@ mod tests {
             let mut e = Emitter {
                 asm,
                 assignment: Vec::new(),
+                resident: Vec::new(),
+                resident_reloads: Vec::new(),
                 labels: Vec::new(),
                 literal_ids: Vec::new(),
                 epilogue: Label(0),
@@ -3656,6 +3732,8 @@ mod tests {
         let mut e = Emitter {
             asm: X64Assembler::new(),
             assignment: vec![Some(Assignment::Reg(1)); 1],
+            resident: vec![None; 1],
+            resident_reloads: Vec::new(),
             labels: vec![Label(0)],
             literal_ids: Vec::new(),
             epilogue: Label(0),

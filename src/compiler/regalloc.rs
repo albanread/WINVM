@@ -714,7 +714,17 @@ const ALLOCATABLE_REGS: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 
 /// idle across calls, and the residency tier reclaims what the scan
 /// leaves unused.
 #[cfg(not(target_arch = "aarch64"))]
-const ALLOCATABLE_REGS: &[u8] = &[1, 2, 3, 6, 7, 8, 9, 12, 13, 14];
+const ALLOCATABLE_REGS: &[u8] = &[1, 2, 3, 6, 7, 8, 9];
+// RCX RDX RBX R8 R9. DELIBERATELY SMALL, and disjoint from most of the
+// callee-saved bank — mirroring AArch64's structure, where allocatable
+// (x0-x15) and residency candidates (x19+) never overlap, so a resident
+// home is always free. When this pool briefly held all ten usable
+// registers (R12-R14 included), the benchmarks were BIT-IDENTICAL to the
+// 7-register pool — spill-all makes ordinary assignments short-lived
+// scratch between safepoints, so breadth here buys nothing — while
+// residency competes for the same registers and loses exactly the
+// long loop-carried intervals it exists for. RBX stays allocatable as a
+// margin against two-address pressure; RSI/RDI/R12-R14 are residency's.
 // RCX RDX RBX RSI RDI R8 R9 R12 R13 R14 — ten. R12-R14 joined once a
 // census found the emitter never wrote them (see assembler_x64).
 
@@ -773,7 +783,9 @@ pub fn fp_allocatable_regs() -> &'static [u8] {
 #[cfg(target_arch = "aarch64")]
 const RESIDENCY_CANDIDATES: &[u8] = &[6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 #[cfg(not(target_arch = "aarch64"))]
-const RESIDENCY_CANDIDATES: &[u8] = &[3, 6, 7];
+const RESIDENCY_CANDIDATES: &[u8] = &[12, 13, 14];
+// RBX RSI RDI R12 R13 R14 — all callee-saved (a resident must survive
+// the Rust calls between safepoint reloads), all saved by the call stub.
 
 /// One past the highest architectural register number either file uses —
 /// the size of the `reg_used` marking array. Register NUMBERS index it, so
@@ -1393,31 +1405,27 @@ mod tests {
         // scarcest resource on x64 and the one place its size is stated.
         assert_eq!(
             ALLOCATABLE_REGS,
-            &[
-                x64::RCX,
-                x64::RDX,
-                x64::RBX,
-                x64::RSI,
-                x64::RDI,
-                x64::R8,
-                x64::R9,
-                x64::R12,
-                x64::R13,
-                x64::R14
-            ]
+            &[x64::RCX, x64::RDX, x64::RBX, x64::RSI, x64::RDI, x64::R8, x64::R9]
         );
-        // Every callee-saved member must be one the call stub preserves,
-        // or compiled code silently corrupts its Rust caller.
-        for r in [x64::RBX, x64::RSI, x64::RDI, x64::R12, x64::R13, x64::R14] {
+        // The two pools must be disjoint apart from RBX (allocatable by
+        // deliberate exception): overlap makes ordinary assignment consume
+        // residency homes, which is exactly the failure that kept loop
+        // state in memory while the candidates sat "used".
+        assert_eq!(
+            RESIDENCY_CANDIDATES,
+            &[x64::R12, x64::R13, x64::R14]
+        );
+        for r in RESIDENCY_CANDIDATES {
             assert!(
-                ALLOCATABLE_REGS.contains(&r),
-                "expected xmm-free callee-saved register {r} in the pool"
+                !ALLOCATABLE_REGS.contains(r),
+                "residency candidate {r} must not be linear-scan allocatable"
             );
         }
-        // Residency candidates must themselves be allocatable (the tier
-        // reclaims scan leftovers) and callee-saved (never an ABI arg).
+        // Candidates must never be ABI argument registers (written
+        // mid-body by marshalling) — and with the disjoint-pool design
+        // they are no longer required to be allocatable; the reverse is
+        // asserted above.
         for r in RESIDENCY_CANDIDATES {
-            assert!(ALLOCATABLE_REGS.contains(r));
             assert!(
                 !x64::ARG_REGS.contains(r),
                 "an ABI argument register is written mid-body; it cannot host a resident"
