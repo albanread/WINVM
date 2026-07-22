@@ -1,8 +1,8 @@
-# MACVM inspired by Strongtalk
+# WINVM — a Windows x86-64 Smalltalk VM, inspired by Strongtalk
 
 ## Motivation
 
-A from-scratch Apple Silicon compiler for Smalltalk — the most complex
+A from-scratch Windows x86-64 compiler for Smalltalk — the most complex
 compiler project in my repos, and like the others, it may take a while
 before it turns into a useful system.
 
@@ -20,247 +20,158 @@ from and build on.
 
 Decades later, software technology and AI have made life far simpler — it's
 much easier to write compilers now, and I find re-implementing a strong,
-well-documented design one of the most rewarding ways to work. So MACVM is
+well-documented design one of the most rewarding ways to work. So WINVM is
 built to a large extent on Strongtalk's own design and documentation. I'm
 cheating to the maximum extent possible: the bytecode interpreter and
-compiler are written in Rust, my own assembler is reused in the compiler,
-and only the GC had to be entirely new. It also carries the almost absurd
-level of introspection, debugging, and testing a project this complex
+compiler are written in Rust, my own **x86-64 assembler** is reused in the
+compiler, and only the GC had to be entirely new. It also carries the almost
+absurd level of introspection, debugging, and testing a project this complex
 needs, in the hope it adds up to reliability.
 
-MACVM is not a port. It's a research virtual machine for macOS on Apple
-Silicon (arm64), in the **Self → Strongtalk** lineage: a **class-based
-object model** with an **adaptive optimizing compiler** driven by type
-feedback. It takes the adaptive-optimization machinery both VMs share
-(inline caches, PICs, type feedback, deoptimization) and Strongtalk's
-representation (classes + direct pointers, no object table), reimplemented
-in Rust for 64-bit Apple Silicon. Both reference VMs are cloned alongside
-this repo (`../self-repo`, `../strongtalk-repo`); the source-level analysis
-that drove the design is in
-[`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md).
+WINVM is a research virtual machine for **Windows on x86-64**, in the
+**Self → Strongtalk** lineage: a **class-based object model** with an
+**adaptive optimizing compiler** driven by type feedback. It takes the
+adaptive-optimization machinery those VMs share (inline caches, PICs, type
+feedback, deoptimization) and Strongtalk's representation (classes + direct
+pointers, no object table), reimplemented in Rust for 64-bit Windows. It is
+the Windows sibling of [MACVM](https://github.com/albanread/MACVM), sharing
+the entire portable front and middle end and re-vendoring the x86-64 JIT
+substrate (the `E:\JASM` encoder and the `E:\WF66` shipping Windows JIT VM)
+for the architecture-specific back half. The migration design is in
+[`MIGRATION.md`](MIGRATION.md).
 
 ## Status — working, and it compiles
 
-MACVM boots a real Smalltalk object world and runs programs on a **two-tier
+WINVM boots a real Smalltalk object world and runs programs on a **two-tier
 engine**: a simple dispatch-based bytecode interpreter plus a **tier-1
-optimizing JIT** that
-recompiles hot code with type feedback and deoptimizes safely. On the standard
-benchmarks the JIT owns essentially all of the runtime:
+optimizing JIT** that recompiles hot code with type feedback and deoptimizes
+safely, all under a moving generational collector. The whole system is gated
+against a single invariant — **compiled output must be byte-identical to
+interpreted output** — enforced by a differential test suite of **5,860
+in-language tests run four ways** (interpreter, JIT, JIT + GC-stress, JIT +
+deopt-stress) that must all agree.
 
-| benchmark | interpreter | JIT (tier-1) | speedup |
-|-----------|-------------|--------------|---------|
-| deltablue | 214 ms | **4 ms** | **53×** |
-| richards  | ~205 ms | 6–7 ms | ~30× |
-| sieve     | 88 ms | 9 ms | ~10× |
-| ctxloop (closure/OSR) | 134 ms | 1 ms | 134× |
+### WINVM vs Cog — the honest yardstick
 
-**Compiler coverage is achieved**: ~98.7% of methods that actually run compile
-(the remainder are native primitives, which lose nothing by staying native),
-and on real workloads **98.6–99.8% of executed bytecode-work runs as compiled
-native code** — including closures, which compile and splice inline rather than
-allocating. See [`docs/next_architecture.md`](docs/next_architecture.md) for
-the coverage arc and [`docs/PERF.md`](docs/PERF.md) for the benchmark-by-benchmark
-measurements.
+The meaningful bar for a Smalltalk JIT isn't its own interpreter (ours is
+deliberately simple); it's a mature production system. So WINVM is measured
+against **Cog** (Pharo 13, the x86-64 OpenSmalltalk JIT), on the same machine
+(i7-12700), both processes pinned to one performance core and timed with a
+microsecond clock:
+
+| benchmark | WINVM (JIT) | Cog | |
+|-----------|-------------|-----|---|
+| arith     | 36 ms | 48 ms | **faster** |
+| sieve     | 3 ms  | 4 ms  | **faster** |
+| alloc     | 14 ms | 18 ms | **faster** |
+| dict      | 12 ms | 11 ms | parity |
+| deltablue | 4 ms  | 4 ms  | parity |
+| richards  | 33 ms | 29 ms | ~1.15× behind |
+| fib       | ~207 ms | ~180 ms | ~1.2× behind |
+
+(warm, ×10 inner reps, checksum-verified equal work on both VMs). WINVM
+matches or beats Cog on five of seven and trails only on the two
+deepest-recursion / send-heavy micro-benchmarks — a known, scoped codegen
+gap ([`docs/x64_codegen_perf.md`](docs/x64_codegen_perf.md)), not a
+correctness or GC problem. See [`docs/PERF.md`](docs/PERF.md) for the full
+measured record, including how the comparison is kept fair (core pinning; a
+microsecond clock, because Windows' millisecond timer quantizes to 15.6 ms
+and made Cog's sub-tick numbers look artificially like zero).
 
 ### What's implemented
 
 - **Object model** — Strongtalk-style classes, direct tagged pointers, **no
-  object table**, a 2-word `[mark][klass]` header.
+  object table**, a 2-word `[mark][klass]` header. Arch-neutral: identical on
+  x86-64.
 - **Garbage collection** — generational scavenge + a full compacting collector,
   both running **under live, moving compiled frames** via precise oop-maps and a
-  mixed-tier frame walker.
+  mixed-tier frame walker (RBP-chain walking on x64).
 - **Interpreter** — a simple dispatch-based bytecode baseline tier (a
-  fetch-decode-`match` loop) with inline caches.
-- **Tier-1 optimizing JIT** — a vendored pure-Rust AArch64 encoder (JASM) behind
+  fetch-decode-`match` loop) with inline caches. It is also the **differential
+  oracle** and the deoptimization target, so it is kept plain and obviously
+  correct on purpose.
+- **Tier-1 optimizing JIT** — a vendored pure-Rust **x86-64 encoder** behind
   the `Assembler` trait; PICs and type feedback; method + block inlining;
   per-klass **customization** with self-send and block-arg **devirtualization**;
   **deoptimization**, **on-stack replacement (OSR)**, and recompile-on-trap.
+  Uncommon traps are `int3` sites recovered through a **Vectored Exception
+  Handler** (the Windows counterpart of MACVM's Mach signal traps).
+- **Windows codegen quality** — identity-move elision, spill-to-spill
+  coalescing, constant rematerialisation, provably-dead write-barrier removal,
+  a loop-weighted callee-saved **residency** tier, and inline lowering of the
+  identity (`==`/`~~`) and boolean-`not` special selectors — all validated
+  byte-identical under the four-way differential
+  ([`docs/x64_codegen_perf.md`](docs/x64_codegen_perf.md)).
 - **Closure compilation** — literal blocks compile and splice inline, including
   multi-basic-block conditional-`^` (non-local-return) blocks, with `Context`
-  elision / materialization / adoption across the tier boundary.
-- **FFI** — Tier-1 POSIX via `dlsym` + shape-keyed native-call trampolines +
-  an `Alien` raw-memory type ([`docs/FFI.md`](docs/FFI.md)).
-- **SIMD** — NEON vector support in two layers: `Float64x2` / `Float32x4` /
-  `Int32x4` **value classes** whose arithmetic the JIT fuses to single NEON
-  instructions, and `FloatArray` **bulk kernels** (`+@`, `sum`, `dot:`,
-  `scale:`, `min`/`max`) as explicit hand-written NEON in Rust
-  ([`docs/SIMD.md`](docs/SIMD.md)).
-- **Debugger** — crash-dossier (PROBE), breakpoints, mixed-tier backtrace, an
-  a64 disassembler, IR dumps, and step-between-calls ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
+  elision / materialization / adoption across the tier boundary. A recursive
+  call never heap-allocates its activation (`contexts_allocated == 0` on the
+  benchmarks).
+- **Inline allocation** — `basicNew` and class-side constructors fuse to an
+  inline eden bump (no Rust crossing per object); the nursery is sized so the
+  allocation benchmark beats Cog ([`docs/gc_alloc_gap.md`](docs/gc_alloc_gap.md)).
+- **Scalar float regions** — a mono-`Double` send site compiles to a guarded
+  unbox, native SSE2 `movsd`/`addsd`/`mulsd`/`ucomisd`, and a box only where a
+  boxed value is actually observed; inside a region there is no allocation, no
+  GC interaction, and no message send
+  ([`docs/float_fastpath_design.md`](docs/float_fastpath_design.md)).
+- **Win32 FFI** — native calls resolved through `GetProcAddress` +
+  shape-keyed native-call trampolines + an `Alien` raw-memory type
+  ([`docs/FFI.md`](docs/FFI.md)). The `Platform` global (`#windows`) lets shared
+  world source select the right OS surface at load time — e.g. `Time` reads
+  the wall clock via `GetSystemTimePreciseAsFileTime` over `VirtualAlloc`
+  scratch, where the Mac line used `clock_gettime`.
+- **COM + the web GUI** — see below.
+- **Multi-VM workers** — share-nothing parallelism driven from Smalltalk:
+  `Worker spawn:` boots **worker VMs** (each its own heap, JIT, and GC on its
+  own OS thread) that communicate with the primary by **deep-copy message
+  passing** (the MOP pickle) — Erlang-style, no shared state, no identity across
+  heaps, fully asynchronous (`send:onReply:` continuations; a send wakes the
+  sleeping receiver, so nothing polls). A crashed worker dies alone and is
+  reported as an ordinary `#workerDied` message
+  ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
 - **Image store** — offline SQLite image editing + a DB→VM boot loader that
   reconstructs the world byte-identically to a `.mst` boot ([`docs/IMAGE.md`](docs/IMAGE.md)).
-- **Embedding + two GUIs** — a `VmHandle` library API embeds the language on
-  a dedicated thread that survives a guest-thread crash, behind **two
-  independent front-ends** built on the same primitives:
-  - **`gui/` (`macvm-gui`)** — a faithful recreation of the 1996
-    **Strongtalk hypertext programming environment**, rendered as HTML in a
-    `WKWebView` inside a native Cocoa window/menu bar/toolbar. The truer
-    read of the original interface, and the one with the built-in help +
-    tour.
-  - **`cocoa_gui/` (`macvm-cocoa`)** — a lighter, **native AppKit shell
-    whose own interface is written in Smalltalk**: real Cocoa views
-    (`NSButton`, `NSOutlineView`, `NSTextView`, …), driven by a Smalltalk VM
-    pinned to the main thread through the Cocoa bridge — no HTML, no JS, no
-    WebKit process. The environment *is* the language, all the way up.
-
-  Both ship the same core toolset — a live **class browser** whose accepts
-  compile into the running VM *and* persist to the image, an outliner,
-  **find tools** (definitions, implementors, senders — SQLite-indexed), a
-  **Workspace** with do-it/print-it, a **Canvas** drawing widget, and a live
-  **VM/GC metrics dashboard** — each built the way its own front-end works
-  best (`gui/`'s tools are DB-and-JS-driven; `cocoa_gui/`'s browser is
-  DB-backed while its outliner reflects the live VM directly)
-  ([`docs/vm_handle.md`](docs/vm_handle.md), [`gui/PLAN.md`](gui/PLAN.md),
-  [`docs/cocoa_gui_design.md`](docs/cocoa_gui_design.md)).
-- **Game engine** — a native Metal game pane driven entirely from Smalltalk: an
-  8-bit indexed drawing surface, retained GPU sprites, a 60 fps frame loop with
-  keyboard input, and sound effects + ABC-notation music through AVFoundation,
-  via the [MacGamePane](https://github.com/albanread/MacGamePane) engine
-  ([`docs/gamepane_design.md`](docs/gamepane_design.md)). The GUI's **Demos**
-  menu ships four, all written in Smalltalk: `Breakout`
-  ([`world/44_breakout.mst`](world/44_breakout.mst)), a small but complete
-  paddle-ball-bricks game; `MandelZoom`
-  ([`world/45_mandelzoom.mst`](world/45_mandelzoom.mst)), a live zooming
-  Mandelbrot (the JIT-compiled escape-time float math); the same dive run in a
-  **spawned second VM**; and `ParallelMandel`
-  ([`world/48_parallelmandel.mst`](world/48_parallelmandel.mst)) — the dive
-  with **every frame computed in parallel bands by 4 worker VMs** (below).
-- **Multi-VM workers** — true multicore parallelism, driven entirely from
-  Smalltalk: `Worker spawn:` boots **worker VMs** (each its own heap, JIT, and
-  GC on its own OS thread) that communicate with the primary by **deep-copy
-  message passing** (the MOP pickle) — Erlang-style share-nothing, no shared
-  state, no identity across heaps, consistent with the `become:` stance below.
-  A primary can hold a pool of **up to 16 concurrent worker VMs**, each
-  independently addressable (`send:onReply:` per worker) — a star topology:
-  every worker talks only to the primary, and workers don't spawn sub-workers
-  (a v1 rule the registry design doesn't preclude lifting later).
-  Fully asynchronous: replies run as `send:onReply:` continuations and delivery
-  is event-driven — the send itself wakes the sleeping receiver (a coalesced,
-  never-lost wake), so **no one ever polls for a message** and a worker with
-  nothing to do sleeps at zero CPU. (Honesty note: that claim is about the
-  message plane. The Cocoa GUI's supervisor does run a deliberate slow
-  heartbeat — ~4 Hz, control-plane housekeeping only: stop flags, toolbar
-  metrics, servicing parked requests such as File In — and the shell's
-  flag-and-drain pattern sweeps its request flags on each pass, made prompt by
-  a run-loop wake. Bounded ticks by design, not message delivery; the headless
-  worker system runs with no beat at all.) A crashed worker dies alone and is
-  reported as an ordinary `#workerDied` message. `ParallelMandel` measures **~2.65 CPUs of sustained
-  utilization with 4 workers** on the live zooming Mandelbrot — visibly faster
-  than the single-VM dive ([`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md)).
-- **The object world** — 107 classes / 1,269 methods of hand-written and
-  Strongtalk-ported library (`world/*.mst`, `world.list`'s own 64 files;
-  counted via `ClassMirror allClasses`, own — not inherited — selectors):
-  full collections + streams protocol, Dictionary/Set/OrderedCollection,
-  String/Character text utilities, Fraction and LargeInteger arithmetic, an
-  in-language test suite, and the Richards / DeltaBlue / Stanford benchmark
-  ports in `world/bench/` (counted separately — loaded on demand, not part
-  of the boot-time figure above).
+- **The object world** — 100+ classes / 1,200+ methods of hand-written and
+  Strongtalk-ported library (`world/*.mst`): full collections + streams
+  protocol, Dictionary/Set/OrderedCollection, String/Character text utilities,
+  Fraction and LargeInteger arithmetic, an in-language test suite, and the
+  Richards / DeltaBlue / Stanford benchmark ports in `world/bench/`.
 - **Scripting** — an embedded RUSTTCL console for driving the VM and its
   debugger ([`docs/RUSTTCL.md`](docs/RUSTTCL.md)).
+- **Debugger** — crash-dossier (PROBE) via an SEH/VEH dumper, breakpoints,
+  mixed-tier backtrace, an x86-64 disassembler, IR dumps, and step-between-calls
+  ([`docs/DEBUGGER.md`](docs/DEBUGGER.md)).
 
-### Cocoa from Smalltalk
+### COM and the web GUI
 
-MACVM talks to macOS directly. Foundation and AppKit objects are ordinary
-Smalltalk receivers — look a class up once and Objective-C messages are
-plain keyword sends, with argument and return types read from the live
-runtime's own method signatures:
+The programming environment is a **web GUI**: a faithful recreation of the
+1996 **Strongtalk hypertext programming environment**, rendered as HTML and
+driven live from the running VM. On Windows it is hosted in **WebView2** — the
+Chromium/Edge runtime — inside a native **Win32** window, and the whole
+integration goes through **COM**: `CoInitializeEx`, the `ICoreWebView2`
+controller and view, and the `webview2-com` bindings
+([`gui/src/shell/win.rs`](gui/src/shell/win.rs)). The page and the VM talk
+over `window.chrome.webview.postMessage`; a virtual host name serves the GUI
+tree, and every send from the page runs between doits on the VM thread.
 
-```smalltalk
-s := (Cocoa classNamed: 'NSMutableString') alloc init.
-s appendString: 'hello'.
-s length.                        "→ 5"
+COM is to WINVM what the Objective-C bridge was to the Mac line: the way the
+language reaches the host platform. WebView2 is itself a COM component tree,
+and the same `webview2-com` / `windows` crate bindings are the substrate a
+broader **COM-from-Smalltalk** bridge builds on — the Windows analogue of
+treating host objects as ordinary Smalltalk receivers.
 
-win onMain makeKeyAndOrderFront: nil.          "AppKit runs on the main thread"
-act := Cocoa action: [ Transcript showCr: 'clicked!' ].
-btn onMain setTarget: act.  btn onMain setAction: 'macvmFire:'.
-```
-
-A Cocoa object lives in Smalltalk as an `ObjcRef` holding one retained
-reference — the moving GC and Objective-C's reference counting never see
-each other's pointers, exceptions are caught at the boundary, and the
-bridge always errs toward a leak, never a double-free (`release`,
-`poolDo:`, and ARC's naming conventions do the bookkeeping). Button
-clicks travel back over the same inbox the worker VMs use and run
-between doits on the VM thread. The **Demos → CocoaPad** menu item
-builds a native `NSWindow` with a live button entirely from
-`world/50_cocoapad.mst`; the design is in
-[`docs/cocoa_bridge_design.md`](docs/cocoa_bridge_design.md), the user
-guide in the in-app help (Help → MACVM Documentation → Cocoa from
-Smalltalk).
-
-### Fast floating point
-
-Strongtalk's tour introduced the idea of "fast floats" — eliminating the
-allocation for intermediate results within a method — and sketched an
-experimental scheme for it. MACVM builds that idea out fully in the tier-1
-JIT as **float regions**: a mono-`Double` send site (the inline cache
-is the type oracle) compiles to a guarded unbox, native `fmul`/`fadd`/`fcmp`,
-and a box only where a boxed value is actually observed. Inside a region there
-is **no allocation, no GC interaction, and no message send — just assembler
-maths and libm calls**:
-
-- **A second register file.** Unboxed floats live in `d0`–`d7` scratch plus a
-  `d8`–`d15` write-through residency tier, fully independent of the GPR
-  allocator. A raw `f64` is invisible to the moving GC (never in an oop map,
-  never scanned), which is what makes registers-across-safepoints cheap here.
-- **A box/unbox reducer.** `FUnbox(FBox x) → x` cancellation, dead-box
-  elimination, deopt-sunk boxing (an intermediate needed only by deopt
-  metadata is boxed *in the trap's own cold block*), literal folding, and
-  **float-temp promotion** — a temp that provably always holds a `Double`
-  lives as a raw `f64` across the whole loop, safepoints included.
-- **Honest deoptimization.** One new deopt-map kind (`DoubleSlot`) tells the
-  materializer "this frame slot is raw float bits — box it back"; everything
-  else reuses the existing trap/reexecute machinery, verified by pinned
-  forced-deopt-mid-loop regressions.
-- **libm transcendentals** — `sin cos tan exp ln atan sqrt` as primitives;
-  libm preserves the callee-saved `d`-registers, so a plotted curve costs one
-  library call per point plus register arithmetic.
-
-Measured on the WKWebView GUI's Mandelbrot demo (420×220, release, Apple
-Silicon), each layer removing a *category* of cost:
-
-| stage | time | allocation per render |
-|-------|------|-----------------------|
-| boxed sends (before) | 746 ms | 708 MB |
-| pixel-buffer output | 458 ms | 595 MB |
-| float-region fuse | 180 ms | 595 MB |
-| sunk boxing + temp promotion | 166 ms | 4 MB |
-| strength-reduced coordinates | 38 ms | 0 |
-| **d-register residency** | **25 ms** | **0** |
-
-**~30× end to end, with zero allocation, zero deopts, and one scavenge-free
-heap per render.** Full design, the measured-and-rejected variants included,
-in [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md).
-
-**How close is that to C?** The honest external yardstick — the *identical*
-Mandelbrot kernel hand-ported to C (same 420×220, same escape loop and
-coordinate accumulation, checksum-verified equal work), compiled with the same
-Apple `clang`, warmed, best-of-30 on the same machine:
-
-| engine | time | vs C ‑O2 |
-|--------|------|----------|
-| C, ‑O2 (== ‑O3 ‑march=native) | 4.6 ms | 1.0× |
-| C, ‑O0 | 13.1 ms | 2.9× |
-| **MACVM tier‑1 JIT** | **25.2 ms**¹ | **5.5×** |
-| MACVM interpreter | 3406 ms¹ | 745× |
-
-¹ Independently re-timed 2026-07-19 (23 ms / 3337 ms — within noise; see
-[`docs/float_fastpath_design.md`](docs/float_fastpath_design.md)'s own
-verification note). This repo has no committed C source or build script for
-the two C rows, so only MACVM's own two rows are source-verifiable here.
-
-So the tier‑1 JIT lands **~1.9× off *unoptimized* C and ~5.5× off optimized
-C** — solid-baseline-JIT territory for a dynamic language (the "~30×" above is
-against our own interpreter floor, not against C; absolute times are the fair
-measure). The remaining gap to ‑O2 is specific and known: no FMA fusion
-(`fmul; fadd` vs a single `fmadd`), and `escapeAtRe:im:` is still a per‑pixel
-compiled *send* rather than inlined into the pixel loop the way C inlines
-`escape()`.
+The GUI ships the same core toolset as the reference environment — a live
+**class browser** whose accepts compile into the running VM *and* persist to
+the image, an outliner, **find tools** (definitions, implementors, senders —
+SQLite-indexed), a **Workspace** with do-it/print-it, a **Canvas** drawing
+widget, and a live **VM/GC metrics dashboard**
+([`docs/vm_handle.md`](docs/vm_handle.md), [`gui/PLAN.md`](gui/PLAN.md)).
 
 ### Replace, don't mutate — there is no persistent image
 
-MACVM never mutates a persistent image. Where classic Smalltalk carries one
-long-lived heap snapshot forward across years of in-place modification, MACVM
+WINVM never mutates a persistent image. Where classic Smalltalk carries one
+long-lived heap snapshot forward across years of in-place modification, WINVM
 keeps its truth in a **source-code database** — the `.mst` world files and the
 SQLite image they seed — and spins up VMs from it in well under a second. VMs
 are plural and disposable: the system would always rather **throw a VM away and
@@ -271,156 +182,92 @@ the GUI, it is not patched into the long-running VM: a **fresh VM is recreated
 from the world and your file loads on top of it**. Filing in the same file
 twenty times just works — there is no accumulated state to collide with,
 because there is no accumulated state at all. To a Smalltalker raised on the
-image this reads as less dynamic, almost static. In operation, though, MACVM is
+image this reads as less dynamic, almost static. In operation, though, WINVM is
 a true Smalltalk system — live objects, live compilation, everything inspectable
 while it runs. The difference is only in how change lands: **replacement instead
 of mutation**, with every piece of state visible in source you can read, diff,
-and version — never implicit in a heap that remembers things no one can point
-to.
+and version.
 
 ### Why there's no `become:`
 
-MACVM has no `become:` — the Smalltalk primitive that swaps one object's
+WINVM has no `become:` — the Smalltalk primitive that swaps one object's
 identity for another's, redirecting every reference in the system at once. This
-is a deliberate omission, and it's worth being honest about the cost before the
-justification.
-
-**What we lose.** `become:` is the classic tool for three things, and we give
-all three up:
-
-- **Live schema migration.** Add an instance variable to a class and, with
-  `become:`, you can reshape every *existing* instance in place while preserving
-  its identity and every reference to it. Without it, instances keep their old
-  shape until they are recreated — so objects built up in memory during a
-  session can't be upgraded live.
-- **Transparent replacement.** Proxies, lazy-loading stubs that resolve into the
-  real object, futures, copy-on-write — anything that substitutes one object for
-  another while everyone holding a reference keeps working. `become:` does this
-  atomically; we must use explicit indirection (a handle, or `doesNotUnderstand:`
-  forwarding), which leaks into the API and means identity (`==`) is the
-  wrapper's, not the target's.
-- **`becomeForward:` bulk redirection**, used by image loaders and some
-  compaction tricks.
-
-These are real capabilities, not corner cases — a Smalltalker who reaches for
-`become:` will find it missing.
-
-**Why it's gone.** MACVM — like Strongtalk and Self before it — represents an
-object reference as the **raw machine address of the object body**, not as an
-index into an object table. That is the choice that makes a field access a
-single load and lets the JIT cache classes at send sites, build PICs, and
-inline — the whole basis of the adaptive optimizer. But it also means
+is a deliberate omission. WINVM — like Strongtalk and Self before it —
+represents an object reference as the **raw machine address of the object
+body**, not as an index into an object table. That is the choice that makes a
+field access a single load and lets the JIT cache classes at send sites, build
+PICs, and inline — the whole basis of the adaptive optimizer. But it also means
 "redirect every reference to A so it points to B" has no cheap implementation:
 there is no table slot to swap, only every pointer in both heap generations,
 every root, every live stack frame, and every machine register to find and
-rewrite. Strongtalk *does* keep a `become:` primitive and implements it exactly
-that way — `deoptimize_all()` followed by a full-heap scan — and its own tour
-calls it "prohibitively slow" and "not supported." For an optimizing VM the scan
-is only half the cost: a `become:` that changes an object's class invalidates
-every cached class in the code cache, and one that reshapes an object
-invalidates the fixed field offsets baked into compiled code, forcing a global
-deoptimization. `become:` fights everything the compiler is built to do.
+rewrite. `become:` fights everything the compiler is built to do.
 
-**Why we can afford to skip it — MACVM is not image-based.** There is no
-persistent snapshot of the live object heap (the `image.sqlite3` MACVM can boot
-from is a database of class/method *source*, not a heap dump). A snapshot is
-what historically *made* `become:` load-bearing: a decades-old living image can
-never be restarted, so its objects must be migrated in place. MACVM instead
-rebuilds its entire world from source — `.mst` files, or the SQLite source
-database — on every boot, and that boot takes **well under a second** for the
-whole standard world. So the dominant use of `become:` — evolving a class whose
-instances you can't afford to lose — is answered by editing the source and
-restarting, not by mutating a live heap. Class redefinition itself already goes
-through the deoptimize-and-recompile path the VM has for exactly this. The
-residual, real loss is schema-migrating or transparently proxying objects
-*within a single running session* — and that is the price we pay, knowingly,
-for direct pointers and a fast JIT.
+We can afford to skip it because WINVM is **not image-based**: there is no
+persistent snapshot of the live object heap (the SQLite image WINVM boots from
+is a database of class/method *source*, not a heap dump). WINVM rebuilds its
+entire world from source on every boot, in well under a second, so the dominant
+use of `become:` — evolving a class whose instances you can't afford to lose —
+is answered by editing the source and restarting, not by mutating a live heap.
+Class redefinition itself already goes through the deoptimize-and-recompile path
+the VM has for exactly this. The full reasoning, including what is genuinely
+lost, is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
-### Design & planning docs
+### Not yet on Windows
 
-| Doc | Contents |
-|-----|----------|
-| [`docs/SPEC.md`](docs/SPEC.md) | The full engineering specification — language, object model, bytecode, interpreter, GC, adaptive compiler, deopt, primitives, bootstrap, testing |
-| [`docs/SPRINTS.md`](docs/SPRINTS.md) | The phased implementation plan (S0–S15 core, S16+ stretch) and its status |
-| [`docs/DESIGN.md`](docs/DESIGN.md) | High-level architecture + decisions of record (D1–D13) |
-| [`docs/PERF.md`](docs/PERF.md) | The performance record: every optimization arc, measured |
-| [`docs/float_fastpath_design.md`](docs/float_fastpath_design.md) | Unboxed float regions: the IR review, the reducer, the `d`-register file, `DoubleSlot` deopt |
-| [`docs/mandelbrot_walkthrough.md`](docs/mandelbrot_walkthrough.md) | The Mandelbrot flagship as a teaching example: 746 ms → 166 ms, 708 MB → 4 MB allocation, walked through arithmetic-vs-representation cost |
-| [`docs/next_architecture.md`](docs/next_architecture.md) | The compiler-coverage arc (now met — ~98.7% of run methods compile): why MACVM's interpreter/JIT boundary exists and what closing it further would take |
-| [`docs/SIMD.md`](docs/SIMD.md) | SIMD vector support (built): `Float64x2`/`Float32x4`/`Int32x4` value classes fused to NEON by the JIT, plus `FloatArray` bulk kernels + reductions |
-| [`docs/FFI.md`](docs/FFI.md) | The foreign-function interface: `dlsym` resolution, shape-keyed trampolines, the `<primitive: FFI …>` pragma, and the `Alien` raw-memory type |
-| [`docs/cocoa_bridge_design.md`](docs/cocoa_bridge_design.md) | The Cocoa bridge (designed): how the moving GC and Cocoa's reference counting coexist — retain-on-wrap `ObjcRef` tickets, zero GC changes, main-thread hops, callback tickets, the C0–C5 ladder |
-| [`docs/cocoa_gui_design.md`](docs/cocoa_gui_design.md) | The native Cocoa GUI (built, `cocoa_gui/`): the environment written in itself — a Smalltalk VM pinned to the main thread *is* the interface, a second VM behind it is the persistent environment; C6 reverse-dispatch delegates, the restart-in-place supervisor |
-| [`docs/cocoa_gui_flag_and_drain.md`](docs/cocoa_gui_flag_and_drain.md) | Why a C6 callback may never touch VM-level state directly (two real failure modes: fails closed silently, or crashes the process) and the flag/wake/drain mechanism every UI rebuild, primary restart, and data-backed view refresh uses instead — plus a checklist for adding a new one |
-| [`docs/cocoa_gui_implementation.md`](docs/cocoa_gui_implementation.md) | Implementation walkthrough, real source cited: how a Cocoa class is found at runtime (both directions), how a Smalltalk send becomes `objc_msgSend` and back, how the moving GC and manual refcounting coexist with zero GC changes, how the UI VM and the persistent VM actually talk |
-| [`docs/DEBUGGER.md`](docs/DEBUGGER.md) | The debugging ladder: PROBE crash dossiers, breakpoints, mixed-tier backtraces, the a64 disassembler, IR dumps |
-| [`docs/ASM.md`](docs/ASM.md) / [`docs/CANVAS.md`](docs/CANVAS.md) | Side-track designs with working preview tools: hand-written native-AArch64 methods (`<asm:>`), and the GUI Canvas widget |
-| [`docs/gamepane_design.md`](docs/gamepane_design.md) | The native Metal game engine driven from Smalltalk (MacGamePane): the frame/threading architecture, drawing/sprite/audio command channel, and the milestone ladder |
-| [`docs/multi-smalltalk-worker.md`](docs/multi-smalltalk-worker.md) | Primary/worker VM parallelism (built, M0–M4): spawn worker VMs from Smalltalk, communicate by deep-copy message passing (the MOP pickle), no shared state — Erlang-style share-nothing across heaps; capstone = the 4-worker parallel Mandelbrot |
-| [`docs/IMAGE.md`](docs/IMAGE.md) / [`docs/managingtheworld.md`](docs/managingtheworld.md) | The versioned SQLite world image, and the practical world/image reseed workflow (`./reseed-world.sh`) |
-| [`docs/arm64.md`](docs/arm64.md) | Machine-level design: MAP_JIT/W^X, AAPCS64, PAC, relocs, oop maps, deopt glue |
-| [`docs/reference-vm-analysis.md`](docs/reference-vm-analysis.md) | Source-anchored analysis of Self, Strongtalk, JASM, and the MacNCL GC |
-| [`docs/sprints/`](docs/sprints/README.md) | Per-sprint implementation guidance + test plans (the sprint logs) |
+WINVM shares the portable front/middle end with the Mac line but is a younger
+port; a few Mac-specific capabilities have **not** been carried over and are not
+claimed here: the NEON SIMD value-classes / bulk kernels (an x86-64 SSE/AVX
+rewrite is future work), the native Metal game pane, and the native AppKit
+("Cocoa") GUI. The web GUI above is the Windows front-end.
 
 ## Layout
 
 | Path | Contents |
 |------|----------|
 | `src/oops/` | Object model — tagged pointers, 2-word headers, classes |
-| `src/memory/` | Object memory, allocation, generational + full GC |
-| `src/interpreter/` | Threaded-code interpreter (the baseline tier) |
+| `src/memory/` | Object memory, allocation (`VirtualAlloc`), generational + full GC |
+| `src/interpreter/` | Dispatch-based interpreter (the baseline tier + differential oracle) |
 | `src/bytecode/` | Bytecode format, decoder, CFG |
-| `src/compiler/` | Tier-1 optimizing compiler + JASM AArch64 backend |
-| `src/codecache/` | Native code cache, stubs, deopt trap machinery |
-| `src/runtime/` | Dispatch, frames, deopt materializer, OSR, recompile, debugger |
+| `src/compiler/` | Tier-1 optimizing compiler + the x86-64 backend (`emit_x64.rs`, `regalloc.rs`, `oopmap.rs`) |
+| `src/codecache/` | Native code cache, stubs, VEH deopt-trap machinery (`stubs_x64.rs`, `deopt_trap.rs`) |
+| `src/runtime/` | Dispatch, frames (RBP chains), deopt materializer, OSR, recompile, debugger |
 | `src/frontend/` | `.mst` parser + class-definition loader |
-| `src/embed.rs` | `VmHandle` embedding API |
+| `src/vendor/wfasm/` | Vendored pure-Rust x86-64 encoder + Win32 native loader (from `E:\JASM`) |
+| `src/embed.rs` | `VmHandle` embedding API + multi-VM workers |
 | `src/rusttcl/` | Embedded RUSTTCL console |
 | `world/` | The object world / image sources, tests, benchmarks |
-| `gui/` | The Strongtalk-style HTML GUI (`macvm-gui`) — rendered in a `WKWebView` |
-| `cocoa_gui/` | The native Cocoa GUI (`macvm-cocoa`) — its own interface written in Smalltalk, driving AppKit directly |
+| `gui/` | The Strongtalk-style web GUI — rendered in **WebView2** via COM (`gui/src/shell/win.rs`) |
 | `image_store/` | The versioned SQLite class/method source database (importer, exporter, send-index) |
-| `examples/` | Embedding examples (`mandel_demo`: boot a fresh VM, run a demo headless, exit) |
-| `docs/` | Design notes, specs, per-sprint guidance |
+| `docs/` | Design notes, specs, per-sprint guidance, the migration design (`MIGRATION.md`) |
 
 ## Building & running
 
 ```sh
 cargo build --release
 target/release/macvm run world/bench/deltablue.mst --world world   # runs it
-MACVM_JIT=off   target/release/macvm run <prog>.mst --world world   # interpreter only
-MACVM_JIT=threshold=200 …                                            # JIT (default gate)
-MACVM_TRACE=stats|jit|deopt|count …                                  # instrumentation
+set MACVM_JIT=off & target/release/macvm run <prog>.mst --world world   # interpreter only
+set MACVM_JIT=threshold=20 & ...                                        # JIT gate
+set MACVM_TRACE=stats & ...                                             # jit|deopt|count instrumentation
+set MACVM_BENCH_CPU=perf & ...                                         # pin to a P-core for benchmarking
 ```
 
 The JIT is on by default. `MACVM_JIT=off` selects the interpreter, which is the
 differential oracle every JIT change is gated against (compiled output must be
 byte-identical to interpreted output). Tests: `cargo test`; the stress matrix
-(GC / deopt) and world differentials are in `tests/` and the `justfile` gates.
+(GC / deopt) and world differentials are in `tests/`.
 
-Either GUI launches with a release build by default (both default to `dev`
-under a bare `cargo run`, which measures tens of times slower on
-compute-heavy demos like the Mandelbrot dives — these scripts exist
-specifically to avoid that trap):
-
-```sh
-./run-gui.sh      # the WKWebView Strongtalk-style environment (macvm-gui)
-./run-cocoa.sh    # the native AppKit environment, written in Smalltalk (macvm-cocoa)
-```
-
-Both share the **Demos** menu (Breakout and the three Mandelbrots, including
-the 4-worker parallel dive); `./run-mandelvm.sh` runs the standalone
-one-dive demo window that exits itself. The WKWebView GUI boots its whole
-interface from a SQLite **image** (`world/image.sqlite3`) rebuilt from the
-`world/*.mst` source; the Cocoa GUI boots classes straight from `.mst`
-source every launch, but its DB-backed browser/find tools read the same
-image. After changing a world class, rebuild the image with
-`./reseed-world.sh` (build + fresh reseed + boot-check) — see
-[`docs/managingtheworld.md`](docs/managingtheworld.md) for the full workflow and
-gotchas.
+The web GUI launches with a release build (`gui/`, hosted in WebView2 — the
+Edge/Chromium runtime must be present, as it is on current Windows). It boots
+its whole interface from a SQLite **image** (`world/image.sqlite3`) rebuilt from
+the `world/*.mst` source; after changing a world class, rebuild the image with
+the reseed workflow ([`docs/managingtheworld.md`](docs/managingtheworld.md)).
 
 ## Lineage & licensing
 
 Self and Strongtalk were released under BSD-style licenses. Code adapted from
-them retains its original notices; new MACVM code is under the license in
-[`LICENSE`](LICENSE). See `docs/DESIGN.md` for provenance tracking.
+them retains its original notices; new WINVM code is under the license in
+[`LICENSE`](LICENSE). See `docs/DESIGN.md` for provenance tracking. WINVM is the
+Windows x86-64 sibling of [MACVM](https://github.com/albanread/MACVM); the two
+share the portable front and middle end and diverge in the architecture-specific
+back half (x86-64 vs AArch64) and the host-integration layer (COM/WebView2 vs
+Cocoa/WKWebView).
