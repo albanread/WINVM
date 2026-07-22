@@ -421,13 +421,29 @@ pub fn create_window_and_webview() {
         let _ = std::fs::create_dir_all(&user_data);
         let user_data_w = wide(&user_data.to_string_lossy());
 
+        // Turn OFF SmartScreen (Edge's URL-reputation service) for this
+        // control. This is not a security downgrade for a general browser —
+        // the environment only ever loads this app's OWN local files over the
+        // [`ASSET_ORIGIN`] virtual host; there is no untrusted navigation to
+        // vet. Leaving it on made every click cost ~2 s: each navigation
+        // targets a fresh `?g=<n>` URL (the cache-buster), so the reputation
+        // check can never be cached and phones home to Microsoft on every
+        // navigation, blocking the commit until it times out (the file itself
+        // is served locally in ~2 ms — measured). Disabling it drops
+        // click-to-content from ~2000 ms to ~5 ms. Set on the ENVIRONMENT so
+        // it needs no launch-time flag.
+        let options: ICoreWebView2EnvironmentOptions =
+            CoreWebView2EnvironmentOptions::default().into();
+        let browser_args = wide("--disable-features=msSmartScreenProtection");
+        let _ = options.SetAdditionalBrowserArguments(PCWSTR(browser_args.as_ptr()));
+
         let (tx, rx) = mpsc::channel();
         CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
             Box::new(move |handler| {
                 CreateCoreWebView2EnvironmentWithOptions(
                     PCWSTR::null(),
                     PCWSTR(user_data_w.as_ptr()),
-                    None,
+                    &options,
                     &handler,
                 )
                 .map_err(Into::into)
