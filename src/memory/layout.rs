@@ -7,7 +7,22 @@
 //! sprint's own layer-boundary rule.)
 
 /// Default eden size *(tunable via `VmOptions`/`MACVM_EDEN`)* — SPEC §7.1.
-pub const DEFAULT_EDEN_SIZE: usize = 4 << 20;
+///
+/// 32 MiB, not the original 4: benchmarked head-to-head against Cog
+/// (docs/gc_alloc_gap.md cost 2, PERF.md 2026-07-22), the 4 MiB nursery
+/// forced ~122 scavenges through the alloc benchmark and was the whole
+/// difference between losing to Cog 3x and beating it (alloc warm 53 ms ->
+/// 12 ms vs Cog's 18). Small heaps still boot: callers size eden through
+/// [`default_eden_for`], which caps it at a quarter of the reservation.
+pub const DEFAULT_EDEN_SIZE: usize = 32 << 20;
+
+/// The default-eden choice for a reservation of `total_len` bytes:
+/// [`DEFAULT_EDEN_SIZE`], capped at a quarter of the reservation so tiny
+/// test heaps (16 MiB) keep booting with sane old-gen headroom. An
+/// explicit `MACVM_EDEN`/`eden_kb` override bypasses this entirely.
+pub fn default_eden_for(total_len: usize) -> usize {
+    DEFAULT_EDEN_SIZE.min(total_len / 4)
+}
 /// Each survivor space's fixed size *(tunable)* — SPEC §7.1.
 pub const SURVIVOR_SIZE: usize = 512 << 10;
 /// Old gen's first committed segment at boot *(tunable, S8 grows further)*;
@@ -144,12 +159,21 @@ mod tests {
     #[test]
     fn small_reservation_still_fits_two_survivors() {
         // The smallest heap_mib used anywhere in the test suite (16 MiB):
+        // `default_eden_for` caps eden at a quarter (4 MiB), so
         // eden(4) + from(0.5) + to(0.5) = 5 MiB, leaving 11 MiB for old.
-        let l = HeapLayout::new(0, 16 << 20, DEFAULT_EDEN_SIZE);
+        let eden = default_eden_for(16 << 20);
+        assert_eq!(eden, 4 << 20);
+        let l = HeapLayout::new(0, 16 << 20, eden);
         assert!(!l.old.is_empty());
-        assert_eq!(
-            l.old.len(),
-            (16 << 20) - DEFAULT_EDEN_SIZE - 2 * SURVIVOR_SIZE
-        );
+        assert_eq!(l.old.len(), (16 << 20) - eden - 2 * SURVIVOR_SIZE);
+    }
+
+    #[test]
+    fn default_eden_scales_with_reservation() {
+        // Big reservations get the full 32 MiB nursery; small ones a quarter.
+        assert_eq!(default_eden_for(256 << 20), DEFAULT_EDEN_SIZE);
+        assert_eq!(default_eden_for(128 << 20), DEFAULT_EDEN_SIZE);
+        assert_eq!(default_eden_for(64 << 20), 16 << 20);
+        assert_eq!(default_eden_for(16 << 20), 4 << 20);
     }
 }

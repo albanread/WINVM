@@ -207,11 +207,11 @@ pub struct Universe {
     pub sel_cannot_return: SymbolOop,
 }
 
-/// Default eden size *(tunable)* — SPEC §7.1. `options.eden_kb`
-/// (`MACVM_EDEN` env override, S7-10) overrides it — the S7 GC-stress test's
-/// actual consumer: a small eden makes a scavenge reachable without first
-/// allocating megabytes of filler.
-const EDEN_SIZE: usize = super::layout::DEFAULT_EDEN_SIZE;
+// Default eden sizing moved to `layout::default_eden_for` (scales with the
+// reservation; 32 MiB cap). `options.eden_kb` (`MACVM_EDEN` env override,
+// S7-10) still overrides it — the S7 GC-stress test's actual consumer: a
+// small eden makes a scavenge reachable without first allocating megabytes
+// of filler.
 /// Initial symbol table capacity *(tunable)* — SPEC §3.1.
 const SYMBOL_TABLE_CAPACITY: usize = 1024;
 
@@ -219,7 +219,10 @@ impl Universe {
     pub fn genesis(options: &VmOptions) -> Universe {
         // --- step 1: heap up (sprint_s07_detail.md A1) -----------------------
         let heap_bytes = options.heap_mib << 20;
-        let eden_size = options.eden_kb.map(|kb| kb << 10).unwrap_or(EDEN_SIZE);
+        let eden_size = options
+            .eden_kb
+            .map(|kb| kb << 10)
+            .unwrap_or_else(|| super::layout::default_eden_for(heap_bytes));
         let reservation = Reservation::reserve(heap_bytes);
         let layout = HeapLayout::new(reservation.base(), heap_bytes, eden_size);
         reservation.commit(layout.eden.start - reservation.base(), layout.eden.len());
@@ -1384,7 +1387,12 @@ mod tests {
         assert_eq!(u.eden.start % 8, 0);
         assert!(u.eden.top > u.eden.start);
         assert!(u.eden.top - u.eden.start < 256 * 1024);
-        assert_eq!(u.eden.end - u.eden.start, EDEN_SIZE);
+        // `boot()` reserves 64 MiB, so `default_eden_for` sizes eden at a
+        // quarter of that (the 32 MiB cap doesn't bind).
+        assert_eq!(
+            u.eden.end - u.eden.start,
+            super::super::layout::default_eden_for(64 << 20)
+        );
     }
 
     #[test]
