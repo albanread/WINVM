@@ -673,3 +673,36 @@ Callee-shaped microbench (`^Association basicNew` called 2M times):
 (gc_alloc_gap.md cost 2, upstream's item): the 4MB eden forces ~122
 scavenges/run; 32MB makes WINVM FASTER than Cog on its own alloc bench.
 richards is unchanged (~90 warm) — its loss is not allocation.
+
+## 2026-07-22 (later) — nursery default, special selectors, and the honest scoreboard
+
+Three more changes toward "at least as fast as Cog everywhere":
+
+1. **Default nursery 4 -> 32 MiB** (`layout::default_eden_for`, capped at a
+   quarter of the reservation). alloc warm 53 -> 13 at defaults.
+2. **Identity `==`/`~~` lowers to a raw pointer compare** (`Ir::RefCmpVal`,
+   no guard — the frontend pins identity non-redefinable) and **boolean
+   `not` lowers to a guarded flip** (`Ir::BoolNot`, reexecute-trap fail
+   edge, canonical-body-verified, inline-dep-pinned). The richards send
+   census showed ~130k `==` sends + ~90k `not` activations per run —
+   selectors Cog never sends at all. richards warm 85 -> 41-44.
+3. **F7**: entry-defined slots skip the prologue nil-fill (non-OSR).
+
+Same-session head-to-head (machine drifts — Cog's own arith read 48, 116,
+and 50 across three sessions today; only same-session pairs mean anything):
+
+| bench | WINVM | Cog | |
+|---|---|---|---|
+| arith | 36 | 50 | WIN |
+| dict | 22 | 15-33 | flapping both sides; quiet-state pair was 13 vs 16 (WIN) |
+| alloc | 16 | 22 | WIN |
+| fib | 204 | 167 | ~1.2x behind (noisy) |
+| richards | 44 | 33 | ~1.3x behind (was 2.6x) |
+| sieve | 3 | <1 | behind |
+| deltablue | 5 | <1 | behind |
+
+Remaining gap analysis: richards' residual is per-activation spill-all
+(F3c — register-resident oops across safepoints with oop maps covering
+registers — the one structural project left). sieve/deltablue absolute
+numbers are near timer granularity; their residual is the same loop code
+quality story. Everything cheaper than F3c is now implemented.
