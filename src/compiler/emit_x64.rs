@@ -1206,6 +1206,28 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             if dst == src {
                 return;
             }
+            // A `Move` can carry an unboxed float: a loop-carried `zr`/`zi`
+            // phi copy in the float fast path lowers to a `Move` between two
+            // fp vregs, and an fp vreg's `Assignment::Reg(n)` names XMMn, NOT
+            // the GPR numbered n. Routing it through the integer path would
+            // `mov` whatever GPR shares that number — silently corrupting the
+            // value. Dispatch on the vreg's class, exactly as the AArch64
+            // emitter does. (This is why the Mandelbrot demo rendered
+            // all-black on x64: every `escapeAtRe:im:` iteration copied its
+            // doubles through the wrong registers, so the escape test — a
+            // compare of those corrupted values — never fired.)
+            if e.method.vregs[dst.0 as usize].is_fp {
+                let s = e.read_fp(*src, FP_SCRATCH0);
+                match e.assignment[dst.0 as usize] {
+                    Some(Assignment::Reg(d)) => {
+                        if d != s {
+                            e.asm.emit("movsd", &[xmm(d), xmm(s)]);
+                        }
+                    }
+                    _ => e.store_def_fp(*dst, s),
+                }
+                return;
+            }
             let s = e.read_into(*src, SCRATCH0);
             // F4: a spilled dst takes its store STRAIGHT from the source
             // register — routing through def_reg's second scratch added a
