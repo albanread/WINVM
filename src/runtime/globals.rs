@@ -99,6 +99,27 @@ pub(crate) fn bootstrap_well_known(vm: &mut VmState) {
     MemOop::try_from(assoc)
         .expect("global association is a mem oop")
         .set_body_oop(1, smalltalk_obj);
+
+    // WINVM port: `Platform` — a Symbol naming the host OS, bound by the
+    // VM binary itself so shared world source can select a platform FFI
+    // surface at load time (world/30_date_time.mst's clock bindings are
+    // the first user: clock_gettime does not exist on Windows, and an FFI
+    // resolve miss is guest-FATAL, so the choice cannot be probed at
+    // runtime). Symbols are interned, so `Platform == #windows` is a
+    // plain identity test guest-side.
+    let plat_sym = vm.universe.intern(b"Platform");
+    let plat_assoc = global_declare(vm, plat_sym);
+    let plat_assoc_h = scope.handle(vm, plat_assoc);
+    let value = vm.universe.intern(if cfg!(target_os = "windows") {
+        &b"windows"[..]
+    } else if cfg!(target_os = "macos") {
+        &b"macos"[..]
+    } else {
+        &b"unix"[..]
+    });
+    MemOop::try_from(plat_assoc_h.get(vm))
+        .expect("global association is a mem oop")
+        .set_body_oop(1, value.oop());
 }
 
 /// The bound `Association` for `name`, if declared.

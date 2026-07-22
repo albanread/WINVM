@@ -175,21 +175,47 @@ Object subclass: Time [
     Time class >> ffiClockGettime: clockId timespec: addr [
         <primitive: FFI function: #clock_gettime ret: #g args: #(g g)>
     ]
+    "Windows bindings (WINVM port). The FFI mechanism is identical — only
+     the kernel surface differs: VirtualAlloc stands in for mmap (same
+     property that matters here: memory outside the GC heap that can never
+     move mid-call), and GetSystemTimePreciseAsFileTime for clock_gettime.
+     Selected via the VM-bound `Platform` symbol; a resolve miss is
+     guest-FATAL, so the wrong platform's symbol must never be touched."
+    Time class >> ffiVirtualAllocAddr: a1 size: a2 type: a3 protect: a4 [
+        <primitive: FFI function: #VirtualAlloc ret: #g args: #(g g g g)>
+    ]
+    Time class >> ffiGetSystemTimePreciseAsFileTime: addr [
+        <primitive: FFI function: #GetSystemTimePreciseAsFileTime ret: #v args: #(g)>
+    ]
     Time class >> clockBufferAddress [
         ClockBuffer isNil ifTrue: [
-            "PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=4098 (0x1002) —
-             real macOS/arm64 flag values, same as world/tests/
-             30_ffi_alien_tests.mst's own proven mmap capstone call."
-            ClockBuffer := self ffiMmapAddr: 0 length: 16 prot: 3 flags: 4098 fd: -1 offset: 0.
+            ClockBuffer := Platform == #windows
+                ifTrue: [
+                    "MEM_COMMIT|MEM_RESERVE = 12288 (0x3000), PAGE_READWRITE = 4."
+                    self ffiVirtualAllocAddr: 0 size: 16 type: 12288 protect: 4 ]
+                ifFalse: [
+                    "PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=4098 (0x1002) —
+                     real macOS/arm64 flag values, same as world/tests/
+                     30_ffi_alien_tests.mst's own proven mmap capstone call."
+                    self ffiMmapAddr: 0 length: 16 prot: 3 flags: 4098 fd: -1 offset: 0 ].
         ].
         ^ClockBuffer
     ]
-    "Milliseconds since the Unix epoch (CLOCK_REALTIME=0) — real wall-clock
-     time, not elapsed-since-VM-start. Verified live: two calls a few
-     milliseconds apart return distinct, correctly-ordered values."
+    "Milliseconds since the Unix epoch — real wall-clock time, not
+     elapsed-since-VM-start. macOS: clock_gettime(CLOCK_REALTIME=0) into a
+     struct timespec. Windows: GetSystemTimePreciseAsFileTime into a
+     FILETIME (one little-endian 64-bit count of 100 ns ticks since
+     1601-01-01; 116444736000000000 ticks separate that epoch from Unix's,
+     10000 ticks make a millisecond). Verified live on both: two calls a
+     few milliseconds apart return distinct, correctly-ordered values."
     Time class >> millisecondClockValue [
         | addr ts sec nsec |
         addr := self clockBufferAddress.
+        Platform == #windows ifTrue: [
+            self ffiGetSystemTimePreciseAsFileTime: addr.
+            ts := Alien forAddress: addr size: 16.
+            ^((ts signedLongAt: 1) - 116444736000000000) // 10000
+        ].
         self ffiClockGettime: 0 timespec: addr.
         ts := Alien forAddress: addr size: 16.
         sec := ts signedLongAt: 1.
