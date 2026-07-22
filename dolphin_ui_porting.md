@@ -10,6 +10,11 @@ This document is grounded in a file-level review of both trees (seven parallel r
 passes over `e:\dsfork` and `E:\WINVM`). Every class/method/mechanism named below was
 read in the fork's sources, not recalled from general knowledge.
 
+**Companion:** [dolphin_ui_sprints.md](dolphin_ui_sprints.md) — VM-change
+specifications (re-entrant callbacks, W5 exceptions, win_gui host, UTF-16, …), the
+gap-review register, and the Phase-G sprint plan. §5.8/§5.9 below are the
+MULTIVM / no-green-threads / no-`become:` adaptation amendments from that pass.
+
 ---
 
 ## 0. Executive summary
@@ -604,6 +609,92 @@ image save of live windows.
 | STL resources + `become:` restore | Offline-transpiled builder methods | Kills the only `become:`, `instVarAt:` writes, and the filer dependency |
 | Overlapped calls for MessageBox/sockets | Blocking calls v1; worker VMs for background work | Matches Dolphin's own common-dialog behavior; S11 later |
 
+### 5.8 MULTIVM adaptation (amendment, 2026-07-22)
+
+This section reconciles the port with the house multi-VM architecture
+([docs/multi-smalltalk-worker.md](docs/multi-smalltalk-worker.md): share-nothing
+primary/worker VMs, deep-copy messages, `send:…onReply:` continuations, star
+topology) and with the Cocoa GUI's three-tier doctrine
+([docs/cocoa_gui_design.md](docs/cocoa_gui_design.md)).
+
+**Tier assignment.** The MVP GUI VM is a *fourth tier variant* — deliberately **not**
+the Cocoa design's "dumb terminal" UI worker:
+
+| Tier | Thread | State | Crash profile |
+|---|---|---|---|
+| **MVP UI VM** (this port) | its own pump thread, owns all HWNDs | **authoritative**: the triads (models/presenters/views) live here | per-message recovery for guest errors; supervisor respawn for hard fatals |
+| Compute workers | background | none (share-nothing) | die + respawn (MULTIVM as designed) |
+| Web-GUI primary | its existing worker thread | the dev environment | unchanged, coexists |
+
+Why the MVP UI VM must be authoritative where the Cocoa UI worker is a snapshot
+terminal: (a) **Win32 is synchronous** — `WM_NCCALCSIZE`, `WM_CTLCOLOR`, `WM_NOTIFY`
+demand answers *now*, computed from real view/model state; a cross-thread snapshot
+protocol cannot answer them and MVP's whole design (views observing live models) is
+that state. (b) The Cocoa doctrine's two objections are both answered differently on
+Windows: *crash safety* — guest errors (DNU/`error:`) no longer kill anything (the
+per-entry recovery slot returns `Err`, the pump answers `DefWindowProc` and continues
+— proven by the web GUI's DNU recovery); *hard* fatals (heap exhaustion, stack
+overflow) tear down the GUI VM, and rebuild-from-source makes respawn legitimate: the
+supervisor destroys surviving HWNDs (generation-checked, cf. `UI_VM_GENERATION` in
+`src/embed.rs`), reboots the VM, and re-runs `UiSession startUp` — windows are
+reconstructed the same way the world is. *Responsiveness* — a long doit freezes the
+GUI exactly as it does in real Dolphin; the fix is the next paragraph, not a snapshot
+protocol.
+
+**Long work ships to workers, replies land as posted actions.** The MULTIVM
+continuation model maps 1:1 onto the pump: the GUI VM's `inbox_wake` hook is
+`PostMessageW` to the host's message-only window; a drain runs between messages as a
+top-level entry and fires the `onReply:` continuation. So the MVP doctrine is:
+command handlers that may exceed ~50 ms send `{selector. args-copy}` to a worker and
+update the model in the continuation — Dolphin's `forkAt: userBackgroundPriority`
+idiom, re-expressed as share-nothing RPC. `ProgressDialog` becomes: worker +
+progress envelopes → posted actions updating a `ValueModel` (its Dolphin
+implementation forks; it is rewritten, not translated).
+
+**Nested VM entries are a designed requirement, not an accident.** The Cocoa design
+proudly avoided nested-recovery machinery because AppKit lets the run loop own every
+callback with the VM quiescent. **Win32 does not offer that option**: `CreateWindowExW`
+delivers `WM_NCCREATE`/`WM_CREATE` synchronously *during* the FFI call;
+`SetWindowText`, `DestroyWindow`, `SendMessage` all re-enter before returning. So the
+callback path here is: `dispatch_callback` (message N) → Smalltalk handler → FFI call
+→ wndproc → **nested** `dispatch_callback` — to arbitrary depth. S1 therefore
+upgrades the embed layer from "fail closed on re-entry" (`callback_active`,
+`src/embed.rs:780`) to a **per-entry recovery-slot stack** — detailed as sprint G0 in
+[dolphin_ui_sprints.md](dolphin_ui_sprints.md). A guest fault at depth N unwinds to
+entry N's slot only (LIFO — the same discipline Dolphin's callback cookies enforce),
+answers that message's default, and the outer FFI call continues.
+
+**No-green-threads site map (exhaustive).** Every `Process`/`Semaphore`/`Delay`/
+`Mutex` dependency in the port scope and its replacement:
+
+| Dolphin site | Mechanism there | Replacement here |
+|---|---|---|
+| `InputState` Main/Idler processes, `inputSemaphore`, `WakeupEvent`, prim 94 sampling | green scheduler + VM | **gone** — native pump (S2); no background green work to preempt |
+| `DialogView>>runModalLoop` (`forkMainIfMain` + `endModal` Semaphore) | replacement main pump | host `RunModalLoop` nested native pump (LIFO modality — see divergence note in §7) |
+| `CapturingInteractor>>captureMouse` (`loopWhile:` nested loop) | nested Smalltalk pump | same host `RunModalLoop` primitive with a capture predicate; tracking state machine unchanged |
+| `postToInputQueue` / `postToMessageQueue` | SharedQueue + posted WM_USER | `PostMessageW` to host message-only window → `UiSession evaluateDeferredAction` |
+| Splash timeout, tooltip dwell, validation debounce, MessageBubble | `Delay`/forked waiters | `SetTimer` + `#timerTick:` (already the Dolphin idiom for UI timers) |
+| Drag-drop autoscroll `forkAt:` | background process | `SetTimer` tick |
+| `ProgressDialog` forked computation | green process | worker VM + progress envelopes → posted actions (rewritten) |
+| Idle-time `invalidateUserInterface` revalidation | queue-empty detection in Smalltalk pump | pump-empty hook: `PeekMessage` miss → `UiSession onIdle` (S2) |
+| `Processor enableAsyncEvents:` critical sections | interrupt masking | no-op shim (single-threaded VM, no async preemption) |
+| `SharedIdentityDictionary` / `Mutex` (RichText converter) | thread safety | plain dictionary / no-op (RichText out of scope v1) |
+| `Cursor wait showWhile:` | dynamic scope | `ensure:` |
+| Overlapped `<overlap stdcall:>` calls | per-process OS worker threads | none v1 (blocking, as Dolphin's own common dialogs); S11 later |
+
+### 5.9 `become:`-free audit (amendment)
+
+The no-`become:` philosophy holds with **zero** runtime `become:` in the ported
+system:
+
+| Dolphin `become:` exposure | Status in the port |
+|---|---|
+| `STBViewProxy>>restoreView` (`self become: newView`) — the only functional site in MVP | **eliminated** — STL resources transpiled offline to builder methods (§3.7/§5.4.6) |
+| `STxProxy>>stbFixup:` (`become: self value`) in the filer | filer **not ported** |
+| Dev-time class reshaping (Dolphin mutates live instances on redefinition) | n/a — translation is offline; at runtime WINVM's existing rule applies (method/classVar changes live, ivar-shape changes need restart — same as the web GUI today) |
+| `View>>recreate` (style changes) | no `become:` involved — Dolphin destroys and recreates the HWND on the *same* view object; ports as-is |
+| Identity across VM boundaries (workers) | never arises — MULTIVM copies by design |
+
 ---
 
 ## 6. Phases
@@ -611,6 +702,12 @@ image save of live windows.
 Each milestone ends with a runnable demo on this machine. Sizing is relative to
 completed WINVM phases (calendar time in this project has compressed absurdly; the
 honest unit is "comparable effort to phase X").
+
+> **Execution plan:** the milestones below are decomposed into concrete sprints
+> (Phase **G**, house SPRINTS.md format, with the VM-change specs S1/W5/etc. written
+> against the real code) in **[dolphin_ui_sprints.md](dolphin_ui_sprints.md)**.
+> Milestone↔sprint mapping: UI-0 ≈ G0–G1, UI-1 ≈ G2–G3, UI-2 ≈ G4, UI-3 ≈ G5 (+W5),
+> UI-4 ≈ G6, UI-5 ≈ G7.
 
 - **UI-0 — Substrate spike** *(comparable to Phase 2/M2)*. S1 (re-entrant
   dispatch_callback) + S2 skeleton + S3 minimal (asUtf16Alien). No Dolphin code. Demo:
@@ -666,23 +763,32 @@ UI-5 ≈ +30 — total in the 150–200 class band predicted in §0.
 | **winkb DB absent on a target machine** | Low | S4c widened probe list for the core three DLLs; clear startup diagnostic |
 | **Scope creep toward the IDE** | Medium | §1 non-goals; the web environment remains the dev UI |
 | **TextEdit/ListView complexity underestimated** (1.7k/2.8k lines each) | Medium | They are UI-3/UI-4 tail items with static modes first; virtual/custom-draw explicitly deferred |
+| **WM_PAINT error storm pre-W5**: a failing paint handler unwinds past `EndPaint`, the update region never validates, Windows re-sends WM_PAINT forever | High until W5 | Rust wndproc backstop: if the image entry for WM_PAINT returns via the recovery path, host calls `ValidateRect` before answering (G1); post-W5 the ported `basicPaint:` `on: Error` dance restores fidelity |
+| **UTF-16 code-unit index math**: `EM_GETSEL`/selection ranges/`BCM_GETNOTE` count UTF-16 units; world strings are UTF-8 byte-indexed | Medium, subtle | `Utf16String` compat class carries code-unit length; conversions only at control boundaries; translator flags String index arithmetic for review (the WORLD.md §6 rule, reused) |
+| **Modality divergence**: Dolphin's forked-main pumps allow dismissing stacked dialogs in any order; nested native pumps are LIFO-only | Low (UX nuance) | Accepted divergence — LIFO modality is standard Win32 behavior; documented in §5.8 |
+| **CBT hook sees every window on the thread** (incl. internals of native dialogs/menus) | Low | Hook associates only when `UiSession` has a pending view-under-construction; all other creations pass through untouched (Dolphin's hook behaves the same) |
+| **GUI-VM respawn vs. live HWNDs** after a hard fatal | Medium | Generation-stamped dispatch: wndproc checks the VM generation, answers `DefWindowProc` for stale windows; supervisor destroys survivors then re-runs `UiSession startUp` (§5.8) |
 
 ---
 
-## 8. Open questions (decisions wanted before UI-1)
+## 8. Open questions (updated after the MULTIVM/sprint pass)
 
+Decided in [dolphin_ui_sprints.md](dolphin_ui_sprints.md):
+- ~~W5 exceptions timing~~ → **decided**: W5 runs as its own sprint, parallel after
+  G1, gating G5 (UI-3). Pre-W5 milestones use no exception-dependent paths.
+- ~~Launcher shape~~ → **decided**: a dedicated bin (working name `winvm-mvp`),
+  following the `macvm-cocoa` precedent — one crate arm, shared world/bridge code.
+
+Still wanted before G2 (first translation sprint):
 1. **Naming/collision policy sign-off** (§5.4.5): merge `Point`/`Rectangle` into world
    classes vs. keep a parallel geometry; `GdiCanvas` rename OK?
-2. **W5 exceptions timing**: build S7 before UI-3 (recommended), or shim
-   `InvalidFormat`-style flows with nil-protocols and retrofit?
-3. **TextEdit tail**: accept the ~33-class dialogs tail in UI-3, or split a
+2. **TextEdit tail**: accept the ~33-class dialogs tail in UI-3/G5, or split a
    "TextEdit-lite" (no find/replace, no document presenter) via the patch overlay?
-4. **Where the code lives**: translated output committed under `world/mvp/` in this
+3. **Where the code lives**: translated output committed under `world/mvp/` in this
    repo (recommended — versioned like the rest of the world), or a sibling repo?
-5. **Launcher shape**: new `winvm-mvp` binary vs. `--native-gui` mode in `winvm-gui`?
-6. **DPI ambition**: is 96-DPI v1 acceptable on this machine's monitors, or is
+4. **DPI ambition**: is 96-DPI v1 acceptable on this machine's monitors, or is
    system-DPI scaling (one global factor, still not per-monitor) worth pulling into
-   UI-2?
+   UI-2/G4?
 
 ---
 
