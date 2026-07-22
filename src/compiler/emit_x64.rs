@@ -251,6 +251,12 @@ pub struct RuntimeAddrs {
     /// float lowering landed, not before: a field no emitted
     /// instruction reads is dead weight that looks like wiring.
     pub box_double: u64,
+    /// The young/old boundary (`reg_block.old_start`), fixed for the VM's
+    /// lifetime. Not a call target: F6 (x64_codegen_perf.md) uses it at
+    /// COMPILE time to prove a constant oop is already old — old objects
+    /// never return to young space, so the store barrier for such a value
+    /// can be elided for the nmethod's whole lifetime.
+    pub old_start: u64,
 }
 
 /// Byte offset of spill slot `i` from the frame pointer: `[rbp − 8·(i+1)]`,
@@ -284,6 +290,14 @@ struct Emitter<'a> {
     /// (A resident interval never spans a `CallSend` — regalloc's
     /// `!crosses_call` gate — so compiled callees can't clobber it.)
     resident_reloads: Vec<(u32, u32, u8, SpillSlot, bool)>,
+    /// F6: vregs whose every def is a smi or an old-space constant — a
+    /// store of such a value can never create an old→young edge, so
+    /// `StoreField`/`ArrayAtPut` skip the 11-instruction barrier entirely.
+    no_barrier: Vec<bool>,
+    /// F2-lite: single-def `ConstSmi` vregs and their tagged word — a
+    /// spilled read rematerializes the immediate instead of reloading the
+    /// slot (the slot still holds the value for deopt/OSR metadata).
+    const_smi_remat: Vec<Option<i64>>,
     /// One label per basic block.
     labels: Vec<Label>,
     /// `PoolLit` index → the interned literal-pool entry.
@@ -319,6 +333,12 @@ impl<'a> Emitter<'a> {
         match self.assignment[v.0 as usize] {
             Some(Assignment::Reg(r)) => r,
             Some(Assignment::Spill(slot)) => {
+                // F2-lite: a single-def constant re-creates itself in one
+                // immediate move — no memory touch.
+                if let Some(tagged) = self.const_smi_remat[v.0 as usize] {
+                    self.asm.emit("mov", &[r64(scratch), imm(tagged)]);
+                    return scratch;
+                }
                 self.asm
                     .emit("mov", &[r64(scratch), mem(RBP, spill_offset(slot))]);
                 scratch
@@ -821,6 +841,67 @@ pub fn emit_x64(
     for iv in &regalloc.intervals {
         assignment[iv.vreg.0 as usize] = iv.assignment;
     }
+    // F6 (x64_codegen_perf.md): per-vreg "this value can never need a write
+    // barrier" — true when EVERY def produces either a smi (`ConstSmi`,
+    // `SmiArith`) or an oop already in OLD space at compile time (the
+    // booleans the compare ops load, an old `ConstPool` constant). Old
+    // objects never return to young space, so the compile-time address
+    // check holds for the nmethod's lifetime; a still-young constant just
+    // keeps its barrier (conservative). Any other def — `Move`, `Param`,
+    // call results, a fresh `Alloc` (young by construction) — disqualifies
+    // the vreg. OSR slot seeding is covered: an OSR entry writes a vreg's
+    // slot with the interpreter's value for the SAME program point, which
+    // for these def shapes is the same smi/boolean/constant.
+    let pool_free = |lit_ix: usize| -> bool {
+        use crate::oops::layout::MEM_TAG;
+        // `.get`, not indexing: fixture methods may carry an empty pool with
+        // default true/false lit ids.
+        let Some(entry) = method.pool.get(lit_ix) else {
+            return false;
+        };
+        let v = entry.value;
+        (v & 3) == 0 || ((v & 3) == MEM_TAG as u64 && v >= rt.old_start && rt.old_start != 0)
+    };
+    let bools_free =
+        pool_free(method.true_lit.0 as usize) && pool_free(method.false_lit.0 as usize);
+    let mut nb: Vec<Option<bool>> = vec![None; method.vregs.len()];
+    for blk in &method.blocks {
+        for op in &blk.code {
+            let free = match op {
+                Ir::ConstSmi { .. } | Ir::SmiArith { .. } => true,
+                Ir::SmiCmpVal { .. } | Ir::FCmpVal { .. } => bools_free,
+                Ir::ConstPool { lit, .. } => pool_free(lit.0 as usize),
+                _ => false,
+            };
+            op.defs(|v| {
+                let e = &mut nb[v.0 as usize];
+                *e = Some(e.unwrap_or(true) && free);
+            });
+        }
+    }
+    let no_barrier: Vec<bool> = nb.iter().map(|o| o.unwrap_or(false)).collect();
+
+    // F2-lite: single-def `ConstSmi` vregs rematerialize at reads. Multi-def
+    // vregs (loop-carried temps) are excluded — their slot is the truth.
+    let mut def_count: Vec<u8> = vec![0; method.vregs.len()];
+    let mut const_smi_remat: Vec<Option<i64>> = vec![None; method.vregs.len()];
+    for blk in &method.blocks {
+        for op in &blk.code {
+            op.defs(|v| def_count[v.0 as usize] = def_count[v.0 as usize].saturating_add(1));
+            if let Ir::ConstSmi { dst, value } = op {
+                let tagged = ((*value as u64) << 2) as i64;
+                if i32::try_from(tagged).is_ok() {
+                    const_smi_remat[dst.0 as usize] = Some(tagged);
+                }
+            }
+        }
+    }
+    for (v, n) in def_count.iter().enumerate() {
+        if *n != 1 {
+            const_smi_remat[v] = None;
+        }
+    }
+
     let mut resident: Vec<Option<u8>> = vec![None; method.vregs.len()];
     let mut resident_reloads: Vec<(u32, u32, u8, SpillSlot, bool)> = Vec::new();
     for iv in &regalloc.intervals {
@@ -849,6 +930,8 @@ pub fn emit_x64(
         assignment,
         resident,
         resident_reloads,
+        no_barrier,
+        const_smi_remat,
         labels,
         literal_ids,
         epilogue,
@@ -1090,20 +1173,49 @@ pub fn emit_x64(
 fn emit_op(e: &mut Emitter, op: &Ir) {
     match op {
         Ir::ConstSmi { dst, value } => {
-            let d = e.def_reg(*dst, SCRATCH0);
             // Tagged form: INT_TAG == 0, so the tagged word is v * 4.
-            let tagged = (*value as u64) << 2;
-            e.asm.emit("mov", &[r64(d), imm(tagged as i64)]);
+            let tagged = ((*value as u64) << 2) as i64;
+            // F2-lite (x64_codegen_perf.md): a spilled constant stores as ONE
+            // immediate — the old shape materialized it into a scratch and
+            // then stored, two instructions per loop iteration for a value
+            // that never changes. (The slot must still be written: deopt
+            // reexecution and OSR metadata read these slots.)
+            if let Some(Assignment::Spill(slot)) = e.assignment[dst.0 as usize] {
+                if i32::try_from(tagged).is_ok() {
+                    e.asm
+                        .emit("mov", &[mem(RBP, spill_offset(slot)), imm(tagged)]);
+                    if let Some(rr) = e.resident[dst.0 as usize] {
+                        e.asm.emit("mov", &[r64(rr), imm(tagged)]);
+                    }
+                    return;
+                }
+            }
+            let d = e.def_reg(*dst, SCRATCH0);
+            e.asm.emit("mov", &[r64(d), imm(tagged)]);
             e.store_def(*dst, d);
         }
 
         Ir::Move { dst, src } => {
-            let s = e.read_into(*src, SCRATCH0);
-            let d = e.def_reg(*dst, SCRATCH1);
-            if d != s {
-                e.asm.emit("mov", &[r64(d), r64(s)]);
+            // F1 (x64_codegen_perf.md): a self-move is a no-op wherever the
+            // value lives. Unguarded, the spilled form cost a 3-instruction
+            // slot round trip — and the back-edge phi copies for unchanged
+            // loop-carried values are exactly this shape, so it fired every
+            // iteration of every hot loop.
+            if dst == src {
+                return;
             }
-            e.store_def(*dst, d);
+            let s = e.read_into(*src, SCRATCH0);
+            // F4: a spilled dst takes its store STRAIGHT from the source
+            // register — routing through def_reg's second scratch added a
+            // dead middle `mov` to every spill→spill copy.
+            match e.assignment[dst.0 as usize] {
+                Some(Assignment::Reg(d)) => {
+                    if d != s {
+                        e.asm.emit("mov", &[r64(d), r64(s)]);
+                    }
+                }
+                _ => e.store_def(*dst, s),
+            }
         }
 
         Ir::Param { dst, index } => {
@@ -1263,7 +1375,10 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             // folds into its `stur` displacement.
             let biased = *byte_off as i64 - crate::oops::layout::MEM_TAG as i64;
             e.asm.emit("mov", &[mem(o, biased), r64(v)]);
-            if *barrier {
+            // F6: a provably-smi/old constant can't create an old→young
+            // edge — the barrier's early-outs would always skip, so the
+            // whole sequence is dead. Elide it at compile time.
+            if *barrier && !e.no_barrier[val.0 as usize] {
                 e.emit_write_barrier(o, v, mem(o, biased));
             }
         }
@@ -1549,8 +1664,12 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             e.asm
                 .emit("mov", &[mem_index(a, i, 2, ARRAY_ELEM_BASE), r64(v)]);
             // Storing an oop into a possibly-old array needs the same
-            // card marking a StoreField does.
-            e.emit_write_barrier(a, v, mem_index(a, i, 2, ARRAY_ELEM_BASE));
+            // card marking a StoreField does — unless the value provably
+            // can't need one (F6; `at:put:` with a literal/boolean/smi is
+            // the sieve fill loop's exact shape).
+            if !e.no_barrier[val.0 as usize] {
+                e.emit_write_barrier(a, v, mem_index(a, i, 2, ARRAY_ELEM_BASE));
+            }
             // `at:put:` answers the stored value.
             let d = e.def_reg(*dst, RAX);
             if d != v {
@@ -1582,6 +1701,11 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             // A callee unwound by a non-local return hands back the
             // sentinel rather than a value; propagate before using it.
             e.emit_nlr_check();
+            // F3b: residents may span this call now — the callee is free
+            // to clobber their registers and the send may have GC'd, so
+            // re-establish every live resident from its canonical slot
+            // BEFORE the result def (whose own write-through must win).
+            e.emit_resident_reloads();
             let d = e.def_reg(*dst, RAX);
             if d != RAX {
                 e.asm.emit("mov", &[r64(d), r64(RAX)]);
@@ -1722,6 +1846,10 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             let lit = e.must_be_boolean_lit;
             let ret_pc = e.emit_runtime_call(lit);
             e.record_safepoint_at(ret_pc);
+            // F3b: residents may span this runtime call — re-sync (the
+            // Rust side preserves the registers per the ABI, but the call
+            // may have GC'd and moved the oops they hold).
+            e.emit_resident_reloads();
             let dst = dst.expect("MUST_BE_BOOLEAN always produces a coerced boolean");
             let d = e.def_reg(dst, RAX);
             if d != RAX {
@@ -2226,6 +2354,8 @@ mod tests {
                 assignment: Vec::new(),
                 resident: Vec::new(),
                 resident_reloads: Vec::new(),
+                no_barrier: Vec::new(),
+                const_smi_remat: Vec::new(),
                 labels: Vec::new(),
                 literal_ids: Vec::new(),
                 epilogue: Label(0),
@@ -3732,6 +3862,8 @@ mod tests {
             assignment: vec![Some(Assignment::Reg(1)); 1],
             resident: vec![None; 1],
             resident_reloads: Vec::new(),
+            no_barrier: vec![false; 1],
+            const_smi_remat: vec![None; 1],
             labels: vec![Label(0)],
             literal_ids: Vec::new(),
             epilogue: Label(0),

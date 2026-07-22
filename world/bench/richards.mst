@@ -1,17 +1,17 @@
 "richards.mst — Martin Richards' OS-scheduler simulation (S15 A6), ported
- from the canonical Smalltalk version (Strongtalk/Squeak RichardsBenchmark;
+ from the canonical Smalltalk version (Strongtalk/Squeak BmRichardsBenchmark;
  the same structure the are-we-fast-yet suite mirrors). Boolean-triple
- TaskState variant, 1-based packet data (Packet init datum := 1, handler
+ BmTaskState variant, 1-based packet data (BmPacket init datum := 1, handler
  compares count > 4, worker writes datum: 1) — the Smalltalk lineage's own
  convention, kept consistent throughout because the canonical check values
  depend on it. The canonical per-task function CLOSURES are ported as
- TaskControlBlock SUBCLASSES (IdleTask/WorkerTask/HandlerTask/DeviceTask)
+ BmTaskControlBlock SUBCLASSES (BmIdleTask/BmWorkerTask/BmHandlerTask/BmDeviceTask)
  overriding processWork:, each holding the scheduler in an ivar — this
  dialect's `self new = basicNew, no auto-initialize` world has no per-task
  environment worth capturing, and the subclass form is the standard
  closure-free rendering (the V8/Java ports do the same).
  Identity comparisons (==) walk all task/packet links; nil is NoWork/NoTask.
- Constants (Idler=1 … DeviceB=6, kinds 1/2) are RBObject instance methods so
+ Constants (Idler=1 … DeviceB=6, kinds 1/2) are BmRBObject instance methods so
  every participant reads them the same way.
  CANONICAL CHECK, single run of the standard workload (idler count 10000):
  queuePacketCount = 23246 and holdCount = 9297, encoded by runOne as
@@ -85,7 +85,7 @@ Object subclass: Bench [
 
 "--- Richards proper ------------------------------------------------------"
 
-Object subclass: RBObject [
+Object subclass: BmRBObject [
     "Task identities double as taskTable indices (1-based, canonical
      Smalltalk numbering). NoWork/NoTask are plain nil."
     idlerId [ ^1 ]
@@ -109,10 +109,10 @@ Object subclass: RBObject [
     ]
 ]
 
-RBObject subclass: Packet [
+BmRBObject subclass: BmPacket [
     | link identity kind datum data |
 
-    Packet class >> link: aLink identity: anIdentity kind: aKind [
+    BmPacket class >> link: aLink identity: anIdentity kind: aKind [
         ^self new initLink: aLink identity: anIdentity kind: aKind
     ]
     initLink: aLink identity: anIdentity kind: aKind [
@@ -134,7 +134,7 @@ RBObject subclass: Packet [
     data [ ^data ]
 ]
 
-RBObject subclass: TaskState [
+BmRBObject subclass: BmTaskState [
     | packetPendingIV taskWaiting taskHolding |
 
     "boolean accessors"
@@ -185,24 +185,24 @@ RBObject subclass: TaskState [
         ^packetPendingIV and: [ taskWaiting and: [ taskHolding not ] ]
     ]
 
-    TaskState class >> running [ ^self new running ]
-    TaskState class >> waiting [ ^self new waiting ]
-    TaskState class >> waitingWithPacket [ ^self new waitingWithPacket ]
+    BmTaskState class >> running [ ^self new running ]
+    BmTaskState class >> waiting [ ^self new waiting ]
+    BmTaskState class >> waitingWithPacket [ ^self new waitingWithPacket ]
 ]
 
 "--- per-task private data records (the canonical *TaskDataRecord classes) -"
 
-RBObject subclass: DeviceTaskDataRecord [
+BmRBObject subclass: BmDeviceTaskDataRecord [
     | pending |
-    DeviceTaskDataRecord class >> create [ ^self new init ]
+    BmDeviceTaskDataRecord class >> create [ ^self new init ]
     init [ pending := nil. ^self ]
     pending [ ^pending ]
     pending: aPacket [ pending := aPacket ]
 ]
 
-RBObject subclass: HandlerTaskDataRecord [
+BmRBObject subclass: BmHandlerTaskDataRecord [
     | workIn deviceIn |
-    HandlerTaskDataRecord class >> create [ ^self new init ]
+    BmHandlerTaskDataRecord class >> create [ ^self new init ]
     init [ workIn := nil. deviceIn := nil. ^self ]
     workIn [ ^workIn ]
     workIn: aPacket [ workIn := aPacket ]
@@ -212,9 +212,9 @@ RBObject subclass: HandlerTaskDataRecord [
     deviceInAdd: aPacket [ deviceIn := self append: aPacket head: deviceIn ]
 ]
 
-RBObject subclass: IdleTaskDataRecord [
+BmRBObject subclass: BmIdleTaskDataRecord [
     | control count |
-    IdleTaskDataRecord class >> create [ ^self new init ]
+    BmIdleTaskDataRecord class >> create [ ^self new init ]
     init [ control := 1. count := 10000. ^self ]
     control [ ^control ]
     control: v [ control := v ]
@@ -222,9 +222,9 @@ RBObject subclass: IdleTaskDataRecord [
     count: v [ count := v ]
 ]
 
-RBObject subclass: WorkerTaskDataRecord [
+BmRBObject subclass: BmWorkerTaskDataRecord [
     | destination count |
-    WorkerTaskDataRecord class >> create [ ^self new init ]
+    BmWorkerTaskDataRecord class >> create [ ^self new init ]
     init [ destination := self handlerA. count := 0. ^self ]
     destination [ ^destination ]
     destination: v [ destination := v ]
@@ -232,12 +232,12 @@ RBObject subclass: WorkerTaskDataRecord [
     count: v [ count := v ]
 ]
 
-"--- TaskControlBlock + the four task kinds --------------------------------"
+"--- BmTaskControlBlock + the four task kinds --------------------------------"
 
-TaskState subclass: TaskControlBlock [
+BmTaskState subclass: BmTaskControlBlock [
     | link identity priority input handle scheduler |
 
-    TaskControlBlock class >> link: aLink identity: anIdentity priority: aPriority work: aWorkQueue state: aState scheduler: aScheduler data: aData [
+    BmTaskControlBlock class >> link: aLink identity: anIdentity priority: aPriority work: aWorkQueue state: aState scheduler: aScheduler data: aData [
         ^self new initLink: aLink identity: anIdentity priority: aPriority
               work: aWorkQueue state: aState scheduler: aScheduler data: aData
     ]
@@ -283,11 +283,11 @@ TaskState subclass: TaskControlBlock [
 
     "the canonical per-task function closure, rendered as an override"
     processWork: work [
-        self error: 'TaskControlBlock subclasses must override processWork:'
+        self error: 'BmTaskControlBlock subclasses must override processWork:'
     ]
 ]
 
-TaskControlBlock subclass: IdleTask [
+BmTaskControlBlock subclass: BmIdleTask [
     processWork: work [
         | data control |
         data := handle.
@@ -304,7 +304,7 @@ TaskControlBlock subclass: IdleTask [
     ]
 ]
 
-TaskControlBlock subclass: WorkerTask [
+BmTaskControlBlock subclass: BmWorkerTask [
     processWork: work [
         | data |
         data := handle.
@@ -322,7 +322,7 @@ TaskControlBlock subclass: WorkerTask [
     ]
 ]
 
-TaskControlBlock subclass: HandlerTask [
+BmTaskControlBlock subclass: BmHandlerTask [
     processWork: work [
         | data workPacket count devicePacket |
         data := handle.
@@ -345,7 +345,7 @@ TaskControlBlock subclass: HandlerTask [
     ]
 ]
 
-TaskControlBlock subclass: DeviceTask [
+BmTaskControlBlock subclass: BmDeviceTask [
     processWork: work [
         | data functionWork |
         data := handle.
@@ -363,10 +363,10 @@ TaskControlBlock subclass: DeviceTask [
 
 "--- the scheduler ----------------------------------------------------------"
 
-RBObject subclass: RichardsBenchmark [
+BmRBObject subclass: BmRichardsBenchmark [
     | taskList currentTask currentTaskIdentity taskTable queuePacketCount holdCount |
 
-    RichardsBenchmark class >> create [ ^self new init ]
+    BmRichardsBenchmark class >> create [ ^self new init ]
     init [
         taskList := nil.
         currentTask := nil.
@@ -382,31 +382,31 @@ RBObject subclass: RichardsBenchmark [
         taskTable at: identity put: aTask.
     ]
     createIdler: identity priority: priority work: work state: state [
-        self addTask: (IdleTask link: taskList identity: identity
+        self addTask: (BmIdleTask link: taskList identity: identity
                 priority: priority work: work state: state
-                scheduler: self data: IdleTaskDataRecord create)
+                scheduler: self data: BmIdleTaskDataRecord create)
             identity: identity
     ]
     createWorker: identity priority: priority work: work state: state [
-        self addTask: (WorkerTask link: taskList identity: identity
+        self addTask: (BmWorkerTask link: taskList identity: identity
                 priority: priority work: work state: state
-                scheduler: self data: WorkerTaskDataRecord create)
+                scheduler: self data: BmWorkerTaskDataRecord create)
             identity: identity
     ]
     createHandler: identity priority: priority work: work state: state [
-        self addTask: (HandlerTask link: taskList identity: identity
+        self addTask: (BmHandlerTask link: taskList identity: identity
                 priority: priority work: work state: state
-                scheduler: self data: HandlerTaskDataRecord create)
+                scheduler: self data: BmHandlerTaskDataRecord create)
             identity: identity
     ]
     createDevice: identity priority: priority work: work state: state [
-        self addTask: (DeviceTask link: taskList identity: identity
+        self addTask: (BmDeviceTask link: taskList identity: identity
                 priority: priority work: work state: state
-                scheduler: self data: DeviceTaskDataRecord create)
+                scheduler: self data: BmDeviceTaskDataRecord create)
             identity: identity
     ]
     createPacket: link identity: identity kind: kind [
-        ^Packet link: link identity: identity kind: kind
+        ^BmPacket link: link identity: identity kind: kind
     ]
 
     findTask: identity [
@@ -456,29 +456,29 @@ RBObject subclass: RichardsBenchmark [
     start [
         | workQ |
         self createIdler: self idlerId priority: 0
-            work: nil state: TaskState running.
+            work: nil state: BmTaskState running.
 
         workQ := self createPacket: nil identity: self workerId kind: self workPacketKind.
         workQ := self createPacket: workQ identity: self workerId kind: self workPacketKind.
         self createWorker: self workerId priority: 1000
-            work: workQ state: TaskState waitingWithPacket.
+            work: workQ state: BmTaskState waitingWithPacket.
 
         workQ := self createPacket: nil identity: self deviceA kind: self devicePacketKind.
         workQ := self createPacket: workQ identity: self deviceA kind: self devicePacketKind.
         workQ := self createPacket: workQ identity: self deviceA kind: self devicePacketKind.
         self createHandler: self handlerA priority: 2000
-            work: workQ state: TaskState waitingWithPacket.
+            work: workQ state: BmTaskState waitingWithPacket.
 
         workQ := self createPacket: nil identity: self deviceB kind: self devicePacketKind.
         workQ := self createPacket: workQ identity: self deviceB kind: self devicePacketKind.
         workQ := self createPacket: workQ identity: self deviceB kind: self devicePacketKind.
         self createHandler: self handlerB priority: 3000
-            work: workQ state: TaskState waitingWithPacket.
+            work: workQ state: BmTaskState waitingWithPacket.
 
         self createDevice: self deviceA priority: 4000
-            work: nil state: TaskState waiting.
+            work: nil state: BmTaskState waiting.
         self createDevice: self deviceB priority: 5000
-            work: nil state: TaskState waiting.
+            work: nil state: BmTaskState waiting.
 
         self schedule.
 
@@ -486,17 +486,17 @@ RBObject subclass: RichardsBenchmark [
     ]
 
     "--- Bench harness protocol (class side) --------------------------------"
-    RichardsBenchmark class >> setUp [
+    BmRichardsBenchmark class >> setUp [
         "each runOne builds its own fresh scheduler — nothing shared to set up"
         ^self
     ]
-    RichardsBenchmark class >> runOne [
+    BmRichardsBenchmark class >> runOne [
         ^self create start
     ]
-    RichardsBenchmark class >> checkResult: r [
+    BmRichardsBenchmark class >> checkResult: r [
         "queuePacketCount = 23246 and holdCount = 9297, encoded exactly"
         ^r = 2324609297
     ]
 ]
 
-Bench run: RichardsBenchmark named: 'Richards' inner: 1 outer: 10.
+Bench run: BmRichardsBenchmark named: 'Richards' inner: 1 outer: 10.

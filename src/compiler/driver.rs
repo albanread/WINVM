@@ -1201,6 +1201,7 @@ fn compile_method_full(
                 box_double: box_double_addr,
                 call_primitive: call_primitive_addr,
                 nlr_originate: nlr_originate_addr,
+                old_start: vm.reg_block.old_start,
             },
             if method.is_block() { None } else { Some(&guard) },
             prim_shim,

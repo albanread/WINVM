@@ -1,9 +1,9 @@
-"deltablue.mst — DeltaBlue, the Wilson/Freeman-Benson one-way constraint
+"deltablue.mst — BmDeltaBlue, the Wilson/Freeman-Benson one-way constraint
  solver (sprint_s15_detail.md A6), ported from the canonical Smalltalk
  version (Squeak/Pharo DBPlanner lineage, mirrored in are-we-fast-yet):
- Strength (7 singletons + ordering table), AbstractConstraint ->
- UnaryConstraint (StayConstraint, EditConstraint) and BinaryConstraint
- (EqualityConstraint, ScaleConstraint), Variable, Planner, Plan. The
+ BmStrength (7 singletons + ordering table), BmAbstractConstraint ->
+ BmUnaryConstraint (BmStayConstraint, BmEditConstraint) and BmBinaryConstraint
+ (BmEqualityConstraint, BmScaleConstraint), BmVariable, BmPlanner, BmPlan. The
  canonical chainTest:/projectionTest: asserts are ported AS-IS (each
  mismatch is a self error:); runOne additionally answers an exact
  checksum (chain last-value + projection dest sum) so Bench checkResult:
@@ -72,23 +72,23 @@ Object subclass: Bench [
     ]
 ]
 
-"--- Strength ---------------------------------------------------------------
+"--- BmStrength ---------------------------------------------------------------
  Strengths are immutable singletons; the Table (Dictionary, symbol ->
  singleton) is the ordering table the of: constructor resolves through.
  Lower arithmeticValue = stronger. initStrengths is called explicitly at
  the bottom of the file (no automatic class initialization in this world)."
 
-Object subclass: Strength [
+Object subclass: BmStrength [
     | symbolicValue arithmeticValue |
     <classVars: Table Required StrongPreferred Preferred StrongDefault Normal WeakDefault Weakest>
 
-    Strength class >> addStrength: aSymbol value: n [
+    BmStrength class >> addStrength: aSymbol value: n [
         | s |
         s := self basicNew initSymbol: aSymbol value: n.
         Table at: aSymbol put: s.
         ^s
     ]
-    Strength class >> initStrengths [
+    BmStrength class >> initStrengths [
         Table := Dictionary new.
         Required := self addStrength: #required value: 0.
         StrongPreferred := self addStrength: #strongPreferred value: 1.
@@ -98,14 +98,14 @@ Object subclass: Strength [
         WeakDefault := self addStrength: #weakDefault value: 5.
         Weakest := self addStrength: #weakest value: 6.
     ]
-    Strength class >> of: aSymbol [ ^Table at: aSymbol ]
-    Strength class >> required [ ^Required ]
-    Strength class >> strongPreferred [ ^StrongPreferred ]
-    Strength class >> preferred [ ^Preferred ]
-    Strength class >> strongDefault [ ^StrongDefault ]
-    Strength class >> normal [ ^Normal ]
-    Strength class >> weakDefault [ ^WeakDefault ]
-    Strength class >> weakest [ ^Weakest ]
+    BmStrength class >> of: aSymbol [ ^Table at: aSymbol ]
+    BmStrength class >> required [ ^Required ]
+    BmStrength class >> strongPreferred [ ^StrongPreferred ]
+    BmStrength class >> preferred [ ^Preferred ]
+    BmStrength class >> strongDefault [ ^StrongDefault ]
+    BmStrength class >> normal [ ^Normal ]
+    BmStrength class >> weakDefault [ ^WeakDefault ]
+    BmStrength class >> weakest [ ^Weakest ]
 
     initSymbol: aSymbol value: n [
         symbolicValue := aSymbol.
@@ -121,13 +121,13 @@ Object subclass: Strength [
     ]
 ]
 
-"--- Variable ---------------------------------------------------------------"
+"--- BmVariable ---------------------------------------------------------------"
 
-Object subclass: Variable [
+Object subclass: BmVariable [
     | value constraints determinedBy walkStrength stay mark |
 
-    Variable class >> new [ ^self basicNew init ]
-    Variable class >> value: aValue [
+    BmVariable class >> new [ ^self basicNew init ]
+    BmVariable class >> value: aValue [
         | v |
         v := self new.
         v value: aValue.
@@ -138,7 +138,7 @@ Object subclass: Variable [
         value := 0.
         constraints := OrderedCollection new.
         determinedBy := nil.
-        walkStrength := Strength weakest.
+        walkStrength := BmStrength weakest.
         stay := true.
         mark := 0.
     ]
@@ -165,25 +165,25 @@ Object subclass: Variable [
     ]
 ]
 
-"--- Plan -------------------------------------------------------------------
- A Plan IS an ordered list of constraints (the canonical version subclasses
+"--- BmPlan -------------------------------------------------------------------
+ A BmPlan IS an ordered list of constraints (the canonical version subclasses
  OrderedCollection exactly like this); execute runs them in order."
 
-OrderedCollection subclass: Plan [
+OrderedCollection subclass: BmPlan [
     execute [ self do: [:c | c execute ] ]
 ]
 
-"--- Planner ----------------------------------------------------------------
+"--- BmPlanner ----------------------------------------------------------------
  The solver. Current is the planner singleton the constraint add/destroy
- protocol reaches (canonical `Planner current`); each test run resets it."
+ protocol reaches (canonical `BmPlanner current`); each test run resets it."
 
-Object subclass: Planner [
+Object subclass: BmPlanner [
     | currentMark |
     <classVars: Current>
 
-    Planner class >> new [ ^self basicNew init ]
-    Planner class >> reset [ Current := self new ]
-    Planner class >> current [ ^Current ]
+    BmPlanner class >> new [ ^self basicNew init ]
+    BmPlanner class >> reset [ Current := self new ]
+    BmPlanner class >> current [ ^Current ]
 
     init [ currentMark := 0 ]
     newMark [
@@ -225,7 +225,7 @@ Object subclass: Planner [
     removePropagateFrom: out [
         | unsatisfied todo v |
         out determinedBy: nil.
-        out walkStrength: Strength weakest.
+        out walkStrength: BmStrength weakest.
         out stay: true.
         unsatisfied := OrderedCollection new.
         todo := OrderedCollection new.
@@ -251,7 +251,7 @@ Object subclass: Planner [
     makePlan: sources [
         | mark plan todo c |
         mark := self newMark.
-        plan := Plan new.
+        plan := BmPlan new.
         todo := sources.
         [ todo isEmpty ] whileFalse: [
             c := todo removeFirst.
@@ -274,9 +274,9 @@ Object subclass: Planner [
     ]
 ]
 
-"--- AbstractConstraint ------------------------------------------------------"
+"--- BmAbstractConstraint ------------------------------------------------------"
 
-Object subclass: AbstractConstraint [
+Object subclass: BmAbstractConstraint [
     | strength |
 
     strength [ ^strength ]
@@ -284,12 +284,12 @@ Object subclass: AbstractConstraint [
 
     addConstraint [
         self addToGraph.
-        Planner current incrementalAdd: self.
+        BmPlanner current incrementalAdd: self.
     ]
 
     destroyConstraint [
         self isSatisfied
-            ifTrue: [ Planner current incrementalRemove: self ]
+            ifTrue: [ BmPlanner current incrementalRemove: self ]
             ifFalse: [ self removeFromGraph ].
     ]
 
@@ -300,7 +300,7 @@ Object subclass: AbstractConstraint [
         | out overridden |
         self chooseMethod: mark.
         self isSatisfied ifFalse: [
-            (strength sameAs: Strength required) ifTrue: [
+            (strength sameAs: BmStrength required) ifTrue: [
                 self error: 'Could not satisfy a required constraint' ].
             ^nil ].
         self markInputs: mark.
@@ -308,7 +308,7 @@ Object subclass: AbstractConstraint [
         overridden := out determinedBy.
         (overridden == nil) ifFalse: [ overridden markUnsatisfied ].
         out determinedBy: self.
-        (Planner current addPropagate: self mark: mark) ifFalse: [
+        (BmPlanner current addPropagate: self mark: mark) ifFalse: [
             self error: 'Cycle encountered' ].
         out mark: mark.
         ^overridden
@@ -326,16 +326,16 @@ Object subclass: AbstractConstraint [
     ]
 ]
 
-"--- UnaryConstraint (StayConstraint, EditConstraint) ------------------------"
+"--- BmUnaryConstraint (BmStayConstraint, BmEditConstraint) ------------------------"
 
-AbstractConstraint subclass: UnaryConstraint [
+BmAbstractConstraint subclass: BmUnaryConstraint [
     | output satisfied |
 
-    UnaryConstraint class >> var: aVariable strength: strengthSymbol [
+    BmUnaryConstraint class >> var: aVariable strength: strengthSymbol [
         ^self basicNew initVar: aVariable strength: strengthSymbol
     ]
     initVar: aVariable strength: strengthSymbol [
-        strength := Strength of: strengthSymbol.
+        strength := BmStrength of: strengthSymbol.
         output := aVariable.
         satisfied := false.
         self addConstraint.
@@ -364,25 +364,25 @@ AbstractConstraint subclass: UnaryConstraint [
     ]
 ]
 
-UnaryConstraint subclass: StayConstraint [
+BmUnaryConstraint subclass: BmStayConstraint [
     execute [ ^self ]
 ]
 
-UnaryConstraint subclass: EditConstraint [
+BmUnaryConstraint subclass: BmEditConstraint [
     isInput [ ^true ]
     execute [ ^self ]
 ]
 
-"--- BinaryConstraint (EqualityConstraint, ScaleConstraint) ------------------"
+"--- BmBinaryConstraint (BmEqualityConstraint, BmScaleConstraint) ------------------"
 
-AbstractConstraint subclass: BinaryConstraint [
+BmAbstractConstraint subclass: BmBinaryConstraint [
     | v1 v2 direction |
 
-    BinaryConstraint class >> var: aVariable var: bVariable strength: strengthSymbol [
+    BmBinaryConstraint class >> var: aVariable var: bVariable strength: strengthSymbol [
         ^self basicNew initVar: aVariable var: bVariable strength: strengthSymbol
     ]
     initVar: aVariable var: bVariable strength: strengthSymbol [
-        strength := Strength of: strengthSymbol.
+        strength := BmStrength of: strengthSymbol.
         v1 := aVariable.
         v2 := bVariable.
         direction := nil.
@@ -440,7 +440,7 @@ AbstractConstraint subclass: BinaryConstraint [
     ]
 ]
 
-BinaryConstraint subclass: EqualityConstraint [
+BmBinaryConstraint subclass: BmEqualityConstraint [
     execute [
         (direction == #forward)
             ifTrue: [ v2 value: v1 value ]
@@ -448,17 +448,17 @@ BinaryConstraint subclass: EqualityConstraint [
     ]
 ]
 
-"ScaleConstraint relates src (v1) and dst (v2) by dst = src * scale + offset,
+"BmScaleConstraint relates src (v1) and dst (v2) by dst = src * scale + offset,
  where scale and offset are themselves constrainable Variables."
-BinaryConstraint subclass: ScaleConstraint [
+BmBinaryConstraint subclass: BmScaleConstraint [
     | scale offset |
 
-    ScaleConstraint class >> src: srcVariable scale: scaleVariable offset: offsetVariable dst: dstVariable strength: strengthSymbol [
+    BmScaleConstraint class >> src: srcVariable scale: scaleVariable offset: offsetVariable dst: dstVariable strength: strengthSymbol [
         ^self basicNew initSrc: srcVariable scale: scaleVariable
             offset: offsetVariable dst: dstVariable strength: strengthSymbol
     ]
     initSrc: srcVariable scale: scaleVariable offset: offsetVariable dst: dstVariable strength: strengthSymbol [
-        strength := Strength of: strengthSymbol.
+        strength := BmStrength of: strengthSymbol.
         v1 := srcVariable.
         v2 := dstVariable.
         scale := scaleVariable.
@@ -504,41 +504,41 @@ BinaryConstraint subclass: ScaleConstraint [
     ]
 ]
 
-"--- DeltaBlue driver ---------------------------------------------------------
+"--- BmDeltaBlue driver ---------------------------------------------------------
  The standard chainTest:/projectionTest: workloads with the canonical
  asserts ported as-is. chainTest: answers the chain's final value (99);
  projectionTest: answers the last dst plus the sum of the checked dests
  (2025 + sum over i=1..99 of i*5+2000 = 2025 + 222750 = 224775), so
  runOne's exact expected answer is 99 + 224775 = 224874."
 
-Object subclass: DeltaBlue [
-    DeltaBlue class >> setUp [ ^self ]
+Object subclass: BmDeltaBlue [
+    BmDeltaBlue class >> setUp [ ^self ]
 
-    DeltaBlue class >> runOne [
+    BmDeltaBlue class >> runOne [
         ^(self chainTest: 100) + (self projectionTest: 100)
     ]
 
-    DeltaBlue class >> checkResult: r [ ^r = 224874 ]
+    BmDeltaBlue class >> checkResult: r [ ^r = 224874 ]
 
     "Builds a chain of n equality constraints between n+1 variables, stays
      the last, edits the first, then pushes 100 values down the chain,
      asserting each arrives intact at the far end (the canonical test)."
-    DeltaBlue class >> chainTest: n [
+    BmDeltaBlue class >> chainTest: n [
         | prev v first last editC edits plan |
-        Planner reset.
+        BmPlanner reset.
         prev := nil.
         1 to: n + 1 do: [:i |
-            v := Variable new.
+            v := BmVariable new.
             (prev == nil) ifFalse: [
-                EqualityConstraint var: prev var: v strength: #required ].
+                BmEqualityConstraint var: prev var: v strength: #required ].
             (i = 1) ifTrue: [ first := v ].
             (i = (n + 1)) ifTrue: [ last := v ].
             prev := v ].
-        StayConstraint var: last strength: #strongDefault.
-        editC := EditConstraint var: first strength: #preferred.
+        BmStayConstraint var: last strength: #strongDefault.
+        editC := BmEditConstraint var: first strength: #preferred.
         edits := OrderedCollection new.
         edits add: editC.
-        plan := Planner current extractPlanFromConstraints: edits.
+        plan := BmPlanner current extractPlanFromConstraints: edits.
         0 to: 99 do: [:i |
             first value: i.
             plan execute.
@@ -550,18 +550,18 @@ Object subclass: DeltaBlue [
      transformation dst = src * scale + offset, then checks the dst set
      tracks edits to a src, a dst, the scale, and the offset (the
      canonical four projection asserts)."
-    DeltaBlue class >> projectionTest: n [
+    BmDeltaBlue class >> projectionTest: n [
         | scale offset src dst dests total |
-        Planner reset.
+        BmPlanner reset.
         dests := OrderedCollection new.
-        scale := Variable value: 10.
-        offset := Variable value: 1000.
+        scale := BmVariable value: 10.
+        offset := BmVariable value: 1000.
         1 to: n do: [:i |
-            src := Variable value: i.
-            dst := Variable value: i.
+            src := BmVariable value: i.
+            dst := BmVariable value: i.
             dests addLast: dst.
-            StayConstraint var: src strength: #normal.
-            ScaleConstraint src: src scale: scale offset: offset dst: dst strength: #required ].
+            BmStayConstraint var: src strength: #normal.
+            BmScaleConstraint src: src scale: scale offset: offset dst: dst strength: #required ].
         self change: src to: 17.
         (dst value = 1170) ifFalse: [ self error: 'Projection test 1 failed' ].
         self change: dst to: 1050.
@@ -581,12 +581,12 @@ Object subclass: DeltaBlue [
 
     "The canonical 'change' helper: plant a preferred edit, extract the
      plan it enables, push the new value through ten times, tear down."
-    DeltaBlue class >> change: aVariable to: newValue [
+    BmDeltaBlue class >> change: aVariable to: newValue [
         | editC edits plan |
-        editC := EditConstraint var: aVariable strength: #preferred.
+        editC := BmEditConstraint var: aVariable strength: #preferred.
         edits := OrderedCollection new.
         edits add: editC.
-        plan := Planner current extractPlanFromConstraints: edits.
+        plan := BmPlanner current extractPlanFromConstraints: edits.
         10 timesRepeat: [
             aVariable value: newValue.
             plan execute ].
@@ -594,5 +594,5 @@ Object subclass: DeltaBlue [
     ]
 ]
 
-Strength initStrengths.
-Bench run: DeltaBlue named: 'deltablue' inner: 10 outer: 10.
+BmStrength initStrengths.
+Bench run: BmDeltaBlue named: 'deltablue' inner: 10 outer: 10.

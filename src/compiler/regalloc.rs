@@ -251,6 +251,7 @@ pub fn compute_intervals(
     Vec<u32>,
     std::collections::HashMap<u32, u32>,
     Vec<(VReg, u32)>,
+    Vec<u32>,
 ) {
     let block_order = reverse_postorder(method);
 
@@ -681,6 +682,7 @@ pub fn compute_intervals(
         safepoint_positions,
         block_start_pos,
         extra_oop_live,
+        call_positions,
     )
 }
 
@@ -808,7 +810,71 @@ const MAX_REG_NUM: usize = 16;
 /// emit's x16/x17/x19/x20 scratches). Longest intervals first — loop-carried
 /// variables win the registers. The slot stays canonical (write-through); see
 /// [`LiveInterval::resident_reg`].
-pub fn assign_residents(intervals: &mut [LiveInterval]) {
+pub fn assign_residents(
+    intervals: &mut [LiveInterval],
+    method: &IrMethod,
+    _call_positions: &[u32],
+) {
+    // F3b profitability: per-vreg read/def counts, LOOP-WEIGHTED. A
+    // resident saves one slot load per dynamic READ and costs one
+    // write-through `mov` per dynamic DEF plus (x64 only) one reload per
+    // call its interval crosses — and the dynamic counts are dominated by
+    // loop frequency, which a flat static count can't see (a loop
+    // induction variable has ~3 static reads but millions of dynamic
+    // ones). Approximate: a back-edge (a block whose successor sits at or
+    // before it in reverse-postorder) defines a loop span; a block's
+    // weight is 10^depth, capped, where depth counts enclosing spans.
+    let order = reverse_postorder(method);
+    let mut linear_ix: Vec<usize> = vec![0; method.blocks.len()];
+    for (i, b) in order.iter().enumerate() {
+        linear_ix[b.0 as usize] = i;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new(); // (header, tail) linear
+    for (i, b) in order.iter().enumerate() {
+        for s in successors(&method.blocks[b.0 as usize]) {
+            let j = linear_ix[s.0 as usize];
+            if j <= i {
+                spans.push((j, i));
+            }
+        }
+    }
+    let weight_of = |b: BlockId| -> u32 {
+        let ix = linear_ix[b.0 as usize];
+        let depth = spans
+            .iter()
+            .filter(|&&(h, t)| h <= ix && ix <= t)
+            .count()
+            .min(3) as u32;
+        10u32.pow(depth)
+    };
+    let mut reads: Vec<u32> = vec![0; method.vregs.len()];
+    let mut defs: Vec<u32> = vec![0; method.vregs.len()];
+    for blk in &method.blocks {
+        let w = weight_of(blk.id);
+        for op in &blk.code {
+            op.uses(|v| reads[v.0 as usize] = reads[v.0 as usize].saturating_add(w));
+            op.defs(|v| defs[v.0 as usize] = defs[v.0 as usize].saturating_add(w));
+        }
+    }
+    // Weighted call cost, in the SAME linear numbering compute_intervals
+    // uses (one position per op, blocks in reverse-postorder): a reload
+    // executes once per dynamic call, so a call inside a loop costs its
+    // block's weight, not 1.
+    let mut call_pos_w: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut pos: u32 = 0;
+        for b in &order {
+            let blk = &method.blocks[b.0 as usize];
+            let w = weight_of(blk.id);
+            for op in &blk.code {
+                if matches!(op, Ir::CallSend { .. } | Ir::CallRuntime { .. }) {
+                    call_pos_w.push((pos, w));
+                }
+                pos += 1;
+            }
+        }
+    }
+    let _ = (&reads, &defs, &call_pos_w); // consumed only by the x64 `admit`
     // Base pool: x21–x27 (callee-saved, never touched by emit's scratches
     // x16/x17/x19/x20 or the ABI paths; x24–x27 had no role of MACVM's own —
     // VMregisters.md — and build_call_stub already saves the whole x19–x28
@@ -867,14 +933,59 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
     #[cfg(not(target_arch = "aarch64"))]
     let fp_pool: Vec<u8> = Vec::new();
     let mut fp_taken: Vec<Vec<(u32, u32)>> = vec![Vec::new(); fp_pool.len()];
+    // F3b (x64_codegen_perf.md): on x86-64 a resident may CROSS calls —
+    // the emitter reloads every live resident from its canonical slot
+    // right after each CallSend/CallRuntime (and the existing Poll/Alloc/
+    // FBox slow paths), so neither a compiled callee clobbering the
+    // register nor a GC moving the oop is ever observable. That is what
+    // finally lets the loop-carried values (`k`, `count`, `size`,
+    // `prime`…) win a register: their lifetimes span the method's setup
+    // sends, which under the whole-lifetime gate disqualified them from
+    // the exact loops where all their reads are. AArch64's emitter has no
+    // post-call reload wired, so it keeps the `!crosses_call` gate (its
+    // 16-register file rarely spills these anyway).
+    #[cfg(target_arch = "aarch64")]
+    let admit = |iv: &LiveInterval| !iv.crosses_call;
+    #[cfg(not(target_arch = "aarch64"))]
+    let admit = |iv: &LiveInterval| {
+        if !iv.crosses_call {
+            return true;
+        }
+        // Crossing intervals only when the weighted ledger clearly wins:
+        // reads save a load each; defs cost a write-through; every crossed
+        // call costs a reload — all loop-weighted. A loop induction
+        // variable (reads at depth 1-2, calls crossed at depth 0) passes;
+        // a recursion's short-lived temps (fib: 1-3 flat reads, 2 flat
+        // calls) fail — admitting those measurably REGRESSED fib.
+        let call_cost: u32 = call_pos_w
+            .iter()
+            .filter(|&&(cp, _)| iv.start <= cp && iv.end > cp)
+            .map(|&(_, w)| w)
+            .sum();
+        let v = iv.vreg.0 as usize;
+        reads[v] > defs[v].saturating_add(call_cost).saturating_add(2)
+    };
     let mut order: Vec<usize> = (0..intervals.len())
         .filter(|&i| {
             matches!(intervals[i].assignment, Some(Assignment::Spill(_)))
-                && !intervals[i].crosses_call
-                && intervals[i].end > intervals[i].start
+                && admit(&intervals[i])
+                // F3a (x64_codegen_perf.md): a len-1 interval is read at
+                // most once, immediately after its def — it was already in
+                // a register, so a resident only ADDS the write-through
+                // `mov` and saves nothing. Sieve's trace showed 8 of 11
+                // residents were exactly this strict loss.
+                && intervals[i].end - intervals[i].start >= 2
         })
         .collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(intervals[i].end - intervals[i].start));
+    // Priority: weighted profitability first (the loop-carried values must
+    // win the small candidate pool), interval length as the tiebreak.
+    order.sort_by_key(|&i| {
+        let v = intervals[i].vreg.0 as usize;
+        std::cmp::Reverse((
+            reads[v].saturating_sub(defs[v]),
+            intervals[i].end - intervals[i].start,
+        ))
+    });
     #[cfg(debug_assertions)]
     let dbg = std::env::var("MACVM_DBG_RESIDENTS").is_ok();
     #[cfg(not(debug_assertions))]
@@ -1057,8 +1168,14 @@ pub struct RegallocResult {
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
-    let (block_order, mut intervals, safepoint_positions, block_start_pos, extra_oop_live) =
-        compute_intervals(method);
+    let (
+        block_order,
+        mut intervals,
+        safepoint_positions,
+        block_start_pos,
+        extra_oop_live,
+        call_positions,
+    ) = compute_intervals(method);
     // S24 A1 (design Risk 1): PIN the block compilation's closure vreg live
     // for the whole method — the root deopt scope's receiver ValueLoc names
     // its spill slot, and `Ir::NlrReturn` reads it, at ANY safepoint. A
@@ -1099,7 +1216,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     let (frame_slots, slot_is_oop) = allocate(&mut intervals);
     // S14 perf recovery: call-free spilled intervals also get a resident
     // register (slots stay canonical; see LiveInterval::resident_reg).
-    assign_residents(&mut intervals);
+    assign_residents(&mut intervals, method, &call_positions);
     // Task #94: the final spill slot of every deopt-referenced vreg (all are
     // spill-assigned — `crosses_safepoint` is forced for them). `emit`
     // nil-fills these in the prologue, which is what makes `extra_oop_live`'s
@@ -1199,7 +1316,7 @@ mod tests {
             vec![VRegInfo { is_oop: true, is_fp: false }, VRegInfo { is_oop: true, is_fp: false }],
         );
 
-        let (_order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (_order, intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
         let iv = intervals
             .iter()
             .find(|iv| iv.vreg == v0)
@@ -1233,7 +1350,7 @@ mod tests {
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
-        let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
         assert_eq!(
             order,
             vec![BlockId(0), BlockId(1)],
@@ -1269,7 +1386,7 @@ mod tests {
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
-        let (_order, mut intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (_order, mut intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
         assert!(
             intervals[0].crosses_safepoint,
             "v0 is defined before and used after the call"
@@ -1525,7 +1642,7 @@ mod tests {
             deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
-        let (order, _intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (order, _intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
         assert_eq!(
             order.len(),
             2,
@@ -1657,7 +1774,7 @@ mod tests {
             vec![entry, header, body, exit, bailout],
             (0..6).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         );
-        let (order, intervals, _safepoints, _bsp, _extra) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
 
         // Confirms this hand-built shape actually reproduces the bug's own
         // precondition: the exit block linearized before the body block.
