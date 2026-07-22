@@ -135,6 +135,40 @@ pub fn global_lookup(vm: &VmState, name: SymbolOop) -> Option<Oop> {
     None
 }
 
+/// The sole instance of metaclass `meta` — the class object whose `klass()`
+/// is `meta` — found by scanning the global namespace (every class the
+/// compiler can meet is bound there; `Object subclass:` declares the name
+/// before anything can send to the class). Compile-time use only: it is a
+/// linear scan, priced for the JIT's once-per-compile `self basicNew`
+/// fusion, not for a runtime path. Returns `None` when `meta` is not a
+/// metaclass, or its class object isn't a declared global (an anonymous
+/// class stays on the generic send path — correct, just not fused).
+pub fn metaclass_sole_instance(
+    vm: &VmState,
+    meta: crate::oops::wrappers::KlassOop,
+) -> Option<crate::oops::wrappers::KlassOop> {
+    use crate::oops::wrappers::KlassOop;
+    if meta.klass().oop().raw() != vm.universe.metaclass_klass.oop().raw() {
+        return None;
+    }
+    let arr = ArrayOop::try_from(vm.universe.smalltalk)?;
+    let tally = SmallInt::try_from(arr.at(0))
+        .expect("globals: tally is not a smi")
+        .value() as usize;
+    for i in 0..tally {
+        let assoc = arr.at(1 + i);
+        let value = MemOop::try_from(assoc)
+            .expect("globals: slot is not an Association")
+            .body_oop(1);
+        if let Some(k) = KlassOop::try_from(value) {
+            if k.klass().oop().raw() == meta.oop().raw() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
 /// The `Association` for `name`, creating it (value `nil`) if absent.
 pub fn global_declare(vm: &mut VmState, name: SymbolOop) -> Oop {
     if let Some(assoc) = global_lookup(vm, name) {

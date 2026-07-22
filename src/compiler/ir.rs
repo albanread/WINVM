@@ -1755,17 +1755,78 @@ impl<'a> Translator<'a> {
     /// `X` is a fixed-size `Format::Slots` class small enough for the inline
     /// fast path's 12-bit `add`/`str` immediates. Anything else stays an
     /// ordinary generic `basicNew` send.
-    fn alloc_site_klass(&self, ic_idx: u16, receiver: VReg) -> Option<(KlassOop, u32)> {
-        let klass = *self.const_class.get(&receiver.0)?;
-        let ic = InterpreterIc::at(self.method, ic_idx);
+    ///
+    /// gc_alloc_gap cost 1 (customized `self basicNew`): the second receiver
+    /// shape is `self` under a CLASS-SIDE customization — `rcvr_klass` is a
+    /// metaclass, whose sole instance (the class object every `self basicNew`
+    /// here instantiates) is a compile-time constant recovered from the
+    /// global namespace. This path is statically sound exactly like
+    /// self-devirt (the nmethod's entry guard proved self's klass), so the
+    /// target comes from `resolve_method_ro` with NO IC warmth required —
+    /// the caller records a `(rcvr_klass, selector)` inline dep so a later
+    /// `basicNew` override on the class side invalidates the nmethod. This
+    /// is the allocation-heavy path Cog wins on: `Point x: y:`-style
+    /// class-side constructors stop paying the CallSend → prim-shim →
+    /// `rt_call_primitive` Rust crossing per object and take the same
+    /// inline eden bump the `X basicNew` constant form always took.
+    fn alloc_site_klass(&mut self, ic_idx: u16, receiver: VReg) -> Option<(KlassOop, u32)> {
+        let self_klass = if self.method.is_block() {
+            // A block's `self` is the HOME receiver (any klass), not the
+            // customization key — same refusal as `devirt_self_target`.
+            None
+        } else {
+            Some(self.rcvr_klass)
+        };
+        self.alloc_site_klass_on(self.method, ic_idx, receiver, self.self_vreg, self_klass)
+    }
+
+    /// The `_on` twin (same pattern as `is_smi_inlinable_on`): the alloc
+    /// gate against an arbitrary method's own IC table, usable on an
+    /// INLINED callee's sites — `holder_self`/`holder_self_klass` are that
+    /// body's own `self` vreg and its statically-proven klass (the splice
+    /// guard klass; the root passes its customization klass). Records the
+    /// `(metaclass, selector)` inline dep itself when the statically-
+    /// resolved self form fires, so every caller stays invalidation-sound.
+    fn alloc_site_klass_on(
+        &mut self,
+        holder: MethodOop,
+        ic_idx: u16,
+        receiver: VReg,
+        holder_self: VReg,
+        holder_self_klass: Option<KlassOop>,
+    ) -> Option<(KlassOop, u32)> {
+        let ic = InterpreterIc::at(holder, ic_idx);
         if ic.argc() != 0 {
             return None;
         }
-        let guard = crate::oops::wrappers::KlassOop::try_from(ic.guard())?;
-        let target = mono_target_method(self.vm, &ic, guard)?;
-        if target.primitive() != PRIM_BASIC_NEW {
-            return None;
-        }
+        let klass = if let Some(&k) = self.const_class.get(&receiver.0) {
+            // Constant-receiver form: feedback-gated (warm mono IC whose
+            // target is the basicNew primitive), exactly as before.
+            let guard = crate::oops::wrappers::KlassOop::try_from(ic.guard())?;
+            let target = mono_target_method(self.vm, &ic, guard)?;
+            if target.primitive() != PRIM_BASIC_NEW {
+                return None;
+            }
+            k
+        } else {
+            // Statically-known-self form: `self basicNew` where this body's
+            // receiver klass is a metaclass proven at compile time (entry
+            // guard or splice guard) — the sole instance is the class every
+            // such send instantiates. Resolution is against the LIVE world
+            // (like self-devirt), no IC warmth required.
+            if receiver != holder_self {
+                return None;
+            }
+            let meta = holder_self_klass?;
+            let sole = crate::runtime::globals::metaclass_sole_instance(self.vm, meta)?;
+            let target =
+                crate::compiler::feedback::resolve_method_ro(self.vm, meta, ic.selector())?;
+            if target.primitive() != PRIM_BASIC_NEW {
+                return None;
+            }
+            self.record_inline_dep(meta, ic.selector());
+            sole
+        };
         if !matches!(klass.format(), crate::oops::klass::Format::Slots) {
             return None;
         }
@@ -2261,6 +2322,16 @@ impl<'a> Translator<'a> {
                         obj: assoc_vreg,
                         byte_off: (BODY_OFFSET + 8) as i32,
                     });
+                    // Mirror the root arm: remember class-valued globals so an
+                    // in-body `X basicNew` can fuse to `Ir::Alloc` below —
+                    // without this the SPLICED copy of a constructor demotes
+                    // its allocation to a generic send.
+                    let value = crate::oops::wrappers::MemOop::try_from(assoc)
+                        .map(|a| a.body_oop(1))
+                        .unwrap_or(assoc);
+                    if let Some(klass) = KlassOop::try_from(value) {
+                        self.const_class.insert(dst.0, klass);
+                    }
                     cstack.push(dst);
                 }
                 // S15 (DeltaBlue port finding): classVar/global STORE — the
@@ -2491,6 +2562,58 @@ impl<'a> Translator<'a> {
                         cstack.push(dst);
                         bci = next;
                         continue;
+                    }
+
+                    // gc_alloc_gap cost 1, splice half: an in-body `X basicNew`
+                    // / `self basicNew` fuses to the same inline `Ir::Alloc`
+                    // the root arm emits. Without this, splicing a tiny
+                    // constructor DEMOTES its allocation from inline eden bump
+                    // to a generic send — and on hosts where `basicNew` has no
+                    // compiled form (prim 23 is not shimmable on x64), to a
+                    // per-object c2i interpreter round trip: the Windows
+                    // alloc-bench pathology (24M interpreted `basicNew`s).
+                    if inner_argc == 0 {
+                        if let Some(&recv) = cstack.last() {
+                            if let Some((aklass, size_words)) = self.alloc_site_klass_on(
+                                callee,
+                                ic,
+                                recv,
+                                callee_self,
+                                callee_self_klass,
+                            ) {
+                                cstack.pop();
+                                // Reexecute deopt: the interpreter re-runs the
+                                // `basicNew` send, so the recorded stack still
+                                // carries the receiver (root-arm rule), and the
+                                // inlined-frame proto reconstructs the callee
+                                // activation around it.
+                                let mut reexec = cstack.clone();
+                                reexec.push(recv);
+                                deopt.push((
+                                    code.len() as u32,
+                                    DeoptRaw {
+                                        stack: reexec,
+                                        bci: inner_bci,
+                                        kind: SafepointKind::Alloc,
+                                        reexecute: true,
+                                        stack_closures: Vec::new(),
+                                        inline: Some(inline_proto.clone()),
+                                    },
+                                ));
+                                let klass_lit = self
+                                    .pool
+                                    .intern(aklass.oop().raw(), Some(RelocKind::Oop));
+                                let dst = self.fresh(true);
+                                code.push(Ir::Alloc {
+                                    dst,
+                                    klass: klass_lit,
+                                    size_words,
+                                });
+                                cstack.push(dst);
+                                bci = next;
+                                continue;
+                            }
+                        }
                     }
 
                     // Consult the callee's own feedback (its IC). A cold
@@ -2938,6 +3061,14 @@ impl<'a> Translator<'a> {
                             obj: assoc_vreg,
                             byte_off: (BODY_OFFSET + 8) as i32,
                         });
+                        // Mirror the root arm (and the nonleaf splicer): track
+                        // class-valued globals for the in-body alloc fuse.
+                        let value = crate::oops::wrappers::MemOop::try_from(assoc)
+                            .map(|a| a.body_oop(1))
+                            .unwrap_or(assoc);
+                        if let Some(klass) = KlassOop::try_from(value) {
+                            self.const_class.insert(dst.0, klass);
+                        }
                         cstack.push(dst);
                     }
                     Instr::PushTemp(t) => {
@@ -3310,6 +3441,52 @@ impl<'a> Translator<'a> {
                             cstack_ph.push(false);
                             bci = next;
                             continue;
+                        }
+                        // gc_alloc_gap cost 1, cfg-splice half: same in-body
+                        // `basicNew` → `Ir::Alloc` fuse as the nonleaf splicer
+                        // (see that arm for the full story). Phantom-free
+                        // stacks only: with no phantom anywhere, the deopt's
+                        // `stack_closures` is empty by construction — the
+                        // conservative gate that keeps this arm simple.
+                        if inner_argc == 0 && !cstack_ph.iter().any(|&ph| ph) {
+                            if let Some(&recv) = cstack.last() {
+                                if let Some((aklass, size_words)) = self.alloc_site_klass_on(
+                                    callee,
+                                    ic,
+                                    recv,
+                                    callee_self,
+                                    callee_self_klass,
+                                ) {
+                                    cstack.pop();
+                                    cstack_ph.truncate(cstack.len());
+                                    let mut reexec = cstack.clone();
+                                    reexec.push(recv);
+                                    bdeopt.push((
+                                        bcode.len() as u32,
+                                        DeoptRaw {
+                                            stack: reexec,
+                                            bci: inner_bci,
+                                            kind: SafepointKind::Alloc,
+                                            reexecute: true,
+                                            stack_closures: Vec::new(),
+                                            inline: Some(inline_proto.clone()),
+                                        },
+                                    ));
+                                    let klass_lit = self
+                                        .pool
+                                        .intern(aklass.oop().raw(), Some(RelocKind::Oop));
+                                    let dst = self.fresh(true);
+                                    bcode.push(Ir::Alloc {
+                                        dst,
+                                        klass: klass_lit,
+                                        size_words,
+                                    });
+                                    cstack.push(dst);
+                                    cstack_ph.push(false);
+                                    bci = next;
+                                    continue;
+                                }
+                            }
                         }
                         let inner_fb =
                             crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
@@ -4277,7 +4454,19 @@ impl<'a> Translator<'a> {
                 // `alloc_site_klass` requires (`ic.argc() == 0`) before it
                 // ever consults `const_class`, so a non-zero-argc send whose
                 // top-of-stack is an arg simply returns `None` here.
-                if let Some(receiver) = stack.last().copied() {
+                // Phantom guard for the customized-self form: an elided
+                // closure pushes `self_vreg` as a placeholder (shadowed by a
+                // `Some` in `stack_sites`) — that operand is NOT self, so it
+                // must not fuse. Mirrors the self-devirt check below; the
+                // const-class form is unaffected (a phantom slot only ever
+                // holds `self_vreg`, never a `const_class` vreg).
+                let phantom_self = self.escape.is_some()
+                    && stack
+                        .len()
+                        .checked_sub(1)
+                        .and_then(|ix| stack_sites.get(ix))
+                        .is_some_and(|s| s.is_some());
+                if let Some(receiver) = stack.last().copied().filter(|_| !phantom_self) {
                     if let Some((klass, size_words)) = self.alloc_site_klass(ic, receiver) {
                         // S13 step 3b: an `Alloc` deopts by RE-EXECUTING the
                         // `basicNew` send in the interpreter (reexecute=true),
