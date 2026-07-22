@@ -573,3 +573,50 @@ benchmarks to within rounding — the S24/OSR work since then hasn't regressed
 it, and sieve holds at its post-fix 97.1% (the pre-fix figure was 4.5%; see
 the OSR cold-send section above). Range: **98.6–99.8%** — the README's own
 figure, now reproducible from this file alone.
+
+---
+
+## WINVM vs Cog (Pharo) — the Windows baseline
+
+**The standing performance target for WINVM is: faster than Cog** — the
+production Smalltalk JIT, a more meaningful yardstick for this VM than C.
+Run `scripts/cog-bench.sh` (Pharo headless lives in `E:/cog`, outside the
+repo; setup instructions in the script header).
+
+First measurement, 2026-07-22 — i7-12700, Pharo 13.0 (Cog/Spur x64,
+build 4c3e4714cc) vs WINVM @ d28baa4, `threshold=20`. Identical workload
+bodies (`scripts/cog-bench.st` mirrors `BenchmarkDashboard`), identical
+protocol: each timing covers 10 inner reps; cold first, then median of 6
+warm; results checksum-verified on both VMs. Warm ms per 10 reps:
+
+| bench | Cog | WINVM | WINVM/Cog |
+|---|---|---|---|
+| arith | 49-50 | 39 | **0.8 — faster** |
+| dict | 16-17 | 13 | **0.8 — faster** |
+| fib | 135-183 | 194-196 | 1.1-1.4 |
+| sieve | <1 | 28-29 | **>=30 — the big loss** |
+| alloc | 17-34 | 138-141 | **4-8 — the other loss** |
+
+Reading, with causes separated by confidence:
+
+- **arith, dict: already faster than Cog.** The smi fast path and the
+  customized-hash recompile fix (d920dd5) are doing their jobs.
+- **alloc, 4-8x behind — cause VERIFIED.** `Association key: i value:
+  last` compiles to a `CallSend` chain whose `basicNew` is a primitive
+  shim: every allocation crosses into Rust (`rt_call_primitive`). Cog
+  inlines allocation entirely in machine code. `Ir::Alloc`'s inline eden
+  bump exists and works — the `basicNew`-send path just never reaches
+  it. The fix is IR-level (lower a Mono `basicNew`/`new` send on a
+  statically-known klass to `Ir::Alloc`) and would benefit the Mac too.
+- **sieve, >=30x behind — cause HYPOTHESIZED, not yet verified.** Pure
+  `Array at:`/`at:put:` loops. Suspects: per-access klass+bounds guards,
+  back-edge Poll cost, and spill-all keeping loop state in memory.
+  Needs a `disasm-native` review of the emitted loop before believing
+  any of that. (Cog's sub-millisecond result was surprising enough to
+  re-check: the 1899-primes checksum is verified on both sides.)
+- **fib, 1.1-1.4x behind:** send-heavy recursion; plausibly the same
+  send-overhead story as sieve's loop overhead, at smaller magnitude.
+
+Not yet baselined against Cog: richards, deltablue (need a chunk-format
+port of `world/41a`), floats, and anything block-heavy.
+
