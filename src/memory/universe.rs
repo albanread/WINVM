@@ -224,6 +224,17 @@ impl Universe {
             .map(|kb| kb << 10)
             .unwrap_or_else(|| super::layout::default_eden_for(heap_bytes));
         let reservation = Reservation::reserve(heap_bytes);
+        // Small-reservation clamp: a heap smaller than the default eden +
+        // both survivors (possible since the 16 MiB default eden, 40fc343)
+        // must still boot — shrink eden so old keeps at least an eden's
+        // worth of room, floored at 1 MiB. Explicit MACVM_EDEN values are
+        // clamped the same way (a tiny heap is the stronger constraint).
+        let survivors = 2 * crate::memory::layout::SURVIVOR_SIZE;
+        let max_eden = heap_bytes
+            .saturating_sub(survivors)
+            .saturating_div(2)
+            .max(1 << 20);
+        let eden_size = eden_size.min(max_eden);
         let layout = HeapLayout::new(reservation.base(), heap_bytes, eden_size);
         reservation.commit(layout.eden.start - reservation.base(), layout.eden.len());
         reservation.commit(layout.from.start - reservation.base(), layout.from.len());
