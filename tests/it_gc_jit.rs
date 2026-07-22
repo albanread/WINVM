@@ -378,6 +378,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         deopt_sites: Vec::new(),
     };
     let call_hot_method_ir = IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -448,6 +449,7 @@ fn compiled_mono_caller_guard_keeps_key_klass_alive() {
         })
         .collect();
     let call_hot_nm = Nmethod {
+        osr_cold_sends: 0,
         id: NmethodId(0),
         key_klass: tmp_klass,
         key_selector: call_hot_sel,
@@ -542,6 +544,7 @@ fn install_loop_nmethod(
     probe_name: &[u8],
 ) -> NmethodId {
     let ir = IrMethod {
+        osr_cold_sends: 0,
         blocks,
         vregs,
         pool,
@@ -637,6 +640,7 @@ fn install_loop_nmethod(
         })
         .collect();
     let nm = Nmethod {
+        osr_cold_sends: 0,
         id: NmethodId(0),
         key_klass,
         key_selector: probe_sel,

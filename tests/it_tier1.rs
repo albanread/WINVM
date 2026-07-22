@@ -132,6 +132,8 @@ fn run_ir_raw() {
     };
 
     let method = IrMethod {
+
+        osr_cold_sends: 0,
         blocks: vec![block0, block1, block2, block3],
         vregs,
         pool: Vec::new(),
@@ -283,6 +285,7 @@ fn mul_method() -> IrMethod {
         deopt_sites: Vec::new(),
     };
     IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0, block1],
         vregs: (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         pool: Vec::new(),
@@ -415,6 +418,7 @@ fn run_ir_raw_forces_spill() {
         deopt_sites: Vec::new(),
     };
     let method = IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0, block1],
         vregs,
         pool: Vec::new(),
@@ -1585,7 +1589,7 @@ fn compile_and_get_listing(vm: &VmState, method: MethodOop) -> String {
     let cfg = macvm::compiler::decode::decode(method);
     let holder = KlassOop::try_from(method.holder())
         .expect("golden methods are frontend-loaded, holder always set");
-    let ir = macvm::compiler::ir::convert(vm, holder, method, &cfg, false);
+    let ir = macvm::compiler::ir::convert(vm, holder, method, &cfg, None);
     let ra = regalloc::regalloc(&ir);
     let mut asm = JasmAssembler::new();
     // None: this helper predates S11's guard and backs the already-committed
@@ -2531,6 +2535,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -2601,6 +2606,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
         })
         .collect();
     let caller_nm = Nmethod {
+        osr_cold_sends: 0,
         id: NmethodId(0),
         key_klass: target_klass,
         key_selector: caller_probe_sel,
@@ -2719,6 +2725,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -2789,6 +2796,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
         })
         .collect();
     let caller_nm = Nmethod {
+        osr_cold_sends: 0,
         id: NmethodId(0),
         key_klass: target_klass,
         key_selector: caller_probe_sel,
@@ -2971,6 +2979,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -3041,6 +3050,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
         })
         .collect();
     let caller_nm = Nmethod {
+        osr_cold_sends: 0,
         id: NmethodId(0),
         key_klass: klasses[0],
         key_selector: caller_probe_sel,
@@ -3217,6 +3227,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         deopt_sites: Vec::new(),
     };
     let caller_method = IrMethod {
+        osr_cold_sends: 0,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -3287,6 +3298,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
         })
         .collect();
     let caller_nm = Nmethod {
+        osr_cold_sends: 0,
         id: NmethodId(0),
         key_klass: target_klass,
         key_selector: caller_probe_sel,
@@ -3644,7 +3656,7 @@ fn allocation_fast_and_slow() {
 
     // The detection must fire: an inline Ir::Alloc, not a generic CallSend.
     let cfg = decode::decode(method);
-    let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+    let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, None);
     assert!(
         ir_method
             .blocks
@@ -3936,7 +3948,7 @@ fn deopt_resolve_frame_loc_from_real_regalloc() {
     InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, baz_target, epoch);
 
     let cfg = decode::decode(method);
-    let ir = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+    let ir = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, None);
     let ra = regalloc::regalloc(&ir);
 
     assert!(
@@ -4420,6 +4432,9 @@ fn deopt_through_inlined_nonleaf_body_rebuilds_both_frames() {
         eden_kb: None,
         jit: JitMode::Threshold(1),
     });
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     let smi_klass = vm.universe.smi_klass;
     // warm_bar = false → the helper's inner `self bar` stays Untaken → an
     // in-body trap once inlined.
@@ -4732,6 +4747,9 @@ fn deopt_through_inlined_block_rebuilds_block_frame() {
         eden_kb: None,
         jit: JitMode::Threshold(1),
     });
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     install_value_prims(&mut vm);
     let smi_klass = vm.universe.smi_klass;
 
@@ -5072,6 +5090,9 @@ fn deopt_through_capturing_block_aliases_home_context() {
         eden_kb: None,
         jit: JitMode::Threshold(1),
     });
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     install_value_prims(&mut vm);
     let smi_klass = vm.universe.smi_klass;
 
@@ -5264,7 +5285,7 @@ fn convert_nonfused_boolbr_into_merge() {
         "branchy boolean-temp method is eligible"
     );
     let cfg = decode::decode(m);
-    let ir = macvm::compiler::ir::convert(&vm, vm.universe.smi_klass, m, &cfg, false);
+    let ir = macvm::compiler::ir::convert(&vm, vm.universe.smi_klass, m, &cfg, None);
     assert!(!ir.blocks.is_empty());
 
     // And the differential: interp vs compiled, both polarities.
@@ -5513,6 +5534,9 @@ fn deopt_inside_inlined_loop_callee_rebuilds_frames() {
         eden_kb: None,
         jit: JitMode::Threshold(1),
     });
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     let smi_klass = vm.universe.smi_klass;
     let (spin, _lt, plus) = spin_loop_scenario(&mut vm);
     // Warm ONLY `+` (ic 1); `<` (ic 0) stays Empty → an in-loop trap.
@@ -5862,6 +5886,9 @@ fn depth3_deopt_in_block_in_callee_rebuilds_all_frames() {
         eden_kb: None,
         jit: JitMode::Threshold(1),
     });
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     install_value_prims(&mut vm);
     let smi_klass = vm.universe.smi_klass;
     let (upto, le, plus) = upto_scenario(&mut vm);
@@ -6242,7 +6269,7 @@ fn self_send_devirt_inlines_guard_free() {
 
     // No GuardKlass anywhere in the IR (the entry guard is the only check).
     let cfg = decode::decode(m);
-    let ir = macvm::compiler::ir::convert(&vm, k, m, &cfg, false);
+    let ir = macvm::compiler::ir::convert(&vm, k, m, &cfg, None);
     for blk in &ir.blocks {
         for op in &blk.code {
             assert!(
@@ -6656,7 +6683,7 @@ fn inlined_trap_deopt_restores_nonempty_pending_stack() {
     // Structural pin: the spliced `next` body's in-body trap must carry a
     // NON-empty caller pending stack — the shape this regression is about.
     let cfg = decode::decode(btw_m);
-    let ir = macvm::compiler::ir::convert(&vm, k, btw_m, &cfg, false);
+    let ir = macvm::compiler::ir::convert(&vm, k, btw_m, &cfg, None);
     let has_nonempty_pending = ir.blocks.iter().any(|b| {
         b.deopt_sites.iter().any(|d| {
             d.1.inline
@@ -7862,6 +7889,9 @@ fn b5_deopt_home(vm: &mut VmState) -> macvm::oops::wrappers::MethodOop {
 #[test]
 fn b5_deopt_inside_nlr_arm_bb_of_grafted_block() {
     let mut vm = loop_test_vm();
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     install_value_prims(&mut vm);
     let m = b5_deopt_home(&mut vm);
     let smi_klass = vm.universe.smi_klass;
@@ -7938,6 +7968,9 @@ fn b5_deopt_inside_grafted_block_gc_stress() {
         eden_kb: None,
         jit: JitMode::Threshold(1),
     });
+    // Pre-4c575c8 trap lowering: keep this materializer pin exercising
+    // the in-body-trap nested rebuild (see DebugState::cold_splice_traps).
+    vm.debug.cold_splice_traps = true;
     install_smi_prim(&mut vm, b"+", 1, 1);
     install_smi_prim(&mut vm, b"<", 1, 10);
     install_value_prims(&mut vm);

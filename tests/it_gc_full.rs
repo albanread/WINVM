@@ -311,6 +311,10 @@ fn stall_after_full() {
     let output = std::process::Command::new(exe)
         .arg("--selftest-alloc-loop")
         .env("MACVM_HEAP", "16")
+        // These tests pin exhaustion behavior at a specific tiny geometry;
+        // the 16 MiB default eden (40fc343) cannot even be carved from a
+        // 16 MiB reservation, so pin the old 4 MiB eden explicitly.
+        .env("MACVM_EDEN", "4096")
         .env_remove("MACVM_GC_STRESS")
         .output()
         .expect("failed to spawn macvm binary");

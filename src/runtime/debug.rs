@@ -110,6 +110,14 @@ pub struct DebugState {
     /// which force-cold makes total). Like `MACVM_TRACE=calls` it forces ICs
     /// cold; unlike it, it stops and services commands instead of just logging.
     pub step_calls: bool,
+    /// Test/diagnostic knob: compile COLD (Untaken-feedback) sends inside
+    /// INLINED bodies as uncommon traps — the pre-4c575c8 lowering. The
+    /// production default (false) lowers them to plain CallSends (the
+    /// markInputs: deopt-storm fix); the it_tier1 deopt-materializer pins
+    /// set this per-VM to keep exercising the nested-frame rebuild through
+    /// in-body traps (the materializer is lowering-agnostic, so the
+    /// coverage transfers). Also useful to reproduce pre-fix behavior.
+    pub cold_splice_traps: bool,
     /// DBG4 §2.2: the bci→source-line map per method, keyed
     /// `"Holder>>selector"` (` class` suffix for the class side). Lines are
     /// 1-based and RELATIVE to the method's own header (so they align with the

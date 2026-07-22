@@ -4036,6 +4036,12 @@ impl<'a> Translator<'a> {
     /// genuinely-cold inlined path just compiles as an unreached dispatch — a
     /// few bytes, zero runtime cost — instead of a trap.
     fn inlined_cold_send_traps(&self) -> bool {
+        // Test/diagnostic override (`DebugState::cold_splice_traps`): the
+        // deopt-materializer pins opt back into the pre-4c575c8 trap
+        // lowering per-VM.
+        if self.vm.debug.cold_splice_traps {
+            return self.cold_send_traps();
+        }
         false
     }
 

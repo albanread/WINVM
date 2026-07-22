@@ -62,6 +62,10 @@ fn eden_exhaustion_aborts() {
     let output = std::process::Command::new(exe)
         .arg("--selftest-alloc-loop")
         .env("MACVM_HEAP", "16")
+        // These tests pin exhaustion behavior at a specific tiny geometry;
+        // the 16 MiB default eden (40fc343) cannot even be carved from a
+        // 16 MiB reservation, so pin the old 4 MiB eden explicitly.
+        .env("MACVM_EDEN", "4096")
         // This self-test loop doesn't root its allocations via Handles, so
         // an inherited `MACVM_GC_STRESS=1` would let a mid-loop scavenge
         // reclaim eden back to empty every time — exhaustion would never
