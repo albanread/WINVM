@@ -370,3 +370,79 @@ in the README's OWN progression table (166 → 38 → 25 ms) aren't otherwise
 written down anywhere in this repo — only the endpoints (746 ms and this
 ~25 ms figure) are independently documented, here and in
 `docs/mandelbrot_walkthrough.md`.
+
+---
+
+## Addendum (2026-07-22): spliced-temp promotion — built, verified, GATED OFF by default
+
+**Status: dormant capability.** `MACVM_SPLICE_PROMOTE=1` selects
+`ir::promote_float_temps_spliced` (the generalized pass); the default runs the
+original root-temp-only `promote_float_temps` above, byte-identical to the
+pre-arc compiler. Commits: `ac1110e` (splice double fuse — ACTIVE, not gated),
+`65a924b` + `9cb4a81` (the promotion generalization — now flag-selected).
+
+### What the gated pass does
+
+The original promotion (B5 above) recognizes a ROOT method temp whose defs are
+direct `FBox` results and whose copies are deopt-only. The splicers thread
+values through `Move` plumbing on both sides (receiver copy into an inlined
+body; the boxed result hopping back out), so a loop-carried temp fed through an
+inlined float callee (`s := self scale: s`) failed every gate and re-boxed once
+per backedge. The generalization:
+
+- **Copy trees** — the candidate plus every vreg reachable through single-def
+  `Move`s promotes as one unit; node uses may be `FUnbox` (cancelled),
+  intra-tree `Move`s, or `Ret` (re-boxed ONCE at the return, per call).
+- **Def chase** — a def's source resolves through single-def `Move` hops to the
+  `FBox`/Double-const root; emptied hops are swept, orphaning their boxes for
+  rule 3.
+- **Defined-before-observed dataflow** over `regalloc::successors` replaces the
+  entry-block nil-init gate. Root-temp discriminator: nil-init IN BLOCK 0 (the
+  splicers emit mid-method nil-inits for callee temps — those are NOT root
+  temps and are scope-visible only at explicit inline deopt refs, so a caller
+  safepoint before the splice no longer disqualifies them).
+- **OSR refinement** — only root temps are rejected under OSR (the OSR entry
+  copies boxed interpreter slots, which hold exactly the root temps; spliced
+  temps are dead at every root loop header — a splice lives inside one send's
+  bci, and the interpreter can never be suspended mid-splice at an OSR point).
+  The OSR header is a second dataflow entry. `osr_bci` threads
+  convert → reduce_float_boxes → promote.
+- **Deopt** — `ValueLoc::DoubleSlot` is legal as an INLINED frame's receiver;
+  the materializer's receiver read boxes it (GC-safe as the frame's first
+  read). This arm stays active (unreachable while the flag is off).
+- **`MACVM_DBG_PROMOTE=<vreg>`** (debug builds) names the exact gate that
+  rejects that vreg — how both the discriminator and OSR bugs were found.
+
+### Measured results (why it is off)
+
+| measurement | result |
+|---|---|
+| FH shape (`s := self scale: s` loop), flag on | zero-alloc loop, one box at the return; bit-identical results incl. GC_STRESS |
+| level-4 inlining probe, Mandelbrot 240² | allocation 2055 → 29 MB (70×), scavenges 490 → 7, 17 → 14 ms/render |
+| **shipping config (level 1)** | **no change on any real workload** — the shapes it rewrites do not occur (no float callee inlines at the level-1 budget) |
+| targeted inlining experiment (float-dense callees get the level-4 per-call allowance, so `escapeAtRe:im:` splices at L1) | **REGRESSION 9.4 → 14.6 ms/render — built, measured, reverted (never committed)** |
+
+The targeted-inlining failure is the decisive datum, and it corrected the
+arc's premise: the `escapeAtRe:` call passes ALREADY-BOXED root temps (cr/ci
+box once per pixel regardless of the call), so call-boundary boxing was never
+part of the 6×-vs-C gap. With boxing eliminated AND promotion working, the
+merged method still loses on per-escape-iteration resident reloads after each
+loop `Poll` plus write-through stores in a 114-slot frame — more than the
+entire call overhead saved. Third consistent data point (global L2, global L4,
+targeted): **do not inline float kernels on this hardware.**
+
+### When to flip it on
+
+Re-run the full battery (world suite + census, GC_STRESS/DEOPT_STRESS parity
+on a spliced float shape, release+debug suites) and enable if either:
+
+1. a REAL workload demonstrates the box-per-backedge shape — small float
+   helpers (inline cost ≤ 30) called in hot loops at level 1; or
+2. the actual remaining cost class is fixed first — write-through elision
+   and/or Poll-resident reload reduction — at which point kernel inlining may
+   flip profitable and this promotion becomes its prerequisite.
+
+The remaining 6×-vs-C gap on the flagship is now precisely attributed:
+write-through stores per float def, entry klass guards, and resident reloads
+after each loop Poll — deopt/GC-visibility taxes, not boxing, calls, or
+compile budget.

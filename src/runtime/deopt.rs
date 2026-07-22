@@ -151,9 +151,10 @@ fn read_value(vm: &VmState, nm: &Nmethod, fv: &FrameView, loc: ValueLoc) -> Oop 
         // pending stacks, reexecute site stacks), which have `&mut vm` and
         // GC-safe ordering; this plain reader cannot.
         ValueLoc::DoubleSlot(_) => unreachable!(
-            "read_value: ValueLoc::DoubleSlot outside a slot/stack position \
-             (compiler bug — fp vregs are only ever temps or operand-stack \
-             copies, never receivers or ctx locations)"
+            "read_value: ValueLoc::DoubleSlot outside a slot/stack/receiver position \
+             (compiler bug — fp vregs are only ever temps, operand-stack \
+             copies, or an inlined frame's receiver copy, never ctx locations; \
+             every such position boxes at its own call site, not here)"
         ),
     }
 }
@@ -401,8 +402,19 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
             reexecute: site_reexecute,
         });
     if vm.options.trace.is_enabled("deopt") {
+        let ident = vm
+            .code_table
+            .get(frame.nm)
+            .map(|nm| {
+                format!(
+                    "{}>>{}",
+                    crate::memory::print_oop(&vm.universe, nm.key_klass.name()),
+                    nm.key_selector.as_string()
+                )
+            })
+            .unwrap_or_else(|| "?".to_string());
         eprintln!(
-            "[deopt] nm={:?} pc={:#x} fp={:#x} bci={} reexecute={} frames={} result={}",
+            "[deopt] nm={:?} {ident} pc={:#x} fp={:#x} bci={} reexecute={} frames={} result={}",
             frame.nm,
             frame.pc,
             frame.fp,
@@ -498,8 +510,23 @@ pub fn deoptimize_frame(vm: &mut VmState, frame: FrameView) -> DeoptResume {
         // Read receiver + unified slot values BEFORE any push, so a stray
         // realloc of the stack Vec during the pushes can't invalidate a
         // FrameSlot read (they're plain values now).
+        //
+        // Float fast-path (spliced-temp promotion): an INLINED frame's
+        // receiver may itself be a promoted raw-f64 copy (a spliced float
+        // callee's `self` — e.g. `s := self scale: s` promotes `s` and its
+        // splice-plumbing copies, one of which is the inline scope's
+        // receiver). Boxing HERE — unlike in the slot map below — is
+        // GC-safe: it is the FIRST read of this frame's iteration, so no
+        // unrooted raw `Oop` is in hand yet, and the slot reads below never
+        // allocate (their alloc cases defer to after the push).
+        let receiver = match vf.scope.receiver {
+            ValueLoc::DoubleSlot(off) => {
+                let bits = read_frame_slot_raw(frame.fp, off);
+                crate::memory::alloc::alloc_double(vm, f64::from_bits(bits)).oop()
+            }
+            loc => read_value(vm, nmethod_ref(vm, frame.nm), &frame, loc),
+        };
         let nm_ref = nmethod_ref(vm, frame.nm);
-        let receiver = read_value(vm, nm_ref, &frame, vf.scope.receiver);
         // S14 step 7-IV-b: an inlined scope's slot may hold an ELIDED CLOSURE
         // (a `do:`-style callee's block-arg temp). Its allocation must not run
         // mid-collect (the other raw `Oop`s here are unrooted until pushed), so
@@ -999,6 +1026,7 @@ pub(crate) mod test_support {
         let sel = format!("s{:x}", code.base as usize);
         let sel_sym = vm.universe.intern(sel.as_bytes());
         Nmethod {
+            osr_cold_sends: 0,
             id: NmethodId(0),
             key_klass: vm.universe.object_klass,
             key_selector: sel_sym,

@@ -2238,6 +2238,7 @@ mod tests {
 
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>, argc: u8) -> IrMethod {
         IrMethod {
+            osr_cold_sends: 0,
             blocks,
             vregs,
             pool: Vec::new(),
@@ -2658,6 +2659,7 @@ mod tests {
         use crate::compiler::ir::PoolEntry;
         // pool[0]=nil, [1]=mark(raw imm), [2]=klass oop.
         let method = IrMethod {
+            osr_cold_sends: 0,
             blocks: vec![IrBlock {
                 id: BlockId(0),
                 bci: 0,
@@ -3073,6 +3075,7 @@ mod tests {
             deopt_sites: Vec::new(),
         };
         let method = IrMethod {
+            osr_cold_sends: 0,
             blocks: vec![block0],
             vregs,
             pool: Vec::new(),

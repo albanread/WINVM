@@ -104,6 +104,24 @@ pub fn rt_osr_request(vm: &mut VmState, fp: usize, target_bci: u16) -> OsrOutcom
         return OsrOutcome::Declined;
     }
 
+    // OSR-heal: while the existing OSR nmethod is HALF-WARM
+    // (`Nmethod::is_half_warm_osr` — cold-site generic sends baked in), do
+    // NOT re-enter it and do NOT compile another: DECLINE, so this
+    // interpreted run continues PAST the trip point and warms the sites the
+    // first OSR compile never saw. Without this, every healing run would
+    // re-trip at the same backedge and take over into the same half-warm
+    // code, and the cold sites' interpreter ICs could never warm — the
+    // sieve's scan-increment site stayed Empty forever exactly this way.
+    if vm
+        .code_table
+        .lookup_osr(k, sel, target_bci)
+        .and_then(|i| vm.code_table.get(i))
+        .is_some_and(|nm| matches!(nm.state, NmState::Alive) && nm.is_half_warm_osr())
+    {
+        vm.stats.osr_declined += 1;
+        return OsrOutcome::Declined;
+    }
+
     let id: NmethodId = match vm.code_table.lookup_osr(k, sel, target_bci).filter(|&i| {
         vm.code_table
             .get(i)

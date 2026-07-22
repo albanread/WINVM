@@ -215,6 +215,44 @@ pub fn activate_method(
                     .get(id)
                     .is_some_and(|nm| matches!(nm.state, NmState::Alive))
             });
+            // OSR-heal (see `Nmethod::osr_cold_sends` and the c2i hatch's
+            // twin of this arm): a half-warm OSR nmethod is replaced by a
+            // warm whole-body compile instead of being reused. On this path
+            // the warmth comes from the PREVIOUS interpreted call(s) —
+            // ordinary dispatch has been declining the OSR nmethod
+            // (`resolve_target_entry`), so this method has been
+            // interpreting end-to-end since the OSR compile.
+            let existing = match existing {
+                Some(id)
+                    if vm
+                        .code_table
+                        .get(id)
+                        .is_some_and(|nm| nm.is_half_warm_osr()) =>
+                {
+                    let old_version = vm.code_table.get(id).unwrap().version;
+                    match crate::compiler::driver::compile_method_versioned(
+                        vm,
+                        k,
+                        m,
+                        old_version + 1,
+                    ) {
+                        Some(new_id) => {
+                            vm.stats.recompiles += 1;
+                            if vm.options.trace.is_enabled("jit") {
+                                eprintln!(
+                                    "[jit] OSR-heal: nm={} v{} -> nm={} (warm whole-body, \
+                                     activate path)",
+                                    id.0, old_version, new_id.0
+                                );
+                            }
+                            crate::codecache::flush::make_not_entrant_lazy(vm, id);
+                            Some(new_id)
+                        }
+                        None => Some(id),
+                    }
+                }
+                other => other,
+            };
             let compiled = existing.or_else(|| crate::compiler::driver::compile_method(vm, k, m));
             if let Some(id) = compiled {
                 if let Some(ic_idx) = ic_site {

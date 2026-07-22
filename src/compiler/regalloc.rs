@@ -97,7 +97,9 @@ fn is_safepoint(ir: &Ir) -> bool {
 /// Every block a given block's terminator can transfer control to —
 /// includes `fail`/`not_bool`/`slow` edges (the bailout block, or an S11
 /// deopt/slow-path block), not just the "normal" successors.
-fn successors(block: &IrBlock) -> Vec<BlockId> {
+/// `pub(crate)`: `ir::promote_float_temps`'s defined-before-use dataflow
+/// walks the same edge set (one definition, not a drifting copy).
+pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
     let mut succs = Vec::new();
     for ir in &block.code {
         match ir {
@@ -861,6 +863,10 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
         })
         .collect();
     order.sort_by_key(|&i| std::cmp::Reverse(intervals[i].end - intervals[i].start));
+    #[cfg(debug_assertions)]
+    let dbg = std::env::var("MACVM_DBG_RESIDENTS").is_ok();
+    #[cfg(not(debug_assertions))]
+    let dbg = false;
     for i in order {
         let (s, e) = (intervals[i].start, intervals[i].end);
         let (p, t) = if intervals[i].is_fp {
@@ -874,6 +880,12 @@ pub fn assign_residents(intervals: &mut [LiveInterval]) {
                 intervals[i].resident_reg = Some(*reg);
                 break;
             }
+        }
+        if dbg {
+            eprintln!(
+                "[residents] v{} len={} [{}..{}] fp={} -> {:?}",
+                intervals[i].vreg.0, e - s, s, e, intervals[i].is_fp, intervals[i].resident_reg
+            );
         }
     }
 }
@@ -1114,6 +1126,7 @@ mod tests {
 
     fn hand_method(blocks: Vec<IrBlock>, vregs: Vec<VRegInfo>) -> IrMethod {
         IrMethod {
+            osr_cold_sends: 0,
             blocks,
             vregs,
             pool: Vec::new(),

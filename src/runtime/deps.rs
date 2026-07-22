@@ -159,6 +159,7 @@ mod tests {
 
     fn fake_nmethod(key_klass: KlassOop, key_selector: SymbolOop, code: CodeHandle) -> Nmethod {
         Nmethod {
+            osr_cold_sends: 0,
             id: NmethodId(0),
             key_klass,
             key_selector,

@@ -869,7 +869,21 @@ pub(crate) fn resolve_target_entry(
         return vm.stubs.value_dispatch_addr(argc);
     }
     match vm.code_table.lookup(k, selector) {
-        Some(target_id) => {
+        // OSR-heal: a HALF-WARM OSR nmethod (cold-site generic sends baked
+        // mid-first-call — `Nmethod::is_half_warm_osr`) serves ONLY its
+        // loop-takeover entry. Ordinary sends take the c2i adapter below:
+        // the interpreted run warms every IC (re-takeover is suppressed in
+        // `rt_osr_request` so the run passes the old trip point), and the
+        // c2i hatch / `activate_method` then replace it with a warm
+        // whole-body compile. A fully-warm OSR nmethod (`osr_cold_sends`
+        // == 0) keeps the S24-L2 trigger-unification fast path unchanged.
+        Some(target_id)
+            if !vm
+                .code_table
+                .get(target_id)
+                .expect("code_table.lookup just returned this id")
+                .is_half_warm_osr() =>
+        {
             let target_nm = vm
                 .code_table
                 .get(target_id)
@@ -881,10 +895,11 @@ pub(crate) fn resolve_target_entry(
             };
             target_nm.code.base as u64 + off as u64
         }
-        // D6.1: no compiled nmethod yet -- a c2i adapter, callable exactly
-        // like a real nmethod's own `entry` (`bl`, x0=result on return),
-        // stands in until (if ever) `method` gets compiled for real.
-        None => {
+        // D6.1: no compiled nmethod yet (or a half-warm OSR one, declined
+        // above) -- a c2i adapter, callable exactly like a real nmethod's
+        // own `entry` (`bl`, x0=result on return), stands in until the
+        // method gets compiled for real.
+        _ => {
             let c2i_shared_addr = vm.stubs.c2i_shared_addr();
             vm.adapters
                 .get_or_make(&mut vm.code_cache, c2i_shared_addr, method)
@@ -1736,6 +1751,44 @@ pub unsafe extern "C" fn rt_interpret_call(
                     .get(id)
                     .is_some_and(|nm| matches!(nm.state, crate::codecache::nmethod::NmState::Alive))
             });
+            // OSR-heal: the interpreted run that just completed warmed EVERY
+            // IC (including the sites past the old OSR trip point — this is
+            // the one moment the whole design converges on). Replace the
+            // half-warm OSR nmethod with a warm whole-body compile, exactly
+            // the recompile-on-trap discipline: install the versioned
+            // replacement FIRST, then lazily retire the old code. One-shot
+            // by construction — the replacement has no OSR entry, so it can
+            // never be half-warm itself.
+            let existing = match existing {
+                Some(id)
+                    if vm
+                        .code_table
+                        .get(id)
+                        .is_some_and(|nm| nm.is_half_warm_osr()) =>
+                {
+                    let old_version = vm.code_table.get(id).unwrap().version;
+                    match crate::compiler::driver::compile_method_versioned(
+                        vm,
+                        k,
+                        method,
+                        old_version + 1,
+                    ) {
+                        Some(new_id) => {
+                            vm.stats.recompiles += 1;
+                            if vm.options.trace.is_enabled("jit") {
+                                eprintln!(
+                                    "[jit] OSR-heal: nm={} v{} -> nm={} (warm whole-body)",
+                                    id.0, old_version, new_id.0
+                                );
+                            }
+                            crate::codecache::flush::make_not_entrant_lazy(vm, id);
+                            Some(new_id)
+                        }
+                        None => Some(id), // ineligible now: keep the old code
+                    }
+                }
+                other => other,
+            };
             let compiled =
                 existing.or_else(|| crate::compiler::driver::compile_method(vm, k, method));
             if let Some(id) = compiled {

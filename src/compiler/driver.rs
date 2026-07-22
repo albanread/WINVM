@@ -868,7 +868,7 @@ fn compile_method_full(
     }
 
     let cfg = decode::decode(method);
-    let ir_method = ir::convert(vm, rcvr_klass, method, &cfg, osr_bci.is_some());
+    let ir_method = ir::convert(vm, rcvr_klass, method, &cfg, osr_bci);
     // T8 (osr_closure_design.md): the pre-decode gate above and convert's
     // own materialize decision must agree — an OSR-compiled has_ctx method
     // is ALWAYS the materialize form (same `escape::analyze` inputs).
@@ -1427,6 +1427,11 @@ fn compile_method_full(
 
     let nm = Nmethod {
         id: NmethodId(0), // overwritten by CodeTable::install
+        osr_cold_sends: if osr_bci.is_some() {
+            ir_method.osr_cold_sends
+        } else {
+            0
+        },
         key_klass: rcvr_klass,
         key_selector,
         code: h,
@@ -2547,7 +2552,7 @@ mod tests {
         InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, box_target, epoch);
 
         let cfg = decode::decode(method);
-        let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, None);
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();
@@ -2701,7 +2706,7 @@ mod tests {
         InterpreterIc::at(method, 1).set_mono(&mut vm, obj_klass, plus_target, epoch);
 
         let cfg = decode::decode(method);
-        let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir_method = ir::convert(&vm, vm.universe.smi_klass, method, &cfg, None);
         let ra = regalloc::regalloc(&ir_method);
 
         let mut asm = JasmAssembler::new();

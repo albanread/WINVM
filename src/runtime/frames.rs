@@ -1040,6 +1040,7 @@ mod tests {
         };
         let selector = vm.universe.intern(sel);
         vm.code_table.install(Nmethod {
+            osr_cold_sends: 0,
             id: NmethodId(0),
             key_klass: klass,
             key_selector: selector,

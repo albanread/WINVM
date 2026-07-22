@@ -264,9 +264,30 @@ pub struct Nmethod {
     /// nmethod is otherwise normal — same key, normal entries, scope descs
     /// everywhere; `rt_osr_request` reads this to pack the transfer buffer.
     pub osr_map: Option<crate::compiler::scopes::OsrMap>,
+    /// OSR-heal (the Cog-comparison sieve finding): how many send sites this
+    /// compile lowered to a generic `CallSend` BECAUSE their feedback was
+    /// `Untaken` — under an OSR compile, sites later in iteration order than
+    /// the loop-counter trip point (LOOP_COUNTER_LIMIT backedges into the
+    /// FIRST call) have never executed, and de-speculating them is correct
+    /// (S15) but bakes in-loop calls that (a) dispatch c2i→interpreter every
+    /// iteration for never-compilable smi primitives and (b) set
+    /// `crosses_call` on every loop-spanning interval, killing residency.
+    /// Nonzero + `osr_map` = a HALF-WARM OSR nmethod: ordinary sends decline
+    /// it (c2i instead), one fully-interpreted run warms every IC, and the
+    /// c2i escape hatch / activate_method replace it with a normal compile.
+    /// Zero keeps the S24-L2 trigger-unification behavior untouched.
+    pub osr_cold_sends: u16,
 }
 
 impl Nmethod {
+    /// See [`Nmethod::osr_cold_sends`]: an OSR-entried compile that baked
+    /// cold-site generic sends. Serves ONLY its OSR (loop-takeover) entry;
+    /// every ordinary-dispatch path treats the method as not-compiled so a
+    /// warm whole-body replacement can happen.
+    pub fn is_half_warm_osr(&self) -> bool {
+        self.osr_map.is_some() && self.osr_cold_sends > 0
+    }
+
     /// Every `Reloc` this nmethod's literal pool actually needs the GC to
     /// visit (`Oop`/`KeyKlassOop`; `RuntimeAddr`/`InternalWord`/
     /// `InlineCache` are never oops).
@@ -337,6 +358,7 @@ impl Nmethod {
         use crate::oops::layout::MEM_TAG;
         use crate::oops::Oop;
         Nmethod {
+            osr_cold_sends: 0,
             id: NmethodId(0),
             // SAFETY: test-only, tag-level shape is never dereferenced by
             // anything `test_fake`'s own callers exercise (same reasoning
@@ -967,6 +989,7 @@ mod tests {
         len: usize,
     ) -> Nmethod {
         Nmethod {
+            osr_cold_sends: 0,
             id: NmethodId(0),
             key_klass,
             key_selector,

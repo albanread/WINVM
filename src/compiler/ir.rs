@@ -690,6 +690,8 @@ enum NonLeafOutcome {
 }
 
 pub struct IrMethod {
+    /// OSR-heal: see `Nmethod::osr_cold_sends` (copied there by the driver).
+    pub osr_cold_sends: u16,
     pub blocks: Vec<IrBlock>,
     pub vregs: Vec<VRegInfo>,
     pub pool: Vec<PoolEntry>,
@@ -1069,6 +1071,47 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     }
 }
 
+/// Float fast-path: free-function twin of `Translator::is_double_inlinable`
+/// for an INLINED callee's own IC table (the splicers fuse their bodies'
+/// Double ops to `FUnbox`/`FArith`/`FBox`/`FCmpVal` exactly like their smi
+/// and array ops). Without this, every Double arithmetic/compare op in an
+/// inlined body decayed to a generic `CallSend` that BOXES its result — a
+/// zero-alloc float loop became box-per-op the moment it was spliced into a
+/// caller (measured: the level-4 inlining probe turned Mandelbrot's 8 MB
+/// into 1 GB of allocation, 12x slower, purely from this decay). Resolves
+/// via (guard klass, selector) rather than the raw IC target, for the same
+/// staleness reason as `classify_double_send`.
+fn is_double_inlinable_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
+    let ic = InterpreterIc::at(method, ic_idx);
+    if ic.guard().raw() != vm.universe.double_klass.oop().raw() {
+        return false;
+    }
+    let Some(target) =
+        crate::compiler::feedback::resolve_method_ro(vm, vm.universe.double_klass, ic.selector())
+    else {
+        return false;
+    };
+    crate::compiler::driver::DOUBLE_INLINE.contains(&target.primitive())
+}
+
+/// True iff the operand on top of `stack` (a send's LAST-pushed arg) was
+/// produced by a `ConstPool` load — i.e. it is a compile-time NON-smi literal
+/// (a Double, LargeInteger, …; a smi literal is an immediate `ConstSmi`, never
+/// pooled). Such an arg can never satisfy a `SmiArith`/`SmiCmp` operand guard,
+/// so fusing the send would emit a fail edge that traps on EVERY call — the
+/// `SmallInteger>>asFloat` (`^self * 1.0`) storm, the smi mirror of the
+/// `aDouble < <smi>` FUnbox storm. Declining the fuse lets the send fall through
+/// to a plain `CallSend`, whose shim runs `SmallInteger>>*`'s own coercing
+/// bytecode fallback (`self asFloat * arg`) with no deopt at all. The hot path
+/// (`x + 1`, `x < n` — smi-const or smi-var args) is untouched: a `ConstSmi`
+/// arg is not a `ConstPool`, and a variable arg has some other producer.
+fn smi_fuse_arg_is_pooled(stack: &[VReg], code: &[Ir]) -> bool {
+    matches!(
+        (stack.last(), code.last()),
+        (Some(&top), Some(Ir::ConstPool { dst, .. })) if *dst == top
+    )
+}
+
 fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKind {
     let ic = InterpreterIc::at(method, ic_idx);
     let target = smi_special_target(vm, &ic).expect(
@@ -1377,6 +1420,10 @@ struct Translator<'a> {
     inline_deps: Vec<(KlassOop, SymbolOop)>,
     /// S14 step 4b: recompilation level driving the inline budget
     /// (`inline::budget_for_level`). Tier-1 compiles are always level 1 today
+    /// OSR-heal: count of Untaken-feedback sites lowered to generic
+    /// `CallSend`s in THIS compile (only meaningful under OSR — see
+    /// `Nmethod::osr_cold_sends`).
+    osr_cold_sends: u16,
     /// (`driver::compile_method` sets `level: 1`); threaded here so the budget
     /// tracks it when higher levels arrive.
     level: u8,
@@ -2349,7 +2396,9 @@ impl<'a> Translator<'a> {
                         bci = next;
                         continue;
                     }
-                    if is_smi_inlinable_on(self.vm, callee, ic) {
+                    if is_smi_inlinable_on(self.vm, callee, ic)
+                        && !smi_fuse_arg_is_pooled(cstack.as_slice(), code.as_slice())
+                    {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = cstack.pop().expect("smi fuse: missing rhs");
                         let a_op = cstack.pop().expect("smi fuse: missing lhs");
@@ -2379,6 +2428,70 @@ impl<'a> Translator<'a> {
                         bci = next;
                         continue;
                     }
+                    // Float fast-path in the splice: `is_double_inlinable`'s
+                    // `_on` twin, same pattern as the smi/array twins above.
+                    if is_double_inlinable_on(self.vm, callee, ic) {
+                        debug_assert_eq!(inner_argc, 1, "DOUBLE_INLINE ops are all binary");
+                        // b4d55a8's storm guard, ported to the splice: a
+                        // compile-time smi arg (`x < 0` in an inlined body) can
+                        // never FUnbox — emit the coerced FConst instead,
+                        // byte-identical to the interpreter fallback's asDouble.
+                        let arg_const_smi: Option<i64> = match (cstack.last(), code.last()) {
+                            (Some(&top), Some(Ir::ConstSmi { dst, value })) if *dst == top => {
+                                Some(*value)
+                            }
+                            _ => None,
+                        };
+                        let b_op = cstack.pop().expect("double fuse: missing rhs");
+                        let a_op = cstack.pop().expect("double fuse: missing lhs");
+                        let mut reexec = cstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(b_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let ua = self.fresh_fp();
+                        let ub = self.fresh_fp();
+                        code.push(Ir::FUnbox {
+                            dst: ua,
+                            src: a_op,
+                            fail,
+                        });
+                        match arg_const_smi {
+                            Some(v) => code.push(Ir::FConst {
+                                dst: ub,
+                                bits: (v as f64).to_bits(),
+                            }),
+                            None => code.push(Ir::FUnbox {
+                                dst: ub,
+                                src: b_op,
+                                fail,
+                            }),
+                        }
+                        let dst = self.fresh(true);
+                        match classify_double_send(self.vm, callee, ic) {
+                            DoubleSendKind::Arith(op) => {
+                                let fd = self.fresh_fp();
+                                code.push(Ir::FArith {
+                                    op,
+                                    dst: fd,
+                                    a: ua,
+                                    b: ub,
+                                });
+                                code.push(Ir::FBox { dst, src: fd });
+                            }
+                            DoubleSendKind::Cmp(op) => {
+                                code.push(Ir::FCmpVal {
+                                    op,
+                                    dst,
+                                    a: ua,
+                                    b: ub,
+                                });
+                            }
+                        }
+                        cstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
 
                     // Consult the callee's own feedback (its IC). A cold
                     // (Untaken) inner IC lowers to a step-3 uncommon trap INSIDE
@@ -2387,6 +2500,15 @@ impl<'a> Translator<'a> {
                     // `CallSend`. We do NOT recursively inline (depth-1).
                     let inner_fb =
                         crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
+
+                    if self.osr
+                        && matches!(
+                            crate::compiler::inline::decide(&inner_fb),
+                            crate::compiler::inline::InlineDecision::Trap
+                        )
+                    {
+                        self.osr_cold_sends += 1; // OSR-heal census (see root arm)
+                    }
                     // Pop the inner send's operands off the callee's own stack.
                     let mut inner_args: Vec<VReg> = (0..inner_argc)
                         .map(|_| {
@@ -2408,7 +2530,7 @@ impl<'a> Translator<'a> {
                     let inner_static_self = inner_recv == callee_self
                         && callee_self_klass
                             .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                    if !inner_static_self && self.cold_send_traps() {
+                    if !inner_static_self && self.inlined_cold_send_traps() {
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
                         {
@@ -3085,7 +3207,9 @@ impl<'a> Translator<'a> {
                             bci = next;
                             continue;
                         }
-                        if is_smi_inlinable_on(self.vm, callee, ic) {
+                        if is_smi_inlinable_on(self.vm, callee, ic)
+                            && !smi_fuse_arg_is_pooled(cstack.as_slice(), bcode.as_slice())
+                        {
                             debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                             cstack_ph.truncate(cstack.len().saturating_sub(2));
                             let b_op = cstack.pop().expect("smi fuse: missing rhs");
@@ -3120,8 +3244,84 @@ impl<'a> Translator<'a> {
                             bci = next;
                             continue;
                         }
+                        // Float fast-path in the splice: `is_double_inlinable`'s
+                        // `_on` twin, same pattern as the smi twin above.
+                        if is_double_inlinable_on(self.vm, callee, ic) {
+                            debug_assert_eq!(inner_argc, 1, "DOUBLE_INLINE ops are all binary");
+                            // b4d55a8's storm guard, ported: a compile-time smi
+                            // arg can never FUnbox — emit the coerced FConst.
+                            let arg_const_smi: Option<i64> = match (cstack.last(), bcode.last()) {
+                                (Some(&top), Some(Ir::ConstSmi { dst, value })) if *dst == top => {
+                                    Some(*value)
+                                }
+                                _ => None,
+                            };
+                            cstack_ph.truncate(cstack.len().saturating_sub(2));
+                            let b_op = cstack.pop().expect("double fuse: missing rhs");
+                            let a_op = cstack.pop().expect("double fuse: missing lhs");
+                            let mut reexec = cstack.clone();
+                            reexec.push(a_op);
+                            reexec.push(b_op);
+                            let fail = self.fresh_inlined_trap_block(
+                                inner_bci,
+                                reexec,
+                                inline_proto.clone(),
+                            );
+                            let ua = self.fresh_fp();
+                            let ub = self.fresh_fp();
+                            bcode.push(Ir::FUnbox {
+                                dst: ua,
+                                src: a_op,
+                                fail,
+                            });
+                            match arg_const_smi {
+                                Some(v) => bcode.push(Ir::FConst {
+                                    dst: ub,
+                                    bits: (v as f64).to_bits(),
+                                }),
+                                None => bcode.push(Ir::FUnbox {
+                                    dst: ub,
+                                    src: b_op,
+                                    fail,
+                                }),
+                            }
+                            let dst = self.fresh(true);
+                            match classify_double_send(self.vm, callee, ic) {
+                                DoubleSendKind::Arith(op) => {
+                                    let fd = self.fresh_fp();
+                                    bcode.push(Ir::FArith {
+                                        op,
+                                        dst: fd,
+                                        a: ua,
+                                        b: ub,
+                                    });
+                                    bcode.push(Ir::FBox { dst, src: fd });
+                                }
+                                DoubleSendKind::Cmp(op) => {
+                                    bcode.push(Ir::FCmpVal {
+                                        op,
+                                        dst,
+                                        a: ua,
+                                        b: ub,
+                                    });
+                                }
+                            }
+                            cstack.push(dst);
+                            cstack_ph.push(false);
+                            bci = next;
+                            continue;
+                        }
                         let inner_fb =
                             crate::compiler::feedback::read_send_site(self.vm, callee, ic, None);
+                        if self.osr
+                            && matches!(
+                                crate::compiler::inline::decide(&inner_fb),
+                                crate::compiler::inline::InlineDecision::Trap
+                            )
+                        {
+                            self.osr_cold_sends += 1; // OSR-heal census (see root arm)
+                        }
+
                         let mut inner_args: Vec<VReg> = (0..inner_argc)
                             .map(|_| cstack.pop().expect("cfg splice: send missing arg"))
                             .collect();
@@ -3148,7 +3348,7 @@ impl<'a> Translator<'a> {
                         let inner_static_self = inner_recv == callee_self
                             && callee_self_klass
                                 .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                        if !inner_static_self && self.cold_send_traps() {
+                        if !inner_static_self && self.inlined_cold_send_traps() {
                             if let crate::compiler::inline::InlineDecision::Trap =
                                 crate::compiler::inline::decide(&inner_fb)
                             {
@@ -3428,6 +3628,30 @@ impl<'a> Translator<'a> {
     /// leaf/nonleaf body, block-arg in-callee graft, spliced block body).
     fn cold_send_traps(&self) -> bool {
         !self.osr
+    }
+
+    /// Whether a COLD (`Untaken`) send spliced from an INLINED callee body may
+    /// be speculatively lowered to a terminating uncommon trap. Always `false`
+    /// — the inlined counterpart to `cold_send_traps`, split off because the
+    /// two heal DIFFERENTLY. A ROOT send's trap re-executes in THIS method and
+    /// warms THIS method's own IC, so `recompile::note_uncommon_trap`'s profile
+    /// snapshot sees the change and recompiles it away. An INLINED send's trap
+    /// re-executes in the CALLEE and warms the CALLEE's IC — which the caller's
+    /// snapshot cannot reliably observe, so the recompile DECLINES ("profile
+    /// unchanged") and the trap fires FOREVER. Found in the wild as
+    /// `ScaleConstraint>>markInputs:` (grafts its OWN `inputsDo:` override,
+    /// whose `direction == #forward` site is cold when the customized
+    /// `markInputs:` compiles): the branch is taken every call, so v0 trapped
+    /// ~102×/run and every resnapshot declined to recompile — a permanent deopt
+    /// storm. `EqualityConstraint>>markInputs:` escaped it only by luck (it
+    /// inlines the SHARED `BinaryConstraint>>inputsDo:`, warm from every other
+    /// binary constraint). Reliability over speculation — the same principle
+    /// `cold_send_traps` already applies to OSR: emit the plain `CallSend`,
+    /// which dispatches correctly on the first call and never storms. A
+    /// genuinely-cold inlined path just compiles as an unreached dispatch — a
+    /// few bytes, zero runtime cost — instead of a trap.
+    fn inlined_cold_send_traps(&self) -> bool {
+        false
     }
 
     fn record_inline_dep(&mut self, klass: KlassOop, selector: SymbolOop) {
@@ -3767,7 +3991,9 @@ impl<'a> Translator<'a> {
                 code.push(Ir::CallSend { dst, site, args });
                 stack.push(dst);
             }
-            Instr::Send { ic, .. } if self.is_smi_inlinable(ic) => {
+            Instr::Send { ic, .. }
+                if self.is_smi_inlinable(ic) && !smi_fuse_arg_is_pooled(stack, code) =>
+            {
                 // S13 step 7b: a smi-overflow deopt is `reexecute=true` at the
                 // SEND's bci — the interpreter re-executes the WHOLE send, so
                 // the recorded operand stack must be the state BEFORE this
@@ -3918,6 +4144,26 @@ impl<'a> Translator<'a> {
                 });
                 let b = stack.pop().expect("double fuse: missing arg operand");
                 let a = stack.pop().expect("double fuse: missing receiver operand");
+                // A compile-time SmallInteger arg (`aFloat < 0`, `aFloat * 2`)
+                // can NEVER be FUnbox'd — a tagged smi is not a boxed Double, so
+                // the unbox fails on EVERY call and the whole fused send deopts
+                // forever: a STEADY-STATE trap storm, because the literal is
+                // invariant so the recompile snapshot never changes and keeps
+                // declining ("profile unchanged"). Left the whole world's
+                // `Double>>truncated` (`^self < 0 ifTrue:…`) at ~1200 deopts per
+                // test-suite run. The interpreter fallback `Double>>< aNumber`
+                // takes is `^self < aNumber asDouble` — a plain smi→f64
+                // coercion — so do exactly that at COMPILE time via `FConst`,
+                // byte-identical (`n asDouble` is the same `n as f64`, same
+                // precision loss for a >2^53 smi). The hot Double-vs-Double path
+                // is UNTOUCHED: its arg is not a `ConstSmi`, so it falls through
+                // to the unbox below. The arg's `ConstSmi` is deliberately left
+                // in `code` — the fail edge's `reexec_stack` still names `b`, so
+                // a receiver-guard miss re-executes correctly.
+                let arg_const_smi: Option<i64> = match code.last() {
+                    Some(Ir::ConstSmi { dst, value }) if *dst == b => Some(*value),
+                    _ => None,
+                };
                 let ua = self.fresh_fp();
                 let ub = self.fresh_fp();
                 code.push(Ir::FUnbox {
@@ -3925,11 +4171,17 @@ impl<'a> Translator<'a> {
                     src: a,
                     fail: fail_id,
                 });
-                code.push(Ir::FUnbox {
-                    dst: ub,
-                    src: b,
-                    fail: fail_id,
-                });
+                match arg_const_smi {
+                    Some(v) => code.push(Ir::FConst {
+                        dst: ub,
+                        bits: (v as f64).to_bits(),
+                    }),
+                    None => code.push(Ir::FUnbox {
+                        dst: ub,
+                        src: b,
+                        fail: fail_id,
+                    }),
+                }
                 match classify_double_send(self.vm, self.method, ic) {
                     DoubleSendKind::Arith(op) => {
                         let fd = self.fresh_fp();
@@ -4250,6 +4502,19 @@ impl<'a> Translator<'a> {
                         *trapped = true;
                         return split; // (always None on the trap path)
                     }
+                }
+
+                // OSR-heal census: an `Untaken` site reaching the generic
+                // CallSend below (the S15 de-speculation kept it from
+                // trapping) marks this OSR compile HALF-WARM — see
+                // `Nmethod::osr_cold_sends`.
+                if self.osr
+                    && matches!(
+                        crate::compiler::inline::decide(&feedback),
+                        crate::compiler::inline::InlineDecision::Trap
+                    )
+                {
+                    self.osr_cold_sends += 1;
                 }
 
                 let ic_view = InterpreterIc::at(self.method, ic);
@@ -5443,7 +5708,9 @@ impl<'a> Translator<'a> {
                         bci = next;
                         continue;
                     }
-                    if is_smi_inlinable_on(self.vm, block, inner_ic_idx) {
+                    if is_smi_inlinable_on(self.vm, block, inner_ic_idx)
+                        && !smi_fuse_arg_is_pooled(bstack.as_slice(), code.as_slice())
+                    {
                         debug_assert_eq!(inner_argc, 1, "SMI_INLINE ops are all binary");
                         let b_op = bstack.pop().expect("smi fuse: missing rhs");
                         let a_op = bstack.pop().expect("smi fuse: missing lhs");
@@ -5473,12 +5740,83 @@ impl<'a> Translator<'a> {
                         bci = next;
                         continue;
                     }
+                    // Float fast-path in the splice: `is_double_inlinable`'s
+                    // `_on` twin, same pattern as the smi twin above.
+                    if is_double_inlinable_on(self.vm, block, inner_ic_idx) {
+                        debug_assert_eq!(inner_argc, 1, "DOUBLE_INLINE ops are all binary");
+                        // b4d55a8's storm guard, ported: a compile-time smi
+                        // arg can never FUnbox — emit the coerced FConst.
+                        let arg_const_smi: Option<i64> = match (bstack.last(), code.last()) {
+                            (Some(&top), Some(Ir::ConstSmi { dst, value })) if *dst == top => {
+                                Some(*value)
+                            }
+                            _ => None,
+                        };
+                        let b_op = bstack.pop().expect("double fuse: missing rhs");
+                        let a_op = bstack.pop().expect("double fuse: missing lhs");
+                        let mut reexec = bstack.clone();
+                        reexec.push(a_op);
+                        reexec.push(b_op);
+                        let fail =
+                            self.fresh_inlined_trap_block(inner_bci, reexec, inline_proto.clone());
+                        let ua = self.fresh_fp();
+                        let ub = self.fresh_fp();
+                        code.push(Ir::FUnbox {
+                            dst: ua,
+                            src: a_op,
+                            fail,
+                        });
+                        match arg_const_smi {
+                            Some(v) => code.push(Ir::FConst {
+                                dst: ub,
+                                bits: (v as f64).to_bits(),
+                            }),
+                            None => code.push(Ir::FUnbox {
+                                dst: ub,
+                                src: b_op,
+                                fail,
+                            }),
+                        }
+                        let dst = self.fresh(true);
+                        match classify_double_send(self.vm, block, inner_ic_idx) {
+                            DoubleSendKind::Arith(op) => {
+                                let fd = self.fresh_fp();
+                                code.push(Ir::FArith {
+                                    op,
+                                    dst: fd,
+                                    a: ua,
+                                    b: ub,
+                                });
+                                code.push(Ir::FBox { dst, src: fd });
+                            }
+                            DoubleSendKind::Cmp(op) => {
+                                code.push(Ir::FCmpVal {
+                                    op,
+                                    dst,
+                                    a: ua,
+                                    b: ub,
+                                });
+                            }
+                        }
+                        bstack.push(dst);
+                        bci = next;
+                        continue;
+                    }
                     let inner_fb = crate::compiler::feedback::read_send_site(
                         self.vm,
                         block,
                         inner_ic_idx,
                         None,
                     );
+                    if self.osr
+                        && matches!(
+                            crate::compiler::inline::decide(&inner_fb),
+                            crate::compiler::inline::InlineDecision::Trap
+                        )
+                    {
+                        self.osr_cold_sends += 1; // OSR-heal census (see root arm)
+                    }
+
                     let mut inner_args: Vec<VReg> = (0..inner_argc)
                         .map(|_| {
                             bstack
@@ -5499,7 +5837,7 @@ impl<'a> Translator<'a> {
                     let inner_static_self = inner_recv == block_self
                         && block_self_klass
                             .is_some_and(|k| self.devirt_self_target(k, inner_sel).is_some());
-                    if !inner_static_self && self.cold_send_traps() {
+                    if !inner_static_self && self.inlined_cold_send_traps() {
                         if let crate::compiler::inline::InlineDecision::Trap =
                             crate::compiler::inline::decide(&inner_fb)
                         {
@@ -6077,6 +6415,17 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
     }
 }
 
+/// `MACVM_SPLICE_PROMOTE=1` selects [`promote_float_temps_spliced`] (the
+/// dormant generalized promotion) over the default root-temp-only pass.
+/// Read once per process — a compile-path check, but cached anyway per the
+/// standing env-var-cost lesson.
+fn splice_promote_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MACVM_SPLICE_PROMOTE").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 /// Float fast-path rule 4 (`docs/float_fastpath_design.md` B5): FLOAT-TEMP
 /// PROMOTION — a method temp that provably always holds a Double becomes an
 /// unboxed fp vreg, living raw across the whole loop (including safepoints:
@@ -6362,6 +6711,650 @@ fn promote_float_temps(m: &mut IrMethod) {
     }
 }
 
+/// SPLICED-TEMP PROMOTION — `promote_float_temps` generalized to copy
+/// trees. **GATED OFF by default; selected by `MACVM_SPLICE_PROMOTE=1`**
+/// (`splice_promote_enabled`). Built 2026-07-22, kept dormant: it is green
+/// under the full battery (world suite, GC/deopt stress, byte-identical
+/// census) but no REAL workload demonstrated a win — the targeted-inlining
+/// hypothesis it was built to enable was falsified (inlining the Mandelbrot
+/// kernel regressed 9.4→14.6 ms/render even with this promotion working;
+/// the call passed already-boxed temps, so call-boundary boxing was never
+/// the gap). Full story: docs/float_fastpath_design.md addendum. Flip the
+/// flag on (and re-run the battery) if a real workload shows box-per-
+/// backedge splice shapes — small float helpers inlined at level 1.
+///
+/// Generalized (spliced-temp promotion) from single root temps to a COPY
+/// TREE: the candidate `t` plus every vreg reachable from it through
+/// single-def `Move`s — exactly the plumbing the splicers thread a value
+/// through (the receiver copy into an inlined body; the boxed result
+/// hopping back out). Without the tree, a loop-carried temp fed through an
+/// inlined float callee re-boxed once per backedge forever
+/// (`s := self scale: s`: the FBox flowed result → splice-return hop → t,
+/// and t → splice receiver hop → FUnbox — neither side matched the old
+/// direct-def / deopt-only-copy tests).
+///
+/// A candidate `t` (with its tree) qualifies iff ALL hold:
+/// - every real def of `t` is `Move { t, s }` with `s` a tree member
+///   (an fp-to-fp move after promotion) or resolvable to an `FBox` result /
+///   Double constant by CHASING single-def `Move` hops (splice-return
+///   plumbing; the emptied hops are swept, orphaning their FBox for rule 3);
+/// - every tree node's every op use is an `FUnbox { _, src: node }`
+///   (rewritten to a direct fp read, guard deleted) or the defining `Move`
+///   of another tree node / of `t` itself. Deopt references are fine on any
+///   node — the node is promoted and its references become `DoubleSlot`
+///   (the materializer re-boxes, including as an inlined frame's receiver);
+/// - DEFINED-BEFORE-OBSERVED, by forward dataflow over the real CFG
+///   (`regalloc::successors`): no path from entry reaches an observation
+///   point while `t` is still undefined — else promotion would show a
+///   garbage f64 where the interpreter shows nil. Observation points are
+///   every op use of a tree node, every deopt site naming one, and — for a
+///   ROOT TEMP (detected by its mandatory nil-init) — every safepoint,
+///   since a root temp is implicitly visible in EVERY safepoint's scope. A
+///   non-temp vreg (splice plumbing, spliced callee temps) is scope-visible
+///   only where deopt metadata names it explicitly. This subsumes the old
+///   "real def in the entry block before any safepoint" gate;
+/// - no tree node appears in a merge entry stack; the nil-init (root temps
+///   only) is unique.
+///
+/// GATED OFF for OSR compiles: the OSR entry copies INTERPRETER slot values
+/// (boxed oops) into compiled frame slots — an fp slot would need an
+/// unbox-with-guard at OSR entry, deferred.
+fn promote_float_temps_spliced(m: &mut IrMethod, osr_bci: Option<u16>) {
+    use std::collections::{HashMap, HashSet};
+    let n = m.vregs.len();
+
+    // ── Whole-method censuses. ──────────────────────────────────────────
+    let mut fbox_src: HashMap<u32, VReg> = HashMap::new(); // FBox dst → fp src
+    let mut const_double: HashMap<u32, u64> = HashMap::new(); // ConstPool dst → f64 bits
+    let mut op_uses: Vec<u32> = vec![0; n];
+    let mut entry_used = vec![false; n];
+    let mut funbox_uses: Vec<u32> = vec![0; n];
+    let mut move_copy_of: Vec<Vec<u32>> = vec![Vec::new(); n]; // t → its copies c
+    let mut bad_def = vec![false; n];
+    let mut move_defs: Vec<u32> = vec![0; n];
+    let mut move_single_src: Vec<u32> = vec![u32::MAX; n]; // valid iff move_defs==1
+    let mut nil_init_def: Vec<u32> = vec![0; n];
+    // ROOT-temp discriminator: a root temp's mandatory nil-init sits in
+    // BLOCK 0 (the translation prologue); a SPLICED callee temp's nil-init
+    // (the splicers mirror the interpreter's activation nil-init) sits
+    // mid-method, inside the spliced region. Only a root temp is
+    // implicitly visible at every safepoint's scope — a spliced temp is
+    // visible only where inline deopt metadata names it explicitly.
+    let mut nil_init_in_entry = vec![false; n];
+    let mut deopt_used = vec![false; n];
+    let mut ret_uses: Vec<u32> = vec![0; n];
+    // Per BLOCK INDEX: each deopt site's (code index, referenced vregs) —
+    // the dataflow's explicit observation points.
+    let mut deopt_refs: Vec<Vec<(u32, Vec<u32>)>> = vec![Vec::new(); m.blocks.len()];
+
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for v in &b.entry_stack {
+            entry_used[v.0 as usize] = true;
+        }
+        for (ci, raw) in &b.deopt_sites {
+            let mut refs: Vec<u32> = Vec::new();
+            for v in &raw.stack {
+                deopt_used[v.0 as usize] = true;
+                refs.push(v.0);
+            }
+            let mut lvl = raw.inline.as_ref();
+            while let Some(site) = lvl {
+                deopt_used[site.receiver.0 as usize] = true;
+                refs.push(site.receiver.0);
+                for v in &site.slots {
+                    deopt_used[v.0 as usize] = true;
+                    refs.push(v.0);
+                }
+                for v in &site.caller_pending_stack {
+                    deopt_used[v.0 as usize] = true;
+                    refs.push(v.0);
+                }
+                lvl = site.parent.as_deref();
+            }
+            deopt_refs[bi].push((*ci, refs));
+        }
+        for op in &b.code {
+            op.uses(|v| op_uses[v.0 as usize] += 1);
+            match op {
+                Ir::FBox { dst, src } => {
+                    fbox_src.insert(dst.0, *src);
+                }
+                Ir::ConstPool { dst, lit } => {
+                    let e = &m.pool[lit.0 as usize];
+                    if e.kind == Some(RelocKind::Oop) {
+                        if let Some(d) = crate::oops::wrappers::DoubleOop::try_from(
+                            crate::oops::Oop::from_raw(e.value),
+                        ) {
+                            const_double.insert(dst.0, d.value().to_bits());
+                        }
+                    }
+                    // Def classification: EXACTLY the nil literal is the
+                    // mandatory temp nil-init; any other ConstPool def (a
+                    // Symbol, a non-Double literal…) disqualifies outright.
+                    if *lit == m.nil_lit {
+                        nil_init_def[dst.0 as usize] += 1;
+                        if bi == 0 {
+                            nil_init_in_entry[dst.0 as usize] = true;
+                        }
+                    } else {
+                        bad_def[dst.0 as usize] = true;
+                    }
+                }
+                Ir::FUnbox { src, .. } => funbox_uses[src.0 as usize] += 1,
+                Ir::Move { dst, src } => {
+                    move_copy_of[src.0 as usize].push(dst.0);
+                    move_defs[dst.0 as usize] += 1;
+                    move_single_src[dst.0 as usize] = src.0;
+                }
+                Ir::Ret { val } => ret_uses[val.0 as usize] += 1,
+                _ => {}
+            }
+            // Non-Move/non-ConstPool defs disqualify their targets.
+            if !matches!(op, Ir::Move { .. } | Ir::ConstPool { .. }) {
+                op.defs(|v| bad_def[v.0 as usize] = true);
+            }
+        }
+    }
+
+    // CFG predecessors (by block INDEX) for the defined-before-observed
+    // dataflow — same edge set the allocator walks.
+    let idx_of: HashMap<u32, usize> = m
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id.0, i))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); m.blocks.len()];
+    for (bi, b) in m.blocks.iter().enumerate() {
+        for s in crate::compiler::regalloc::successors(b) {
+            if let Some(&si) = idx_of.get(&s.0) {
+                preds[si].push(bi);
+            }
+        }
+    }
+
+    // Chase single-def Move plumbing (the splice-return hops) back to an
+    // FBox result or a Double constant. Hop vregs are recorded for the
+    // dead-plumbing sweep once their consumer is rewritten away.
+    enum Root {
+        Fp(VReg),
+        Bits(u64),
+    }
+    let chase = |start: u32, hops: &mut Vec<u32>| -> Option<Root> {
+        let mut v = start;
+        for _ in 0..16 {
+            if let Some(&fp) = fbox_src.get(&v) {
+                return Some(Root::Fp(fp));
+            }
+            if let Some(&bits) = const_double.get(&v) {
+                return Some(Root::Bits(bits));
+            }
+            let vi = v as usize;
+            if move_defs[vi] == 1 && nil_init_def[vi] == 0 && !bad_def[vi] {
+                hops.push(v);
+                v = move_single_src[vi];
+            } else {
+                return None;
+            }
+        }
+        None
+    };
+
+    // ── Qualification. ──────────────────────────────────────────────────
+    // A chased def's rewrite, planned at its exact (block index, op index).
+    enum DefRw {
+        Fp(VReg, VReg),   // Move { dst, fp_src }
+        Bits(VReg, u64),  // FConst { dst, bits }
+    }
+    struct Promo {
+        tree: Vec<u32>,
+        def_plan: HashMap<(usize, usize), DefRw>,
+        hops: Vec<u32>,
+    }
+    let mut promos: Vec<Promo> = Vec::new();
+    let mut claimed = vec![false; n]; // each vreg joins at most one tree
+    // Debugger (MACVM_DBG_IR's promotion companion): MACVM_DBG_PROMOTE=<N>
+    // prints which gate rejects vreg N in every compile that considers it.
+    // Debug builds only, stderr.
+    #[cfg(debug_assertions)]
+    let dbg_promote: Option<u32> = std::env::var("MACVM_DBG_PROMOTE")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    #[cfg(not(debug_assertions))]
+    let dbg_promote: Option<u32> = None;
+    macro_rules! dbg_reject {
+        ($t:expr, $($msg:tt)*) => {
+            if dbg_promote == Some($t) {
+                eprintln!("[promote] v{} REJECTED: {}", $t, format!($($msg)*));
+            }
+        };
+    }
+    // The OSR header's IR block index (first match = the original block —
+    // spliced blocks share the send's bci but are appended after all
+    // originals). It is a SECOND dataflow entry below: OSR execution begins
+    // there, with every candidate value undefined.
+    let osr_header: Option<usize> =
+        osr_bci.and_then(|bci| m.blocks.iter().position(|b| b.bci == bci as usize));
+    'cand: for t in 1..n as u32 {
+        let ti = t as usize;
+        // OSR compile: a ROOT temp is copied into the frame as a BOXED
+        // interpreter slot by the OSR entry — promoting it would type-pun
+        // that copy. Spliced temps/plumbing are dead at the header and
+        // stay eligible.
+        if osr_bci.is_some() && nil_init_in_entry[ti] {
+            dbg_reject!(t, "OSR compile: root temp (OSR entry copies boxed slots)");
+            continue;
+        }
+        if m.vregs[ti].is_fp
+            || claimed[ti]
+            || move_defs[ti] == 0
+            || bad_def[ti]
+            || entry_used[ti]
+            || nil_init_def[ti] > 1
+        {
+            dbg_reject!(
+                t,
+                "basic filter: is_fp={} claimed={} move_defs={} bad_def={} entry_used={} \
+                 nil_inits={}",
+                m.vregs[ti].is_fp,
+                claimed[ti],
+                move_defs[ti],
+                bad_def[ti],
+                entry_used[ti],
+                nil_init_def[ti]
+            );
+            continue;
+        }
+
+        // The copy tree: t plus every vreg reachable via single-def Moves.
+        let mut tree: Vec<u32> = vec![t];
+        let mut in_tree: HashSet<u32> = HashSet::new();
+        in_tree.insert(t);
+        let mut wl: Vec<u32> = vec![t];
+        while let Some(node) = wl.pop() {
+            for &c in &move_copy_of[node as usize] {
+                if c == t {
+                    continue; // Move { t, node } — a def of t, gated below
+                }
+                if in_tree.contains(&c) {
+                    dbg_reject!(t, "second Move def into tree node v{c}");
+                    continue 'cand; // a second Move def into a tree node
+                }
+                let ci = c as usize;
+                if move_defs[ci] == 1
+                    && nil_init_def[ci] == 0
+                    && !bad_def[ci]
+                    && !entry_used[ci]
+                    && !claimed[ci]
+                    && !m.vregs[ci].is_fp
+                {
+                    in_tree.insert(c);
+                    tree.push(c);
+                    wl.push(c);
+                } else {
+                    dbg_reject!(
+                        t,
+                        "invalid copy v{c} of v{node}: move_defs={} nil_inits={} bad_def={} \
+                         entry_used={} claimed={} is_fp={}",
+                        move_defs[ci],
+                        nil_init_def[ci],
+                        bad_def[ci],
+                        entry_used[ci],
+                        claimed[ci],
+                        m.vregs[ci].is_fp
+                    );
+                    continue 'cand;
+                }
+            }
+        }
+        // Every node's op uses are exactly its FUnboxes + its outgoing
+        // Moves (each verified above to land in the tree or redefine t) +
+        // its Rets (re-boxed once at the return — per call, not per
+        // iteration; the rewrite's final pass).
+        for &node in &tree {
+            let ni = node as usize;
+            if op_uses[ni]
+                != funbox_uses[ni] + move_copy_of[ni].len() as u32 + ret_uses[ni]
+            {
+                dbg_reject!(
+                    t,
+                    "node v{node} use mismatch: op_uses={} funbox={} moves={} rets={}",
+                    op_uses[ni],
+                    funbox_uses[ni],
+                    move_copy_of[ni].len(),
+                    ret_uses[ni]
+                );
+                continue 'cand;
+            }
+        }
+
+        // Every FUnbox of a tree node must be cleanly cancellable: all uses
+        // of its dst in the same block, after the unbox, before any
+        // redefinition of that node (only t can be redefined — copies are
+        // single-def), accounting for the dst's every use.
+        for b in &m.blocks {
+            for (i, op) in b.code.iter().enumerate() {
+                let (u, node) = match op {
+                    Ir::FUnbox { dst, src, .. } if in_tree.contains(&src.0) => (dst.0, src.0),
+                    _ => continue,
+                };
+                // Deleting the FUnbox deletes u's only def — u must not be
+                // named by any deopt metadata.
+                if deopt_used[u as usize] {
+                    dbg_reject!(t, "FUnbox dst v{u} of node v{node} is deopt-referenced");
+                    continue 'cand;
+                }
+                let mut in_window = 0u32;
+                let mut redefined = false;
+                for later in &b.code[i + 1..] {
+                    let mut uses_u = false;
+                    later.uses(|v| {
+                        if v.0 == u {
+                            uses_u = true;
+                        }
+                    });
+                    if uses_u {
+                        if redefined {
+                            dbg_reject!(t, "FUnbox dst v{u}: use stranded past a redefinition of v{node}");
+                            continue 'cand; // stranded past a redefinition
+                        }
+                        in_window += 1;
+                    }
+                    let mut defs_node = false;
+                    later.defs(|v| {
+                        if v.0 == node {
+                            defs_node = true;
+                        }
+                    });
+                    if defs_node {
+                        redefined = true;
+                    }
+                }
+                if in_window != op_uses[u as usize] {
+                    dbg_reject!(t, "FUnbox dst v{u}: cross-block use ({in_window} of {})", op_uses[u as usize]);
+                    continue 'cand; // cross-block use of the unboxed value
+                }
+            }
+        }
+
+        // Every real def of t: a tree member (fp-to-fp move after
+        // promotion) or a chase to an FBox / Double-const root.
+        let mut def_plan: HashMap<(usize, usize), DefRw> = HashMap::new();
+        let mut hops: Vec<u32> = Vec::new();
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for (i, op) in b.code.iter().enumerate() {
+                if let Ir::Move { dst, src } = op {
+                    if dst.0 != t || in_tree.contains(&src.0) {
+                        continue;
+                    }
+                    match chase(src.0, &mut hops) {
+                        Some(Root::Fp(fp)) => {
+                            def_plan.insert((bi, i), DefRw::Fp(*dst, fp));
+                        }
+                        Some(Root::Bits(bits)) => {
+                            def_plan.insert((bi, i), DefRw::Bits(*dst, bits));
+                        }
+                        None => {
+                            dbg_reject!(t, "def Move src v{} unresolvable (chase failed)", src.0);
+                            continue 'cand;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Defined-before-observed dataflow: no path from entry may reach an
+        // observation of the tree while t is still undefined (promotion
+        // would show garbage f64 where the interpreter shows nil). A ROOT
+        // temp (nil-init in the entry block) is implicitly visible in
+        // EVERY safepoint's scope; a spliced callee temp (nil-init inside
+        // the spliced region) and plain plumbing are visible only where
+        // deopt metadata names them explicitly — which is what lets a
+        // mid-method spliced init qualify despite the caller's earlier
+        // safepoints.
+        let is_temp = nil_init_def[ti] == 1 && nil_init_in_entry[ti];
+        let nb = m.blocks.len();
+        let mut first_obs: Vec<Option<usize>> = vec![None; nb];
+        let mut first_def: Vec<Option<usize>> = vec![None; nb];
+        for (bi, b) in m.blocks.iter().enumerate() {
+            for (i, op) in b.code.iter().enumerate() {
+                let mut observes = false;
+                op.uses(|v| {
+                    if in_tree.contains(&v.0) {
+                        observes = true;
+                    }
+                });
+                if is_temp && is_safepoint_op(op) {
+                    observes = true;
+                }
+                if observes && first_obs[bi].is_none() {
+                    first_obs[bi] = Some(i);
+                }
+                if first_def[bi].is_none() {
+                    if let Ir::Move { dst, .. } = op {
+                        if dst.0 == t {
+                            first_def[bi] = Some(i);
+                        }
+                    }
+                }
+            }
+            for (ci, refs) in &deopt_refs[bi] {
+                if refs.iter().any(|r| in_tree.contains(r)) {
+                    let at = *ci as usize;
+                    if first_obs[bi].is_none_or(|o| at < o) {
+                        first_obs[bi] = Some(at);
+                    }
+                }
+            }
+        }
+        let mut undef_in = vec![false; nb];
+        let mut undef_out = vec![false; nb];
+        loop {
+            let mut changed = false;
+            for bi in 0..nb {
+                let inn = bi == 0
+                    || Some(bi) == osr_header
+                    || preds[bi].iter().any(|&p| undef_out[p]);
+                let out = if first_def[bi].is_some() { false } else { inn };
+                if inn != undef_in[bi] || out != undef_out[bi] {
+                    undef_in[bi] = inn;
+                    undef_out[bi] = out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for bi in 0..nb {
+            if !undef_in[bi] {
+                continue;
+            }
+            if let Some(o) = first_obs[bi] {
+                // Observed while possibly undefined — unless a real def in
+                // this block strictly precedes the observation.
+                if first_def[bi].is_none_or(|d| o <= d) {
+                    dbg_reject!(t, "observed-while-undef in block index {bi} (obs at {o}, def {:?})", first_def[bi]);
+                    continue 'cand;
+                }
+            }
+        }
+
+        for &v in &tree {
+            claimed[v as usize] = true;
+        }
+        promos.push(Promo {
+            tree,
+            def_plan,
+            hops,
+        });
+    }
+    if promos.is_empty() {
+        return;
+    }
+
+    // ── Rewrite (shapes pre-verified above — no bail-outs from here). ───
+    let mut is_promoted = vec![false; n];
+    let mut all_hops: HashSet<u32> = HashSet::new();
+    let mut def_plan_all: HashMap<(usize, usize), DefRw> = HashMap::new();
+    for p in promos {
+        for &v in &p.tree {
+            is_promoted[v as usize] = true;
+            m.vregs[v as usize].is_fp = true;
+            m.vregs[v as usize].is_oop = false;
+        }
+        all_hops.extend(p.hops);
+        def_plan_all.extend(p.def_plan);
+    }
+    for (bi, b) in m.blocks.iter_mut().enumerate() {
+        let len = b.code.len();
+        let mut delete = vec![false; len];
+        for i in 0..len {
+            // A chased def of t: retarget the Move straight at the FBox's
+            // fp source (or bake the constant), bypassing the plumbing.
+            if let Some(rw) = def_plan_all.get(&(bi, i)) {
+                b.code[i] = match rw {
+                    DefRw::Fp(dst, fp) => Ir::Move {
+                        dst: *dst,
+                        src: *fp,
+                    },
+                    DefRw::Bits(dst, bits) => Ir::FConst {
+                        dst: *dst,
+                        bits: *bits,
+                    },
+                };
+                continue;
+            }
+            let replace: Option<Ir> = match &b.code[i] {
+                Ir::ConstPool { dst, .. } if is_promoted[dst.0 as usize] => {
+                    // The provably-dead nil-init — value irrelevant; an
+                    // FConst keeps the def so interval shapes are unchanged.
+                    Some(Ir::FConst { dst: *dst, bits: 0 })
+                }
+                Ir::Move { dst, src } if is_promoted[dst.0 as usize] => {
+                    if is_promoted[src.0 as usize] {
+                        None // intra-tree fp-to-fp move — correct as marked
+                    } else {
+                        unreachable!(
+                            "promotion qualified a def it can't rewrite \
+                             (non-tree defs are all in def_plan)"
+                        )
+                    }
+                }
+                _ => None,
+            };
+            if let Some(new_op) = replace {
+                b.code[i] = new_op;
+                continue;
+            }
+            let (u, t) = match &b.code[i] {
+                Ir::FUnbox { dst, src, .. } if is_promoted[src.0 as usize] => (dst.0, *src),
+                _ => continue,
+            };
+            for later in b.code[i + 1..].iter_mut() {
+                rewrite_uses(later, u, t);
+            }
+            delete[i] = true;
+        }
+        if delete.iter().any(|&d| d) {
+            let mut removed = 0u32;
+            let mut removed_before: Vec<u32> = vec![0; len + 1];
+            for (i, item) in delete.iter().enumerate() {
+                removed_before[i] = removed;
+                if *item {
+                    removed += 1;
+                }
+            }
+            removed_before[len] = removed;
+            let mut idx = 0usize;
+            b.code.retain(|_| {
+                let keep = !delete[idx];
+                idx += 1;
+                keep
+            });
+            for (ci, _) in b.deopt_sites.iter_mut() {
+                *ci -= removed_before[*ci as usize];
+            }
+        }
+    }
+
+    // ── Dead-plumbing sweep. The chased hops' consumers were retargeted
+    // above; a hop whose value is now completely unobserved (no op use, no
+    // deopt/entry reference) deletes with its defining Move — iterated,
+    // since each deletion frees the next hop up the chain. The FBoxes this
+    // orphans die in rule 3, which runs after promotion. A hop that IS
+    // still referenced (e.g. pinned in a reexecute stack) simply keeps its
+    // Move and its boxed value — correct, just unoptimized. ──────────────
+    while !all_hops.is_empty() {
+        let mut uses: Vec<u32> = vec![0; n];
+        for b in &m.blocks {
+            for op in &b.code {
+                op.uses(|v| uses[v.0 as usize] += 1);
+            }
+        }
+        let dead: HashSet<u32> = all_hops
+            .iter()
+            .copied()
+            .filter(|&h| {
+                uses[h as usize] == 0 && !deopt_used[h as usize] && !entry_used[h as usize]
+            })
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for h in &dead {
+            all_hops.remove(h);
+        }
+        for b in &mut m.blocks {
+            let len = b.code.len();
+            let mut removed = 0u32;
+            let mut removed_before: Vec<u32> = vec![0; len + 1];
+            let mut keep: Vec<bool> = Vec::with_capacity(len);
+            for (i, op) in b.code.iter().enumerate() {
+                removed_before[i] = removed;
+                let del = matches!(op, Ir::Move { dst, .. } if dead.contains(&dst.0));
+                keep.push(!del);
+                if del {
+                    removed += 1;
+                }
+            }
+            removed_before[len] = removed;
+            if removed == 0 {
+                continue;
+            }
+            let mut it = keep.iter();
+            b.code.retain(|_| *it.next().unwrap());
+            for (ci, _) in b.deopt_sites.iter_mut() {
+                *ci -= removed_before[*ci as usize];
+            }
+        }
+    }
+
+    // ── Ret re-boxing. A promoted value that IS the method's answer boxes
+    // exactly once, at the return — per call, never per iteration. `Ret` is
+    // always its block's final op, so the insertion shifts no deopt-site
+    // index (sites never point at or past a terminator). ─────────────────
+    let mut ret_fixes: Vec<(usize, VReg)> = Vec::new();
+    for (bi, b) in m.blocks.iter().enumerate() {
+        if let Some(Ir::Ret { val }) = b.code.last() {
+            if is_promoted[val.0 as usize] {
+                ret_fixes.push((bi, *val));
+            }
+        }
+    }
+    for (bi, val) in ret_fixes {
+        let boxed = VReg(m.vregs.len() as u32);
+        m.vregs.push(VRegInfo {
+            is_oop: true,
+            is_fp: false,
+        });
+        let b = &mut m.blocks[bi];
+        let ret_ix = b.code.len() - 1;
+        b.code[ret_ix] = Ir::FBox { dst: boxed, src: val };
+        b.code.push(Ir::Ret { val: boxed });
+    }
+}
+
 /// `op` reads `from` → make it read `to` (fp positions only — the promotion
 /// only ever rewrites fp-valued reads: FArith/FCmp*/FBox sources and fp
 /// Moves).
@@ -6417,7 +7410,7 @@ fn is_safepoint_op(ir: &Ir) -> bool {
 ///
 /// Runs after [`copy_propagate`] (which collapses the Move chains between an
 /// `FBox` and its consumer `FUnbox`, making rule 2's def visible in-block).
-pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr: bool) {
+pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr_bci: Option<u16>) {
     // ── Rule 2: per-block cancel. ────────────────────────────────────────
     for b in &mut m.blocks {
         let mut boxed_src: HashMap<u32, VReg> = HashMap::new(); // FBox dst → fp src
@@ -6517,9 +7510,14 @@ pub(crate) fn reduce_float_boxes(m: &mut IrMethod, osr: bool) {
     }
 
     // ── Rule 4 (docs B5): float-temp promotion — before the sink/census
-    // so the temp-store FBoxes it orphans die in rule 3 below. OSR compiles
-    // are gated out (the OSR entry copies boxed interpreter slots).
-    if !osr {
+    // so the temp-store FBoxes it orphans die in rule 3 below. The DEFAULT
+    // is the original root-temp-only pass (OSR compiles gated out — the
+    // OSR entry copies boxed interpreter slots). MACVM_SPLICE_PROMOTE=1
+    // selects the generalized spliced-temp pass instead — dormant
+    // capability, see `promote_float_temps_spliced`'s own doc.
+    if splice_promote_enabled() {
+        promote_float_temps_spliced(m, osr_bci);
+    } else if osr_bci.is_none() {
         promote_float_temps(m);
     }
 
@@ -6685,8 +7683,9 @@ pub fn convert(
     rcvr_klass: KlassOop,
     method: MethodOop,
     cfg: &Cfg,
-    osr: bool,
+    osr_bci: Option<u16>,
 ) -> IrMethod {
+    let osr = osr_bci.is_some();
     let (entry_depth, _max_stack_depth) = compute_entry_depths(method, cfg);
     let sources = entry_stack_sources(cfg, &entry_depth);
 
@@ -6826,6 +7825,7 @@ pub fn convert(
         // sets `level: 1`); the inline budget scales with this when higher
         // levels arrive (S14 step 8).
         level: 1,
+        osr_cold_sends: 0,
         const_class: HashMap::new(),
         // S14 step 7-I: run the escape pre-pass iff M creates a literal closure.
         // Hoisted above (A3b needs it for the materialize decision); a
@@ -7435,6 +8435,7 @@ pub fn convert(
     };
 
     let mut irm = IrMethod {
+        osr_cold_sends: t.osr_cold_sends,
         blocks: ir_blocks,
         vregs: t.vregs,
         pool: t.pool.entries,
@@ -7463,7 +8464,7 @@ pub fn convert(
         method_pool_ix,
     };
     copy_propagate(&mut irm);
-    reduce_float_boxes(&mut irm, osr);
+    reduce_float_boxes(&mut irm, osr_bci);
     irm
 }
 
@@ -7538,7 +8539,7 @@ mod tests {
         // call_site, no site_feedback entry, but ONE UncommonTrap deopt site.
         {
             let cfg = decode::decode(method);
-            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+            let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
             assert_eq!(
                 ir.site_feedback.len(),
                 ir.call_sites.len(),
@@ -7566,7 +8567,7 @@ mod tests {
         let epoch = vm.ic_epoch;
         InterpreterIc::at(method, 0).set_mono(&mut vm, klass, target, epoch);
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
         assert_eq!(
             ir.call_sites.len(),
             1,
@@ -7620,7 +8621,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, recv_klass, val, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         // No CallSend for the inlined site.
         assert_eq!(ir.call_sites.len(), 0, "inlined leaf → no CallSend");
@@ -7692,7 +8693,7 @@ mod tests {
         InterpreterIc::at(method, 0).set_mono(&mut vm, smi_klass, id_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
         assert_eq!(ir.call_sites.len(), 0, "^self inlined, no CallSend");
         let smi_guards = ir
             .blocks
@@ -7740,7 +8741,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, plus_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         let (fail, a, b_) = ir.blocks[0]
             .code
@@ -7833,7 +8834,7 @@ mod tests {
         ic.set_mono(&mut vm, smi_klass, lt_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         let block0 = &ir.blocks[0];
         assert!(
@@ -7897,7 +8898,7 @@ mod tests {
         ic.set_mono(&mut vm, double_klass, lt_method, epoch);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, double_klass, method, &cfg, false);
+        let ir = convert(&vm, double_klass, method, &cfg, None);
 
         // Scan every block, not just `blocks[0]`: the double fuse finishes its
         // guard-fail trap block DURING the send's own translation, so the
@@ -7941,7 +8942,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         // Same block layout as decode::tests::leaders_if_else: 0=condition,
         // 1=true arm, 2=false arm, 3=merge.
@@ -7982,7 +8983,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 0);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         // 2 real blocks (push+jump, then the target) -- S11 step 7: no
         // extra synthetic block anymore unless one is actually NEEDED (a
@@ -8031,7 +9032,7 @@ mod tests {
         let method = b.finish(&mut vm, sel, 0, 1);
 
         let cfg = decode::decode(method);
-        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, false);
+        let ir = convert(&vm, vm.universe.smi_klass, method, &cfg, None);
 
         let stored_vreg = ir.blocks[0]
             .code
