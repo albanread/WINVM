@@ -423,3 +423,60 @@ This is a calling-convention change, not a peephole — correct-by-construction
 for GC/deopt (slots stay canonical) but with a corruption failure mode in the
 stub conversion, so it wants a focused session with full stress-validation
 budget, not a rushed tail-end implementation.
+
+## 2026-07-22 — two 9cb272e findings from the arm64 (MACVM) port
+
+MACVM ported the special selectors the same day (its `20b37b0`, writing the
+A64 sequences this repo cfg-gated off) and its verification pass surfaced two
+defects that are present in THIS tree too. Confirmed against this checkout,
+not just the Mac's.
+
+### 1. `Ir::BoolNot` has NEVER fired — the canonical-flip check can't pass
+
+`bool_not_speculatable`'s canonical check (ir.rs:1793) ends with
+
+    matches!(i1, Instr::ReturnTos) && n1 >= len
+
+but the frontend **always appends a dead trailing `ret_self`** after a method
+body (frontend/codegen.rs ~1046: "`ret_self` is always appended; … this
+trailing `ret_self` is simply unreachable dead code"). So the live
+`True>>not` / `False>>not` (`^false` / `^true`, world/02_nil_boolean.mst)
+decode as `PushFalse; ReturnTos; ReturnSelf` with `len = 3, n1 = 2` —
+`n1 >= len` is false for EVERY method this frontend compiles, `canonical`
+returns false, and every `not` site silently stays a generic `CallSend`.
+9cb272e's richards 85 → 41-44 was therefore RefCmpVal + F7 alone; the
+~90k-activations/run `not` half of the census was never captured, and its
+"the first cut silently DECLINED every method containing them" lesson has a
+quieter sibling: this decline is invisible because generic sends are
+correct, just slow.
+
+Fix (as landed on the Mac): drop the `n1 >= len` conjunct — anything after
+an unconditional `ReturnTos` is unreachable, so the leading
+`PushTrue/PushFalse; ReturnTos` pair fully determines the method's
+behavior:
+
+    let (i1, _n1) = decode_at(m, n0);
+    matches!(i1, Instr::ReturnTos)
+
+Verify it actually fires this time (the Mac's probe recipe): debug build,
+`MACVM_DBG_IR=<sel>` on a method whose `not` site has boolean evidence —
+expect `BoolNot { … }` in the dump, not `CallSend`; then send `not` to a
+non-boolean through the warmed compiled site — expect exactly ONE deopt
+line and the correct DNU-free result. On the Mac this half was worth
+richards 21.0 → 20.1 ms on top of RefCmpVal; given this port's higher
+per-activation costs it plausibly closes a similar or larger slice of the
+remaining ~1.15x richards gap vs Cog.
+
+### 2. `successors()` omits `BoolNot`'s trap edge — latent, benign today
+
+regalloc.rs's `successors()` fail-edge group (SmiArith / SmiCmpVal /
+ArrayAt / ArrayAtPut / FUnbox / VecArith / GuardKlass) never learned
+`Ir::BoolNot { fail, .. }`. Nothing breaks TODAY only because
+`reverse_postorder` seeds a DFS from every unvisited block, so the
+CFG-unreachable trap block still gets laid out and its label binds — it
+just lands at the tail of the block order instead of near its guard. But
+the function is the compiler's single source of CFG truth (block layout,
+instruction numbering, and — once fixed — any future dominance/liveness
+consumer), and an edge it lies about is a trap for the next analysis that
+trusts it. One-line fix: add `| Ir::BoolNot { fail, .. }` to the
+`succs.push(*fail)` group.
