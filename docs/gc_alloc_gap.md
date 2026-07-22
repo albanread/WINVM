@@ -68,3 +68,19 @@ once they are gone.
 1. Eden default bump (one line + the standard battery).
 2. Customized-`self basicNew` alloc fusion (the big general win).
 3. Scavenge batching (secondary).
+
+---
+
+## Outcome (same day): both fixes landed, gap closed to a TIE
+
+- `40fc343` — default eden 4 -> 16 MiB (cost 2).
+- `ad2846f` — `alloc_site_klass_on`: spliced constructors' `self basicNew`
+  fuses to the inline eden bump in both in-body splice walks (cost 1; the
+  constructor pattern routes through the CFG splicer — its `| a |` temp
+  makes the nonleaf splicer decline, which is where a first attempt
+  silently missed; found by probing the check, not by re-reading it).
+
+Measured end state (matched-source harness): **alloc x5 = 7 ms on BOTH
+VMs — a dead tie**, from 46 ms (6.6x behind). The full comparison now
+reads: MACVM wins or ties every bench. Cost 3 (scavenge batching) was
+never needed for parity and remains unimplemented.
