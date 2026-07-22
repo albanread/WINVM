@@ -51,13 +51,19 @@ interpreted output** — enforced by a differential test suite of **5,860
 in-language tests run four ways** (interpreter, JIT, JIT + GC-stress, JIT +
 deopt-stress) that must all agree.
 
-### WINVM vs Cog — the honest yardstick
+### Measured against Cog — a yardstick, not a competition
 
-The meaningful bar for a Smalltalk JIT isn't its own interpreter (ours is
-deliberately simple); it's a mature production system. So WINVM is measured
-against **Cog** (Pharo 13, the x86-64 OpenSmalltalk JIT), on the same machine
-(i7-12700), both processes pinned to one performance core and timed with a
-microsecond clock:
+WINVM does not compete with Squeak, Pharo, or Cog in any way. Those are
+mature production systems with decades of engineering and real communities
+behind them; this is a from-scratch Windows VM exploring the Strongtalk
+lineage. But a JIT still needs an honest yardstick — not its own interpreter
+(ours is deliberately simple) — and Cog, the OpenSmalltalk JIT that powers
+Squeak and Pharo, is the meaningful one: same language, same benchmarks, and
+it sets a high bar.
+
+So WINVM is measured against **Cog** (Pharo 13, the x86-64 OpenSmalltalk
+JIT), on the same machine (i7-12700), both processes pinned to one
+performance core and timed with a microsecond clock:
 
 | benchmark | WINVM (JIT) | Cog | |
 |-----------|-------------|-----|---|
