@@ -594,7 +594,7 @@ warm; results checksum-verified on both VMs. Warm ms per 10 reps:
 | arith | 49-50 | 39 | **0.8 — faster** |
 | dict | 16-17 | 13 | **0.8 — faster** |
 | fib | 135-183 | 194-196 | 1.1-1.4 |
-| sieve | <1 | 28-29 | **>=30 — the big loss** |
+| sieve | <1 | ~~28-29~~ 3 | ~~>=30~~ **~3 (smi-speculation fix, same day)** |
 | alloc | 17-34 | 138-141 | **4-8 — the other loss** |
 
 Reading, with causes separated by confidence:
@@ -608,12 +608,21 @@ Reading, with causes separated by confidence:
   bump exists and works — the `basicNew`-send path just never reaches
   it. The fix is IR-level (lower a Mono `basicNew`/`new` send on a
   statically-known klass to `Ir::Alloc`) and would benefit the Mac too.
-- **sieve, >=30x behind — cause HYPOTHESIZED, not yet verified.** Pure
-  `Array at:`/`at:put:` loops. Suspects: per-access klass+bounds guards,
-  back-edge Poll cost, and spill-all keeping loop state in memory.
-  Needs a `disasm-native` review of the emitted loop before believing
-  any of that. (Cog's sub-millisecond result was surprising enough to
-  re-check: the 1899-primes checksum is verified on both sides.)
+- **sieve — DIAGNOSED AND FIXED same day (28ms -> 3ms).** The
+  hypothesis above was wrong: the array ops and most arithmetic DID
+  inline. The real cause: OSR fired mid-first-call (fill loop's 8190
+  backedges + ~1800 inner-sweep iterations crossed the 10k threshold)
+  BEFORE the loop-tail sites `count := count + 1` and the outer
+  increment had ever executed — their ICs were Empty, so they compiled
+  as full CallSends inside the hottest loop (~18k sends/run), and being
+  plain sends they never trapped, so no recompile ever healed them.
+  Fix: Cog-parity speculation — an Empty IC whose selector's
+  SmallInteger implementation is a SMI_INLINE primitive lowers to the
+  guarded inline op anyway (`smi_special_target`). Wrong speculation
+  costs one reexecute-trap + one recompile (the customized profile hash
+  sees the warmed IC); all-smi sites never deopt at all. The remaining
+  ~3x vs Cog is loop code quality (spill-all across the back-edge Poll),
+  not send overhead.
 - **fib, 1.1-1.4x behind:** send-heavy recursion; plausibly the same
   send-overhead story as sieve's loop overhead, at smaller magnitude.
 

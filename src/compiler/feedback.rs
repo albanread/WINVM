@@ -133,7 +133,7 @@ fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
 /// feedback behind a passing klass guard is a silent miscompile. Resolving
 /// through (klass, selector) is immune to both; `None` means the site has no
 /// verifiable target and the caller must not speculate.
-fn resolve_target(
+pub(crate) fn resolve_target(
     vm: &VmState,
     target: Oop,
     klass: KlassOop,

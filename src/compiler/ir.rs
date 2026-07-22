@@ -981,6 +981,64 @@ enum SmiSendKind {
     Cmp(CmpOp),
 }
 
+/// The SmallInteger method a smi-special site dispatches to — accepting
+/// BOTH a warm Mono-smi IC and a stone-cold EMPTY one.
+///
+/// The Empty case is the Cog-parity speculation (2026-07, the sieve
+/// investigation): an OSR compile mid-first-call reads loop-TAIL sites
+/// that have never executed — sieve's `count := count + 1` and its outer
+/// increment sat exactly after the point the backedge counter tripped, so
+/// they compiled as full CallSends inside the hottest loop (~18k sends
+/// per sieveOnce, a 30x loss against Cog) and, being plain sends, never
+/// trapped, so no recompile ever healed them. Cog never consults
+/// feedback for arithmetic at all.
+///
+/// Speculating smi on an Empty `+`/`<`/... site costs, when wrong, one
+/// reexecute-trap plus one recompile — and the customized profile hash
+/// now sees the IC that trap warms, so the recompile actually lowers the
+/// truth. When right (overwhelmingly, for these selectors), the site is
+/// tight inline code with no warmup and no deopt, ever.
+///
+/// Resolution is against the LIVE world (`resolve_method_ro`), so a guest
+/// that redefines `SmallInteger>>+` to a non-primitive method disables
+/// the speculation rather than being miscompiled.
+fn smi_special_target(vm: &VmState, ic: &InterpreterIc) -> Option<MethodOop> {
+    let guard = ic.guard();
+    if guard.raw() == vm.universe.smi_klass.oop().raw() {
+        return mono_target_method(vm, ic, vm.universe.smi_klass);
+    }
+    if guard.raw() == vm.universe.nil_obj.raw() {
+        return crate::compiler::feedback::resolve_method_ro(
+            vm,
+            vm.universe.smi_klass,
+            ic.selector(),
+        );
+    }
+    None
+}
+
+/// The method behind a Mono IC's target, whichever of its TWO
+/// representations the slot holds. `set_mono` stores a MethodOop;
+/// `set_mono_compiled` stores a SmallInt-encoded NmethodId — and a bare
+/// `MethodOop::try_from(ic.target())` silently fails on the latter.
+///
+/// That silent failure was a compounding performance bug: the moment a
+/// primitive method itself got COMPILED (prim shims made `SmallInteger>>+`
+/// and `basicNew` compilable), every IC dispatching to it was repatched to
+/// the NmethodId form, and every gate below — smi-inline, array-op,
+/// alloc-site — began declining sites it had accepted the day before.
+/// Loop increments compiled as full CallSends (sieve: ~18k sends per run,
+/// a 30x loss against Cog); `basicNew` sites lost the `Ir::Alloc` inline
+/// bump (alloc: 4-8x against Cog). The feedback layer already had the
+/// dual decoder (`resolve_target`); the gates just never used it.
+fn mono_target_method(
+    vm: &VmState,
+    ic: &InterpreterIc,
+    guard_klass: crate::oops::wrappers::KlassOop,
+) -> Option<MethodOop> {
+    crate::compiler::feedback::resolve_target(vm, ic.target(), guard_klass, ic.selector())
+}
+
 /// S14 opt: is `method`'s send site `ic_idx` a mono-smi-guarded `SMI_INLINE`
 /// primitive — the fuse-to-`SmiArith`/`SmiCmpVal` class? The free-function
 /// twin of `Translator::is_smi_inlinable`, usable on an INLINED callee's own
@@ -989,10 +1047,7 @@ enum SmiSendKind {
 /// machine code and being a chain of stub calls).
 fn is_smi_inlinable_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> bool {
     let ic = InterpreterIc::at(method, ic_idx);
-    if ic.guard().raw() != vm.universe.smi_klass.oop().raw() {
-        return false;
-    }
-    let Some(target) = MethodOop::try_from(ic.target()) else {
+    let Some(target) = smi_special_target(vm, &ic) else {
         return false;
     };
     crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
@@ -1006,7 +1061,7 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
     if ic.guard().raw() != vm.universe.array_klass.oop().raw() {
         return None;
     }
-    let target = MethodOop::try_from(ic.target())?;
+    let target = mono_target_method(vm, &ic, vm.universe.array_klass)?;
     match target.primitive() {
         26 => Some(false),
         27 => Some(true),
@@ -1016,14 +1071,10 @@ fn array_op_kind_on(vm: &VmState, method: MethodOop, ic_idx: u16) -> Option<bool
 
 fn classify_smi_send(vm: &VmState, method: MethodOop, ic_idx: u16) -> SmiSendKind {
     let ic = InterpreterIc::at(method, ic_idx);
-    assert_eq!(
-        ic.guard().raw(),
-        vm.universe.smi_klass.oop().raw(),
-        "classify_smi_send: IC {ic_idx} is not mono-smi-guarded -- driver::eligible should \
-         have rejected this method (compiler bug if this fires)"
+    let target = smi_special_target(vm, &ic).expect(
+        "classify_smi_send: site is neither mono-smi nor an Empty smi-special -- \
+         is_smi_inlinable should have rejected it (compiler bug if this fires)",
     );
-    let target = MethodOop::try_from(ic.target())
-        .expect("classify_smi_send: mono IC target must be a CompiledMethod");
     match target.primitive() {
         1 => SmiSendKind::Arith(SmiOp::Add),
         2 => SmiSendKind::Arith(SmiOp::Sub),
@@ -1584,7 +1635,7 @@ impl<'a> Translator<'a> {
         if ic.guard().raw() != self.vm.universe.array_klass.oop().raw() {
             return None;
         }
-        let target = MethodOop::try_from(ic.target())?;
+        let target = mono_target_method(self.vm, &ic, self.vm.universe.array_klass)?;
         match target.primitive() {
             26 => Some(false), // at:
             27 => Some(true),  // at:put:
@@ -1594,10 +1645,9 @@ impl<'a> Translator<'a> {
 
     fn is_smi_inlinable(&self, ic_idx: u16) -> bool {
         let ic = InterpreterIc::at(self.method, ic_idx);
-        if ic.guard().raw() != self.vm.universe.smi_klass.oop().raw() {
-            return false;
-        }
-        let Some(target) = MethodOop::try_from(ic.target()) else {
+        // Accepts warm Mono-smi AND cold Empty (the Cog-parity
+        // speculation) — see `smi_special_target`.
+        let Some(target) = smi_special_target(self.vm, &ic) else {
             return false;
         };
         crate::compiler::driver::SMI_INLINE.contains(&target.primitive())
@@ -1664,7 +1714,8 @@ impl<'a> Translator<'a> {
         if ic.argc() != 0 {
             return None;
         }
-        let target = MethodOop::try_from(ic.target())?;
+        let guard = crate::oops::wrappers::KlassOop::try_from(ic.guard())?;
+        let target = mono_target_method(self.vm, &ic, guard)?;
         if target.primitive() != PRIM_BASIC_NEW {
             return None;
         }
