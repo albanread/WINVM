@@ -343,3 +343,83 @@ fixed per-activation cost is paid most often.
   proper parallel move, uses a direct 5-byte `call rel32` (the near-host
   placement win is in place), and does a 2-instruction NLR check. The send is
   tight; its cost is the spill-all traffic *around* it (F3), not the call.
+
+---
+
+## F3c — the register-residence project, fully scoped (2026-07-22, reconnaissance)
+
+Deep reconnaissance (GC frame scan, oop-map format, deopt materializer, call
+stubs) turned the vague "structural ceiling" into a concrete, staged, de-risked
+plan. The headline findings and the plan:
+
+### What the code actually guarantees today
+- **GC scans stack slots only** (`memory/roots.rs::each_code_root` reads
+  `[fp − 8·(slot+1)]` per the per-safepoint `OopMap` bitmap; `oopmap.rs`). No
+  register concept anywhere in the map.
+- **Deopt reads stack slots only** (`scopes.rs::ValueLoc` has `FrameSlot`/
+  `DoubleSlot`/`ConstPool`/`ConstSmi`/`Nil`/`ElidedClosure` — no `Register`;
+  `resolve_frame_loc` only matches `Assignment::Spill`). The trapped register
+  file is captured on the PROBE/crash path (`capture_regs_win`) but NOT on the
+  `0xDE00/0xDE01` deopt path.
+- **nmethod prologues save NO callee-saved registers** (`push rbp; mov rbp,rsp;
+  sub rsp,N` — nothing else). A callee freely clobbers RBX/RSI/RDI/R12–R14. The
+  only save of the Win64 callee bank is once at the interpreter→compiled
+  boundary in `call_stub` (`stubs_x64.rs` `SAVED`). This is *why* residency
+  (F3b) reloads after every call: the register does not survive a compiled call.
+- **Multiple stubs rely on "spill-all ⇒ callee-saved regs are dead" and clobber
+  them as scratch.** The deopt-return trampoline is explicit
+  (`stubs_x64.rs:556`: "Safe to clobber RBX/RSI here: nothing live is in them,
+  by the spill-all-at-safepoints invariant"). PIC/mega/ffi stubs use RBX/RSI but
+  push/pop them (already compliant).
+
+### The split that de-risks everything
+There are TWO F3c's, and they have very different risk:
+
+**F3c-oops (the RegisterMap project — DEFER).** To let an *oop* live in a
+callee-saved register across a GC safepoint, the collector must find and
+relocate it while the mutator is suspended deep in a call. Its physical home is
+whatever inner frame last saved that register — so the frame walker needs a
+HotSpot-style RegisterMap that tracks callee-saved save locations as it unwinds.
+Plus register bits in the `OopMap`, plus `ValueLoc::Register` resolved through
+the same RegisterMap at deopt. This touches the crown-jewel GC/deopt contract;
+its failure mode is heap corruption. Large, highest-risk. Not worth it for the
+current gap.
+
+**F3c-nonoops (the safe, high-value subset — the recommended next step).**
+A *non-oop* value (smi, raw) is NEVER in an oop map and is NEVER relocated by
+GC. So keeping it in a callee-saved register across a call needs **no GC change
+and no deopt-data change**: the canonical slot stays authoritative (write-through
+at def, exactly as residency today), deopt reads the slot unchanged, GC ignores
+it. The ONLY thing gained over F3b residency: **drop the post-call reload** for
+non-oop residents — because the value can't have moved and (once prologues are
+Win64-compliant) the register survives the call. This directly attacks fib
+(smi-dominated: `n` reloaded 3×/activation across its send) and part of richards.
+
+### F3c-nonoops implementation stages (each ends green + 4-way stress)
+1. **Win64-compliant prologues.** Every nmethod saves/restores the callee-saved
+   GPRs it assigns, in a save bank BELOW the spill slots so `spill_offset =
+   −8·(slot+1)` and every GC/deopt slot read stays byte-identical. Frame layout:
+   `[rbp]`, slots `[rbp−8..]`, save bank, outgoing area at `[rsp]`; all summands
+   16-rounded.
+2. **Two-pool regalloc.** Main scan PREFERS volatile regs (RCX RDX R8 R9) so
+   leaf/small methods clobber no callee-saved reg and pay zero save cost;
+   callee-saved regs (RBX RSI RDI R12–R14) are drawn only under pressure or for
+   cross-call residents. Save-set = callee-saved regs actually assigned.
+3. **Convert every stub that clobbers a callee-saved register** to preserve it
+   (push/pop or use volatile scratch). Known site: the deopt-return trampoline
+   (`stubs_x64.rs:556`, currently `mov rbx,rax; mov rsi,rbp`). Audit: PIC/mega/
+   ffi already push/pop; `call_stub` saves the whole bank; Rust callees preserve
+   per Win64. This is the exhaustive-audit gate — a miss corrupts a caller's
+   resident.
+4. **Skip the post-call reload for non-oop residents** (`emit_resident_reloads`
+   gains `is_oop` filtering; keep the reload for oop residents, which still
+   spill and may be GC-relocated). Loosen the F3b admit gate for non-oops now
+   that they cost only a write-through, no reload.
+5. **Verify:** fib/richards pinned vs Cog; lib + it_world; the 5860-test
+   differential byte-identical under interp / JIT / GC-stress / DEOPT-stress
+   (the last exercises the converted trampoline).
+
+This is a calling-convention change, not a peephole — correct-by-construction
+for GC/deopt (slots stay canonical) but with a corruption failure mode in the
+stub conversion, so it wants a focused session with full stress-validation
+budget, not a rushed tail-end implementation.
