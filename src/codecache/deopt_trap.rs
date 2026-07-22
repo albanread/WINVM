@@ -27,7 +27,11 @@
 
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+// Only the POSIX recovery buffer (`JMP_BUFS`) is `[AtomicU32; _]`; the Windows
+// buffer is raw bytes (`WinJmpSlot`), so the import would be unused there.
+#[cfg(not(windows))]
+use std::sync::atomic::AtomicU32;
 use std::sync::Mutex;
 
 use crate::compiler::assembler::xr;
@@ -198,7 +202,8 @@ static CAPTURED: [AtomicU64; 36] = [const { AtomicU64::new(0) }; 36];
 // hand-declared here, with `sigjmp_buf`'s exact layout confirmed from this
 // system's own `/usr/include/.../usr/include/setjmp.h`: on `arm64` macOS,
 // `_JBLEN = (14 + 8 + 2) * 2 = 48`, `sigjmp_buf` is `int[_JBLEN + 1]` =
-// `[c_int; 49]`.
+// `[c_int; 49]`. (Windows has no `sigjmp_buf`; its buffer is [`WinJmpSlot`].)
+#[cfg(not(windows))]
 const SIGJMP_BUF_LEN: usize = 49;
 
 /// The identity key the jmp/recovery registries use for "this thread".
@@ -218,26 +223,122 @@ fn current_thread_id() -> u64 {
     unsafe { GetCurrentThreadId() as u64 }
 }
 
-// WINVM: no signal layer on Windows yet (Phase 2 replaces this whole
-// mechanism with a Vectored Exception Handler — MIGRATION.md §2.2). Until
-// then: `sigsetjmp` reports "no recovery point established" (returns 0 and
-// nothing ever jumps back), and `siglongjmp` — reachable only through
-// `raise_guest_fatal` on a thread that claimed a slot, i.e. the embedded
-// `VmHandle` case that doesn't exist on Windows yet — aborts loudly rather
-// than unwinding through JIT frames.
-#[cfg(windows)]
-pub(crate) unsafe fn sigsetjmp(
-    _env: *mut core::ffi::c_int,
-    _savemask: core::ffi::c_int,
-) -> core::ffi::c_int {
-    0
+// WINVM: the Windows `sigsetjmp`/`siglongjmp` (MIGRATION.md §2.2). POSIX gets
+// these from libc; Windows has no `sigsetjmp`, and — crucially — the CRT's own
+// `longjmp` UNWINDS via SEH on x64, which is exactly what must not happen here:
+// the jump crosses interpreter AND JIT-compiled frames, and JIT frames carry no
+// unwind info, so unwinding through them is undefined. `RtlCaptureContext`/
+// `RtlRestoreContext` were tried first and are subtly wrong for setjmp: they
+// capture the *helper's* frame, which is dead once `sigsetjmp` returns.
+//
+// So this is a hand-written, NON-unwinding setjmp/longjmp — the same shape
+// musl/glibc use, and the same shape the POSIX `sigsetjmp` this replaces
+// already is. `winvm_setjmp` saves the callee-saved register set plus the
+// CALLER's return address and post-return RSP; `winvm_longjmp` restores them
+// and `jmp`s straight back into the caller (`eval`'s frame), never re-entering
+// `winvm_setjmp`. That is what makes it legal to jump out of arbitrarily deep
+// compiled frames: nothing between here and the recovery point is unwound, it
+// is simply abandoned (the VM resets its own stack/arena afterward —
+// `embed::VmHandle::restore_after_guest_fatal`, and the `eval_recovers_to_a_
+// clean_stack_and_arena_without_accumulating` test that pins it).
+//
+// Windows x64 nonvolatile set saved/restored: RBX RBP RDI RSI R12–R15, plus
+// MXCSR, the x87 control word, and XMM6–XMM15 (all nonvolatile on Win64, unlike
+// SysV) — so a caller holding a live float in an XMM nonvolatile across the
+// call is reconstituted correctly. Args are Microsoft x64: `env` in RCX,
+// `savemask`/`val` in EDX. Buffer layout matches [`WinJmpSlot`] (256 bytes,
+// 16-aligned). Validated end to end (return-twice, 60-frame jump with zero
+// Drops, XMM/int integrity, repeated recovery) in an isolated binary before
+// landing here — the discipline the macOS path's own doc describes.
+#[cfg(all(windows, target_arch = "x86_64"))]
+core::arch::global_asm!(
+    ".globl winvm_setjmp",
+    "winvm_setjmp:",
+    "  mov [rcx+0x00], rbx",
+    "  mov [rcx+0x08], rbp",
+    "  mov [rcx+0x10], rdi",
+    "  mov [rcx+0x18], rsi",
+    "  mov [rcx+0x20], r12",
+    "  mov [rcx+0x28], r13",
+    "  mov [rcx+0x30], r14",
+    "  mov [rcx+0x38], r15",
+    "  lea rax, [rsp+8]",           // caller RSP after our ret pops the address
+    "  mov [rcx+0x40], rax",
+    "  mov rax, [rsp]",             // our return address == caller resume RIP
+    "  mov [rcx+0x48], rax",
+    "  stmxcsr [rcx+0x50]",
+    "  fnstcw  [rcx+0x54]",
+    "  movups [rcx+0x60], xmm6",
+    "  movups [rcx+0x70], xmm7",
+    "  movups [rcx+0x80], xmm8",
+    "  movups [rcx+0x90], xmm9",
+    "  movups [rcx+0xa0], xmm10",
+    "  movups [rcx+0xb0], xmm11",
+    "  movups [rcx+0xc0], xmm12",
+    "  movups [rcx+0xd0], xmm13",
+    "  movups [rcx+0xe0], xmm14",
+    "  movups [rcx+0xf0], xmm15",
+    "  xor eax, eax",               // first return: 0
+    "  ret",
+    ".globl winvm_longjmp",
+    "winvm_longjmp:",
+    "  mov eax, edx",               // return value the setjmp site will see
+    "  test eax, eax",
+    "  jnz 2f",
+    "  mov eax, 1",                 // longjmp(env, 0) must surface as 1
+    "2:",
+    "  mov rbx, [rcx+0x00]",
+    "  mov rbp, [rcx+0x08]",
+    "  mov rdi, [rcx+0x10]",
+    "  mov rsi, [rcx+0x18]",
+    "  mov r12, [rcx+0x20]",
+    "  mov r13, [rcx+0x28]",
+    "  mov r14, [rcx+0x30]",
+    "  mov r15, [rcx+0x38]",
+    "  ldmxcsr [rcx+0x50]",
+    "  fldcw   [rcx+0x54]",
+    "  movups xmm6,  [rcx+0x60]",
+    "  movups xmm7,  [rcx+0x70]",
+    "  movups xmm8,  [rcx+0x80]",
+    "  movups xmm9,  [rcx+0x90]",
+    "  movups xmm10, [rcx+0xa0]",
+    "  movups xmm11, [rcx+0xb0]",
+    "  movups xmm12, [rcx+0xc0]",
+    "  movups xmm13, [rcx+0xd0]",
+    "  movups xmm14, [rcx+0xe0]",
+    "  movups xmm15, [rcx+0xf0]",
+    "  mov rsp, [rcx+0x40]",        // caller RSP
+    "  jmp qword ptr [rcx+0x48]",   // resume in the caller, not here
+);
+
+// Same call-site contract as the POSIX `sigsetjmp` below: `sigsetjmp` MUST be
+// invoked directly, inline, at the site whose frame stays live for the whole
+// recovery window (never through an intervening wrapper that then returns —
+// that frame would be gone by the time a later `siglongjmp` targets it). These
+// are the asm routines above under the exact names the shared code calls.
+#[cfg(all(windows, target_arch = "x86_64"))]
+extern "C" {
+    #[link_name = "winvm_setjmp"]
+    pub(crate) fn sigsetjmp(env: *mut core::ffi::c_int, savemask: core::ffi::c_int)
+        -> core::ffi::c_int;
+    #[link_name = "winvm_longjmp"]
+    pub(crate) fn siglongjmp(env: *mut core::ffi::c_int, val: core::ffi::c_int) -> !;
 }
 
+/// Per-thread recovery-buffer storage for the Windows [`sigsetjmp`]/
+/// [`siglongjmp`] above — the counterpart of the POSIX [`JMP_BUFS`]. 256 bytes,
+/// 16-aligned, matching the layout the asm reads/writes (`0x00..0x100`).
+/// `UnsafeCell` in a `Sync` newtype (as [`ProbeStack`] does) rather than a
+/// `static mut`; each slot is exclusively owned by the thread that claimed it,
+/// so there is no real sharing to guard.
 #[cfg(windows)]
-pub(crate) unsafe fn siglongjmp(_env: *mut core::ffi::c_int, _val: core::ffi::c_int) -> ! {
-    eprintln!("macvm: guest-fault recovery (siglongjmp) is not implemented on Windows yet");
-    std::process::abort()
-}
+#[repr(C, align(16))]
+struct WinJmpSlot(core::cell::UnsafeCell<[u8; 256]>);
+#[cfg(windows)]
+unsafe impl Sync for WinJmpSlot {}
+#[cfg(windows)]
+static WIN_JMP_BUFS: [WinJmpSlot; JMP_REGISTRY_CAP] =
+    [const { WinJmpSlot(core::cell::UnsafeCell::new([0u8; 256])) }; JMP_REGISTRY_CAP];
 
 #[cfg(unix)]
 extern "C" {
@@ -282,6 +383,9 @@ extern "C" {
 /// this file of using atomics even for what is conceptually a raw buffer.
 const JMP_REGISTRY_CAP: usize = 64;
 static JMP_OWNER: [AtomicU64; JMP_REGISTRY_CAP] = [const { AtomicU64::new(0) }; JMP_REGISTRY_CAP];
+// POSIX recovery buffers. Windows uses [`WIN_JMP_BUFS`] instead (a `sigjmp_buf`
+// is a libc type; the hand-written Windows setjmp has its own layout).
+#[cfg(not(windows))]
 static JMP_BUFS: [[AtomicU32; SIGJMP_BUF_LEN]; JMP_REGISTRY_CAP] =
     [const { [const { AtomicU32::new(0) }; SIGJMP_BUF_LEN] }; JMP_REGISTRY_CAP];
 /// The triggering fault's `(signal, pc, far)`, published into THIS thread's
@@ -327,6 +431,7 @@ pub(crate) fn claim_jmp_slot() -> usize {
 /// # Safety
 /// `i` must be a slot this thread itself claimed via [`claim_jmp_slot`] and
 /// has not yet released via [`deregister_setjmp`].
+#[cfg(not(windows))]
 #[allow(unsafe_code)]
 pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
     // SAFETY (of the cast, not the caller contract above): `JMP_BUFS[i]` is
@@ -336,6 +441,20 @@ pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
     // `pthread_self()`), so treating its start as one contiguous
     // `*mut c_int` is sound.
     JMP_BUFS[i][0].as_ptr() as *mut core::ffi::c_int
+}
+
+/// The Windows twin — a pointer into slot `i`'s [`WinJmpSlot`], which the
+/// hand-written [`sigsetjmp`]/[`siglongjmp`] read/write by fixed byte offset.
+///
+/// # Safety
+/// As the POSIX version: `i` must be a slot this thread claimed and has not
+/// released.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
+    // SAFETY: exclusive per-thread ownership of slot `i` (as POSIX); the 256-
+    // byte, 16-aligned cell is exactly the buffer the asm addresses.
+    WIN_JMP_BUFS[i].0.get() as *mut core::ffi::c_int
 }
 
 /// Clears this thread's own registered slot, if any — called once a worker
@@ -481,11 +600,10 @@ pub(crate) fn has_registered_jmp_slot() -> bool {
 pub(crate) fn raise_guest_fatal(message: String) -> ! {
     if let Some(i) = lookup_jmp_slot_for_current_thread() {
         GUEST_FATAL_MSG.lock().unwrap()[i] = Some(message);
+        // `jmp_buf_ptr` is the platform-neutral accessor (POSIX `JMP_BUFS` /
+        // Windows `WIN_JMP_BUFS`), so this one call site serves both.
         unsafe {
-            siglongjmp(
-                JMP_BUFS[i][0].as_ptr() as *mut core::ffi::c_int,
-                GUEST_FATAL_JMP_VAL,
-            );
+            siglongjmp(jmp_buf_ptr(i), GUEST_FATAL_JMP_VAL);
         }
     }
     crate::runtime::vm_state::fatal_exit(1);
@@ -1257,8 +1375,26 @@ fn raw_stderr(bytes: &[u8]) {
 /// registered cache, so it carries the three facts that decide what to do
 /// next: what faulted, where, and what address it touched.
 #[cfg(windows)]
-fn write_foreign_verdict_win(code: u32, pc: u64, far: u64, in_cache: bool) {
-    fn put(buf: &mut [u8; 160], n: &mut usize, s: &[u8]) {
+/// The disposition a foreign-fault verdict line reports, so the message is
+/// honest about what happens next — mirroring the macOS `write_foreign_verdict`'s
+/// `recovering` distinction (a line that says "dying" while the thread actually
+/// recovers is worse than no line).
+#[cfg(windows)]
+enum FaultDisposition {
+    /// Foreign pc, thread has a recovery slot: caught and unwound to the eval
+    /// point (the S21 embedded-VM path).
+    Recovering,
+    /// Foreign pc, no recovery slot: nothing trustworthy to build a dossier
+    /// from, and nowhere to jump — the default fatal disposition.
+    ForeignDying,
+    /// In a registered cache but no dossier available (a second fault mid-
+    /// dossier, or a cache with no probe trampoline).
+    InCacheDying,
+}
+
+#[cfg(windows)]
+fn write_foreign_verdict_win(code: u32, pc: u64, far: u64, disposition: FaultDisposition) {
+    fn put(buf: &mut [u8; 176], n: &mut usize, s: &[u8]) {
         for &b in s {
             if *n < buf.len() {
                 buf[*n] = b;
@@ -1266,7 +1402,7 @@ fn write_foreign_verdict_win(code: u32, pc: u64, far: u64, in_cache: bool) {
             }
         }
     }
-    fn put_hex(buf: &mut [u8; 160], n: &mut usize, v: u64) {
+    fn put_hex(buf: &mut [u8; 176], n: &mut usize, v: u64) {
         put(buf, n, b"0x");
         let digits = b"0123456789abcdef";
         let mut started = false;
@@ -1278,7 +1414,7 @@ fn write_foreign_verdict_win(code: u32, pc: u64, far: u64, in_cache: bool) {
             }
         }
     }
-    let mut buf = [0u8; 160];
+    let mut buf = [0u8; 176];
     let mut n = 0usize;
     put(&mut buf, &mut n, b"MACVM PROBE: ");
     put(&mut buf, &mut n, fault_name(code));
@@ -1289,13 +1425,12 @@ fn write_foreign_verdict_win(code: u32, pc: u64, far: u64, in_cache: bool) {
     put(
         &mut buf,
         &mut n,
-        if in_cache {
-            // In-cache but no dossier: either a second fault while one was
-            // already being built (the dossier itself is broken), or a
-            // cache registered without a probe trampoline.
-            b" IN CODE CACHE but no dossier available; dying\n"
-        } else {
-            b" FOREIGN (not in any code cache); dying\n"
+        match disposition {
+            FaultDisposition::Recovering => {
+                b" FOREIGN (not in any code cache); embedded VM thread recovering\n" as &[u8]
+            }
+            FaultDisposition::ForeignDying => b" FOREIGN (not in any code cache); dying\n",
+            FaultDisposition::InCacheDying => b" IN CODE CACHE but no dossier available; dying\n",
         },
     );
     raw_stderr(&buf[..n]);
@@ -1326,13 +1461,56 @@ unsafe fn handle_win_fault(ctx: &mut WinContext, rec: &WinExceptionRecord) -> i3
         0
     };
 
+    // S21/Windows: an embedded `VmHandle` worker thread that has a registered
+    // recovery slot should have a GENUINELY FOREIGN hardware fault — a wild
+    // dereference in interpreter/FFI/marshalling code, NOT inside a code cache
+    // where PROBE's `R15 == &VmState` dossier is the right treatment — end only
+    // THIS computation, not the whole process. This is the exact mirror of the
+    // macOS `sig_fault_handler` foreign-fault branch, and it is what lets a bad
+    // `Alien` or a corrupt guest pointer surface as a catchable
+    // `GuestError::NativeFault` instead of taking the GUI down.
+    //
+    // Redirect rather than call: a VEH runs in the faulting context, so we
+    // rewrite the delivered CONTEXT to re-enter `winvm_longjmp(buf, 1)` and
+    // `EXCEPTION_CONTINUE_EXECUTION`. That REUSES the asm restore (no second
+    // copy of the buffer layout here) and needs no valid stack — `winvm_longjmp`
+    // touches none until it resets RSP from the buffer.
+    //
+    // `STATUS_STACK_OVERFLOW` is deliberately excluded: Windows has already
+    // consumed the guard page by the time the VEH runs, and resuming the thread
+    // without `_resetstkoflw` leaves future stack growth unguarded. A stack
+    // overflow is a VM-invariant failure (worker respawn is the right response),
+    // not a recoverable guest condition — so it falls through to the dossier/die
+    // path below, unlike on macOS where the sigaltstack makes recovery safe.
+    if code != STATUS_STACK_OVERFLOW {
+        if let Some(i) = lookup_jmp_slot_for_current_thread() {
+            let in_code_cache = lookup_pc_full(pc).map(|(_, _, p)| p).unwrap_or(0) != 0;
+            if !in_code_cache {
+                write_foreign_verdict_win(code, pc, far, FaultDisposition::Recovering);
+                JMP_LAST_SIG[i].store(code as u64, Ordering::Relaxed);
+                JMP_LAST_PC[i].store(pc, Ordering::Relaxed);
+                JMP_LAST_FAR[i].store(far, Ordering::Relaxed);
+                // Enter `winvm_longjmp(jmp_buf_ptr(i), 1)` on resume: RCX = buf,
+                // EDX = the native-fault jmp value (1, the `handle_native_fault`
+                // discriminant, distinct from `GUEST_FATAL_JMP_VAL`).
+                let longjmp_addr = siglongjmp
+                    as unsafe extern "C" fn(*mut core::ffi::c_int, core::ffi::c_int) -> !
+                    as usize as u64;
+                ctx.Rcx = jmp_buf_ptr(i) as u64;
+                ctx.Rdx = 1;
+                ctx.Rip = longjmp_addr;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
+
     // Reentrancy: a fault while a dossier is already being built means the
     // dossier ITSELF dereferenced something bad. Do not recurse — let the
     // process die, keeping whatever prefix was already flushed. (The
     // per-step flushing in `rt_probe_crash` exists precisely so that
     // prefix is worth something.)
     if PROBE_IN_PROGRESS.load(Ordering::Acquire) {
-        write_foreign_verdict_win(code, pc, far, true);
+        write_foreign_verdict_win(code, pc, far, FaultDisposition::InCacheDying);
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -1341,9 +1519,15 @@ unsafe fn handle_win_fault(ctx: &mut WinContext, rec: &WinExceptionRecord) -> i3
         // Outside every registered cache — the `R15 == &VmState`
         // convention does not hold, so there is nothing trustworthy to
         // build a dossier from. One honest line, then the default
-        // disposition.
+        // disposition. (`Some` here means in-cache but with no probe
+        // trampoline; `None` means genuinely foreign.)
         other => {
-            write_foreign_verdict_win(code, pc, far, other.is_some());
+            let disposition = if other.is_some() {
+                FaultDisposition::InCacheDying
+            } else {
+                FaultDisposition::ForeignDying
+            };
+            write_foreign_verdict_win(code, pc, far, disposition);
             return EXCEPTION_CONTINUE_SEARCH;
         }
     };
@@ -3031,6 +3215,114 @@ mod tests {
             2,
             "both real SIGSEGVs must have been recovered"
         );
+    }
+
+    /// Windows guest-fatal recovery, at the lowest layer: the hand-written
+    /// non-unwinding `sigsetjmp`/`siglongjmp` (`../MIGRATION.md` §6) must
+    /// "return twice" and, crucially, land the jump back in the CALLER's frame
+    /// after crossing arbitrarily many intervening frames — none of which is
+    /// unwound. `_bomb`'s `Drop` firing would mean a Rust unwind happened,
+    /// which is exactly what must NOT occur across (eventually) JIT frames.
+    /// The macOS siblings above use a real `SIGSEGV`; the Windows guest-fatal
+    /// trigger (`raise_guest_fatal`, a DNU/`error:`) is an ordinary call, so
+    /// this drives `siglongjmp` directly the same way it does.
+    #[cfg(windows)]
+    #[test]
+    fn guest_fatal_siglongjmp_recovers_across_frames_without_unwinding() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DROPS: AtomicU32 = AtomicU32::new(0);
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // A deep recursion, each frame owning a `Bomb`, that ends in the jump.
+        fn deep(slot: usize, depth: u32, val: core::ffi::c_int) {
+            let _bomb = Bomb;
+            let mut scratch = [depth as u64; 40];
+            scratch[0] = scratch[0].wrapping_add(1);
+            std::hint::black_box(&mut scratch);
+            if depth == 0 {
+                unsafe { siglongjmp(jmp_buf_ptr(slot), val) };
+            }
+            deep(slot, depth - 1, val);
+            std::hint::black_box(&scratch);
+        }
+
+        let recoveries = std::thread::spawn(|| {
+            let slot = claim_jmp_slot();
+            let mut got = 0u32;
+            // Fresh capture each iteration — the real per-eval loop shape, and
+            // the property that proves a SECOND recovery through the same slot
+            // is clean, not just the first.
+            for want in [GUEST_FATAL_JMP_VAL, 1, GUEST_FATAL_JMP_VAL] {
+                let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+                if rc == 0 {
+                    deep(slot, 50, want);
+                    unreachable!("siglongjmp must not fall through");
+                }
+                assert_eq!(rc, want, "the setjmp site must observe the longjmp value");
+                got += 1;
+            }
+            deregister_setjmp();
+            got
+        })
+        .join()
+        .expect("worker completed normally");
+
+        assert_eq!(recoveries, 3, "every recovery must land back at the setjmp site");
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            0,
+            "no Drop may run across the jump — that would be an unwind through \
+             frames the design forbids unwinding"
+        );
+    }
+
+    /// The Windows counterpart of `foreign_fault_recovers_via_registered_jmp_
+    /// slot_on_a_real_segv`: a REAL, deliberately-induced access violation on a
+    /// thread with a registered recovery slot must be caught by the VEH and
+    /// redirected into `siglongjmp`, NOT killed. Proves the
+    /// `handle_win_fault` foreign-fault branch, the context-rewrite-into-
+    /// `winvm_longjmp` redirect, and `take_last_crash_info` compose — the
+    /// hardening that lets a wild pointer in interpreter/FFI code surface as a
+    /// catchable fault instead of taking the process down. Run on a spawned
+    /// thread so a miss is the exact process-death this design prevents, made
+    /// concrete. `far` (the touched address) must come back as the real bad
+    /// address the read used.
+    #[cfg(windows)]
+    #[test]
+    fn foreign_access_violation_recovers_via_the_veh_and_registered_slot() {
+        let mut cache = CodeCache::new(1 << 16).unwrap();
+        let _trampolines = install(&mut cache); // arms the VEH (idempotent)
+
+        let info = std::thread::spawn(|| {
+            let slot = claim_jmp_slot();
+            // SAFETY: `slot` was just claimed by this thread; `sigsetjmp` is
+            // inline here, its frame live for the recovery window.
+            let rc = unsafe { sigsetjmp(jmp_buf_ptr(slot), 1) };
+            if rc == 0 {
+                // A real access violation: read the always-unmapped null page
+                // at a distinctive offset so `far` is checkable.
+                let bad = 0x24usize as *const u8;
+                unsafe { std::ptr::read_volatile(bad) };
+                panic!("unreachable — the access violation should have recovered");
+            }
+            // Resumed via the VEH's redirect into siglongjmp, value 1 (a
+            // native fault, distinct from GUEST_FATAL_JMP_VAL).
+            assert_eq!(rc, 1, "a recovered native fault returns the native-fault value");
+            let info = take_last_crash_info();
+            deregister_setjmp();
+            info
+        })
+        .join()
+        .expect("worker thread must complete normally, not die");
+
+        let (code, _pc, far) =
+            info.expect("expected recorded crash info after a recovered access violation");
+        assert_eq!(code as u32, STATUS_ACCESS_VIOLATION);
+        assert_eq!(far, 0x24, "far must be the real faulting address");
     }
 
     /// `take_last_crash_info` must not falsely report a crash for a thread
