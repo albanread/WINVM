@@ -706,3 +706,29 @@ Remaining gap analysis: richards' residual is per-activation spill-all
 registers — the one structural project left). sieve/deltablue absolute
 numbers are near timer granularity; their residual is the same loop code
 quality story. Everything cheaper than F3c is now implemented.
+
+## 2026-07-22 (final) — pinned cores, honest clocks, and the real scoreboard
+
+Two measurement bugs had been corrupting every comparison on this machine:
+the P/E-core lottery (fixed: `MACVM_BENCH_CPU=perf` pins the VM to a
+detected performance core at HIGH priority; cog-bench.sh pins BOTH VMs to
+the same logical CPU), and Pharo's millisecond clock quantizing to the
+15.6 ms Windows timer tick — **Cog's "sub-millisecond" sieve and deltablue
+were artifacts**; measured with its microsecond clock they are 4 ms each.
+
+Pinned, microsecond-clocked, same-session (warm ms per x10 reps):
+
+| bench | WINVM | Cog | verdict |
+|---|---|---|---|
+| arith | 36 | 48 | **WIN 1.3x** |
+| sieve | 3 | 4 | **WIN** |
+| alloc | 14 | 18 | **WIN** |
+| dict | 12 | 11 | parity |
+| deltablue | 4 | 4 | parity |
+| richards | 33 | 29 | ~1.15x behind |
+| fib | 207 | 152-201 | ~1.2x behind (flappiest bench on both VMs) |
+
+Day's arc: alloc was 8x behind, richards 2.6x, "sieve 3x" and
+"deltablue 6x" — the last two never real. What remains is a ~1.15-1.2x
+send-activation residual on the two deep-call benchmarks, which is F3c
+(register-resident oops across safepoints) plus fib's pure call chain.
