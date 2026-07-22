@@ -277,3 +277,31 @@ Windows x86-64 sibling of [MACVM](https://github.com/albanread/MACVM); the two
 share the portable front and middle end and diverge in the architecture-specific
 back half (x86-64 vs AArch64) and the host-integration layer (COM/WebView2 vs
 Cocoa/WKWebView).
+
+## Further reading
+
+WINVM's technical origin is **Strongtalk** — the original system lives on at
+[strongtalk.org](https://strongtalk.org/) and
+[talksmall/Strongtalk](https://github.com/talksmall/Strongtalk).
+
+**Cog** is the other great branch of the Self family tree — the production
+JIT that, from a deliberately simpler baseline design, still keeps pace with
+Strongtalk's — and it is by far the best-documented. Eliot Miranda's
+[Cog Blog](http://www.mirandabanda.org/cogblog/) is the clearest published
+explanation anywhere of the machinery a Smalltalk VM actually needs
+(remarkably, Cog is itself written in Smalltalk, translated to C for the
+build). If the internals here interest you, read him:
+
+- [About Cog](http://www.mirandabanda.org/cogblog/about-cog/) — what Cog is
+  and how its pieces fit
+- [Closures Part I](http://www.mirandabanda.org/cogblog/2008/06/07/closures-part-i/),
+  [Part II — the Bytecodes](http://www.mirandabanda.org/cogblog/2008/07/22/closures-part-ii-the-bytecodes/),
+  [Part III — the Compiler](http://www.mirandabanda.org/cogblog/2008/07/24/closures-part-iii-the-compiler/)
+- [Under Cover Contexts and the Big Frame-Up](http://www.mirandabanda.org/cogblog/2009/01/14/under-cover-contexts-and-the-big-frame-up/)
+  — mapping contexts to stack frames, the heart of making Smalltalk fast
+- [Build me a JIT as fast as you can](http://www.mirandabanda.org/cogblog/2011/03/01/build-me-a-jit-as-fast-as-you-can/)
+- [A Spur gear for Cog](http://www.mirandabanda.org/cogblog/2013/09/05/a-spur-gear-for-cog/)
+  — the Spur object representation
+
+Cog itself lives at
+[OpenSmalltalk/opensmalltalk-vm](https://github.com/OpenSmalltalk/opensmalltalk-vm).
