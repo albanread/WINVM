@@ -623,18 +623,13 @@ impl<'a> Emitter<'a> {
     /// odd number of registers. The two numbers are both correct and the
     /// difference is not an inconsistency.)
     fn emit_runtime_call(&mut self, target: LiteralId) -> u32 {
-        // The full outgoing area, not just the shadow space: these
-        // callees are the same stubs a send reaches, and their epilogue
-        // writes the RootSpill's stack slots back into this reservation.
-        self.asm
-            .emit("sub", &[r64(RSP), imm(OUTGOING_ARG_BYTES)]);
+        // No RSP adjustment: the prologue reserved the full outgoing
+        // area for the method's lifetime, so a runtime call is just the
+        // call. (The callee stubs' epilogues write the RootSpill's stack
+        // slots back into this permanently-reserved area — in bounds by
+        // construction.)
         self.asm.call_far(target);
-        // The return address, captured BEFORE the stack is released —
-        // see `record_safepoint_at`.
-        let ret_pc = self.asm.offset();
-        self.asm
-            .emit("add", &[r64(RSP), imm(OUTGOING_ARG_BYTES)]);
-        ret_pc
+        self.asm.offset()
     }
 
     /// Record a deopt safepoint at the CURRENT offset — used right after
@@ -888,13 +883,23 @@ pub fn emit_x64(
     // Spill area, rounded so RSP stays 16-byte aligned at the next call
     // (Win64 requires it, and `push rbp` has already shifted alignment by
     // 8 from the entry state).
+    // The frame reserves the OUTGOING ARGUMENT AREA once, here, and RSP
+    // stays parked below it for the whole method — the standard C-compiler
+    // shape. Before this, every send site (and every Poll/Alloc/FBox slow
+    // path) wrapped its call in a `sub rsp, 64` / `add rsp, 64` pair: two
+    // instructions per call site on the hottest paths in the VM, purely to
+    // re-create an area whose size never changes. AArch64 never had the
+    // problem (no shadow space, no stack args at these arities), which
+    // made it easy to port the per-site shape without noticing the cost.
+    //
+    // Alignment: after `push rbp` RSP is 16-aligned, both summands are
+    // 16-rounded, so RSP stays 16-aligned AT every call instruction with
+    // no per-site adjustment — the property Win64 requires.
     let frame_bytes = {
         let raw = 8 * regalloc.frame_slots as i64;
-        (raw + 15) & !15
+        ((raw + 15) & !15) + OUTGOING_ARG_BYTES
     };
-    if frame_bytes > 0 {
-        e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
-    }
+    e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
 
     // Nil-fill every deopt-referenced spill slot before any block code
     // runs — the x64 counterpart of the AArch64 prologue's task-#94 fill.
@@ -1019,9 +1024,7 @@ pub fn emit_x64(
         let entry_off = e.asm.offset();
         e.asm.emit("push", &[r64(RBP)]);
         e.asm.emit("mov", &[r64(RBP), r64(RSP)]);
-        if frame_bytes > 0 {
-            e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
-        }
+        e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
 
         // Nil-fill EVERY slot before the buffer copies land on top.
         //
@@ -1557,12 +1560,9 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
         }
 
         Ir::CallSend { dst, site, args } => {
-            // Reserve the outgoing argument area BEFORE marshaling: the
-            // stack arguments `marshal_args` writes are RSP-relative and
-            // must land inside this reservation. (Register-only sends
-            // reserve exactly the 32-byte shadow space, as before.)
-            let outgoing = outgoing_arg_bytes(args.len());
-            e.asm.emit("sub", &[r64(RSP), imm(outgoing)]);
+            // The outgoing area is part of the frame (see the prologue),
+            // so marshaling writes straight into it and the send is just
+            // the call — no per-site RSP traffic.
             e.marshal_args(args);
             // The patchable site: a 5-byte `call rel32` whose displacement
             // the code cache rewrites to point at the current IC target.
@@ -1571,9 +1571,7 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             let off = e.asm.call_patchable(RelocKind::InlineCache);
             // A send is a deopt safepoint, keyed on the RETURN address —
             // captured here, before the outgoing area is released.
-            let ret_pc = e.asm.offset();
-            e.asm.emit("add", &[r64(RSP), imm(outgoing)]);
-            e.record_safepoint_at(ret_pc);
+            e.record_safepoint_at(e.asm.offset());
             let info = e.method.call_sites[*site as usize];
             e.ic_sites.push(EmittedIcSite {
                 off,
