@@ -76,15 +76,31 @@ Builds on world/61's existing `socket`/`bind`/`listen`/`accept`/`connect`/
   with the internet-checksum helper and echo-request builder; `Ping`
   (world/61d, the demo) is the worked example.
 
-### C. IoWorker integration (already free)
+### C. IoWorker integration — the async path is first-class
 
-Any socket fd is watchable by the existing IoWorker (`kevent` works on all
-fds), so a UDP or ICMP server multiplexes non-blocking exactly like TCP.
-**Honest boundary:** the IoWorker's `drainData:` does a `read`, which for a
-*connected* socket is fine but for an *unconnected* datagram server drops
-the peer address. So `watchRead:onData:` serves connected datagram flows;
-a datagram *server* that needs per-packet peer info uses `UdpSocket receive`
-directly (or connects the socket first). Documented, not papered over.
+The blocking `receive`/`receiveReply` above are a low-level ESCAPE HATCH
+(fine for a one-shot; they work in bare `macvm run`, which has no workers).
+The proper path rides the IoWorker, non-blocking, exactly like TCP does —
+and the substrate gap that made the first cut block is closed here.
+
+The IoWorker's original `drainData:` does a `read`, which drops the peer on
+an unconnected datagram socket — so datagram servers can't answer their
+sender through it. **Fixed, not worked around:** the IoWorker gains a
+`recvfrom`-based **datagram drain** (`watchDatagramFd:`/`drainDatagram:`)
+parallel to its accept drain, delivering `{#datagram. fd. bytes. octets.
+port}` tuples, and a primary-side `watchDatagram:onPacket:` firing a
+`[:bytes :octets :port]` continuation. The socket layer wraps it as
+`aSocket via: iow onPacket: [:bytes :from :port | ...]` (`from` an
+`InetAddress`), and `IcmpSocket via: iow onReply: [:type :code :seq | ...]`
+parses the IP+ICMP reply. So a UDP/ICMP server multiplexes non-blocking
+with full peer info, no VM ever sleeps in `recvfrom`, and pinging a real
+host never freezes the GUI. (The IoWorker itself stays free of the
+world/61c socket globals — it passes raw octets, the socket layer rebuilds
+the address — since 61c loads after it.)
+
+Requires the embedded worker context (GUI / `VmHandle`), like every
+IoWorker path; bare `macvm run` has no workers, so there the blocking
+escape hatch is what's available.
 
 ## The demo — `Ping` (world/61d)
 

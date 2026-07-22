@@ -47,8 +47,8 @@
  valid here. My class side is the server that runs inside the spawned
  worker itself."
 Object subclass: IoWorker [
-    | worker kq readHandlers acceptHandlers pumping |
-    <classVars: Kq Buf Accepting>
+    | worker kq readHandlers acceptHandlers datagramHandlers pumping |
+    <classVars: Kq Buf Accepting Datagrams>
 
     "── worker side: the server that runs INSIDE the spawned IoWorker VM ──
      The boot doit carries the primary-made kqueue's fd (fds are shared
@@ -59,6 +59,7 @@ Object subclass: IoWorker [
         Kq := Kqueue onFd: kqFd.
         Buf := NativeBuffer page.
         Accepting := Dictionary new.
+        Datagrams := Dictionary new.
         Worker onMessage: [ :m | IoWorker handle: m payload ]
     ]
     "Pure kqueue mutations (no messaging), so `handle:`'s reply is the only
@@ -80,6 +81,18 @@ Object subclass: IoWorker [
         Accepting at: fd put: nil.
         Kq unwatchRead: fd
     ]
+    "A DATAGRAM socket is watched with the same EVFILT_READ, but drained
+     with recvfrom (which captures the peer) instead of read (which drops
+     it) — so a datagram server can answer its sender. Marked, like a
+     listener, so `drain:` routes it to `drainDatagram:`."
+    IoWorker class >> watchDatagramFd: fd [
+        Datagrams at: fd put: true.
+        Kq watchRead: fd
+    ]
+    IoWorker class >> unwatchDatagramFd: fd [
+        Datagrams at: fd put: nil.
+        Kq unwatchRead: fd
+    ]
 
     IoWorker class >> handle: req [
         | tag |
@@ -95,6 +108,12 @@ Object subclass: IoWorker [
             ^Worker reply: (Array with: #watched with: (req at: 2)) ].
         tag == #unwatchAccept ifTrue: [
             self unwatchAcceptFd: (req at: 2).
+            ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
+        tag == #watchDatagram ifTrue: [
+            self watchDatagramFd: (req at: 2).
+            ^Worker reply: (Array with: #watched with: (req at: 2)) ].
+        tag == #unwatchDatagram ifTrue: [
+            self unwatchDatagramFd: (req at: 2).
             ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
         tag == #pump ifTrue: [ ^self pump: (req at: 2) ].
         Worker reply: (Array with: #err with: #unknownRequest)
@@ -121,9 +140,15 @@ Object subclass: IoWorker [
         results := OrderedCollection new.
         events do: [ :e |
             (e at: 2) = -1 ifTrue: [
-                (Accepting at: (e at: 1) ifAbsent: [ nil ]) isNil
-                    ifTrue: [ results add: (self drainData: e) ]
-                    ifFalse: [ self drainAccepts: e into: results ] ] ].
+                "Route each readable fd by how it was registered: an
+                 acceptor accepts, a datagram socket recvfrom's (peer and
+                 all), everything else is a plain bounded read."
+                (Accepting at: (e at: 1) ifAbsent: [ nil ]) notNil
+                    ifTrue: [ self drainAccepts: e into: results ]
+                    ifFalse: [
+                        (Datagrams at: (e at: 1) ifAbsent: [ nil ]) notNil
+                            ifTrue: [ results add: (self drainDatagram: e) ]
+                            ifFalse: [ results add: (self drainData: e) ] ] ] ].
         ^results asArray
     ]
     IoWorker class >> drainData: e [
@@ -136,6 +161,32 @@ Object subclass: IoWorker [
         bytes := ByteArray new: rc.
         1 to: rc do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ].
         ^Array with: #data with: fd with: bytes with: eof
+    ]
+    "One datagram off a readable datagram socket, via recvfrom — the peer
+     sockaddr the kernel fills in is what a `read` would have dropped.
+     Answers {#datagram. fd. bytes. octets(4-elem Array). port}; the
+     primary side rebuilds an InetAddress from the octets (this worker
+     stays free of the world/61c socket-class globals, which load after
+     me). Payload at Buf 0..2047, peer sockaddr at 2048, socklen at 3072
+     — no overlap. Bounded by the kevent-reported count, so it can't
+     block; one recvfrom yields exactly one datagram."
+    IoWorker class >> drainDatagram: e [
+        | fd n rc bytes sa |
+        fd := e at: 1.
+        n := (e at: 3) min: 2048.
+        Buf u32At: 3072 put: 128.       "value-result socklen (>= 16)"
+        rc := n > 0
+            ifTrue: [ Posix recvfromFd: fd buf: Buf address len: n flags: 0
+                            addr: Buf address + 2048 addrLenPtr: Buf address + 3072 ]
+            ifFalse: [ 0 ].
+        rc < 0 ifTrue: [ rc := 0 ].
+        bytes := ByteArray new: rc.
+        1 to: rc do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ].
+        sa := 2048.
+        ^Array with: #datagram with: fd with: bytes
+               with: (Array with: (Buf byteAt: sa + 4) with: (Buf byteAt: sa + 5)
+                            with: (Buf byteAt: sa + 6) with: (Buf byteAt: sa + 7))
+               with: ((Buf byteAt: sa + 2) * 256 + (Buf byteAt: sa + 3))
     ]
     IoWorker class >> drainAccepts: e into: results [
         | listener newFd |
@@ -161,6 +212,7 @@ Object subclass: IoWorker [
         kq := aKqueue.
         readHandlers := Dictionary new.
         acceptHandlers := Dictionary new.
+        datagramHandlers := Dictionary new.
         pumping := false.
         ^self
     ]
@@ -207,9 +259,31 @@ Object subclass: IoWorker [
         self poke.
         ^self
     ]
+    "Register a continuation for a DATAGRAM socket's incoming packets — the
+     non-blocking answer to `UdpSocket receive`. `aBlock` is a 3-arg block
+     `[:bytes :octets :port | ...]` (`octets` a 4-element Array; the socket
+     class layer, world/61c, wraps it as an InetAddress). Fired once per
+     datagram, WITH the sender, so a datagram server never blocks in
+     recvfrom on a peer's behalf — the whole point of the IoWorker model."
+    watchDatagram: fd onPacket: aBlock [
+        datagramHandlers at: fd put: aBlock.
+        worker send: (Array with: #watchDatagram with: fd).
+        self poke.
+        ^self
+    ]
+    unwatchDatagram: fd [
+        datagramHandlers at: fd put: nil.
+        worker send: (Array with: #unwatchDatagram with: fd).
+        self poke.
+        ^self
+    ]
 
     "Dispatch one #io batch of tagged tuples to the registered per-fd
-     continuations: {#data. fd. bytes. eof} and {#accept. listener. newFd}."
+     continuations: {#data. fd. bytes. eof}, {#accept. listener. newFd},
+     and {#datagram. fd. bytes. octets. port}. The datagram continuation
+     is fired with the raw octets Array (not an InetAddress) so this class
+     stays free of the world/61c socket globals that load after it — the
+     UdpSocket layer rebuilds the address."
     deliver: batch [
         batch do: [ :io |
             | h |
@@ -218,7 +292,11 @@ Object subclass: IoWorker [
                 h isNil ifFalse: [ h value: (io at: 3) value: (io at: 4) ] ].
             (io at: 1) == #accept ifTrue: [
                 h := acceptHandlers at: (io at: 2) ifAbsent: [ nil ].
-                h isNil ifFalse: [ h value: (io at: 3) ] ] ]
+                h isNil ifFalse: [ h value: (io at: 3) ] ].
+            (io at: 1) == #datagram ifTrue: [
+                h := datagramHandlers at: (io at: 2) ifAbsent: [ nil ].
+                h isNil ifFalse: [
+                    h value: (io at: 3) value: (io at: 4) value: (io at: 5) ] ] ]
     ]
 
     "Send one poll; its reply dispatches the data and, while `pumping`, re-arms

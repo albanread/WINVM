@@ -6,71 +6,112 @@
  the IP+ICMP reply is parsed by hand. 'Granular control over our own
  protocols' made concrete.
 
- Ping host: '127.0.0.1' count: 4 prints the classic per-echo lines and a
- summary. The default target is loopback (on-machine, no network egress,
- no firewall prompt); any dotted-quad the machine can route to also works.
- Harmless headless — on a platform that refuses even the unprivileged ICMP
+ Two ways to run me:
+   Ping via: anIoWorker host: '127.0.0.1' count: 4
+     — the PROPER path: replies arrive as continuations through the
+       IoWorker, so no VM ever blocks in recvfrom. Needs a worker context
+       (the GUI / an embedded VM). This is the one to use.
+   Ping host: '127.0.0.1' count: 4
+     — a blocking one-shot for a bare `macvm run` (no workers there): each
+       recvfrom blocks until its reply. Fine for a quick loopback check;
+       don't ping a distant host this way from an interactive VM.
+
+ The default target is loopback (on-machine, no network egress, no
+ firewall prompt); any dotted-quad the machine can route to also works.
+ Harmless headless — where the OS refuses even the unprivileged ICMP
  socket, `open` answers false and the run reports that cleanly."
 
 Object subclass: Ping [
-    | sock addr sent received totalRtt |
+    | sock addr sent received totalRtt replies sendAt tick |
 
+    "── the proper, non-blocking path: replies via an IoWorker ──"
+    Ping class >> via: iow host: aString count: n [
+        ^self new runVia: iow host: aString count: n
+    ]
+    "── the blocking one-shot (bare CLI, no worker context) ──"
     Ping class >> host: aString [ ^self host: aString count: 4 ]
     Ping class >> host: aString count: n [
-        ^self new runHost: aString count: n
+        ^self new runBlockingHost: aString count: n
     ]
-    "Loopback shortcut."
     Ping class >> loopback [ ^self host: '127.0.0.1' count: 4 ]
 
-    open [
-        sock := IcmpSocket new.
-        ^sock isOpen
+    open [ sock := IcmpSocket new. ^sock isOpen ]
+
+    prepareHost: aString [
+        addr := InetAddress fromString: aString.
+        addr isNil ifTrue: [ Transcript show: 'ping: bad address ', aString; cr. ^false ].
+        self open ifFalse: [
+            Transcript show: 'ping: could not open an ICMP socket (errno ',
+                Posix errno printString, ')'; cr. ^false ].
+        sent := 0. received := 0. totalRtt := 0.
+        Transcript show: 'PING ', addr printString,
+            ' — each byte crafted in Smalltalk'; cr.
+        ^true
     ]
 
-    "One echo: send, wait for the reply, answer its round-trip time in ms
-     (or nil if the reply never came / wasn't an echo reply). The DGRAM
-     socket blocks in recvfrom; loopback answers effectively instantly, and
-     a real host answers within the network RTT."
-    pingSeq: seq [
+    "The non-blocking run: register a reply continuation, fire the echoes,
+     then pump the inbox loop until every reply lands (or a tick cap). The
+     VM is in its inbox loop, never asleep in recvfrom — the IoWorker did
+     the recvfrom on its own thread and messaged the reply back."
+    runVia: iow host: aString count: n [
+        (self prepareHost: aString) ifFalse: [ ^self ].
+        replies := Dictionary new.
+        sendAt := Dictionary new.
+        sock via: iow onReply: [ :type :code :seq |
+            (type = IcmpSocket echoReplyType and: [ (replies includesKey: seq) not ]) ifTrue: [
+                replies at: seq put: (Time millisecondClockValue
+                    - (sendAt at: seq ifAbsent: [ Time millisecondClockValue ])) ] ].
+        iow startPumping.
+        1 to: n do: [ :seq |
+            sent := sent + 1.
+            sendAt at: seq put: Time millisecondClockValue.
+            sock sendEchoTo: addr id: 4660 seq: seq ].
+        tick := 0.
+        Worker runLoopWhile: [ tick := tick + 1. tick < 5000 and: [ replies size < n ] ].
+        1 to: n do: [ :seq | self reportSeq: seq rtt: (replies at: seq ifAbsent: [ nil ]) ].
+        sock unwatchFrom: iow. sock close.
+        self summary.
+        ^self
+    ]
+
+    "The blocking run: send, then block in recvfrom for each reply. No
+     worker context needed — the escape hatch for a bare CLI."
+    runBlockingHost: aString count: n [
+        | rtt |
+        (self prepareHost: aString) ifFalse: [ ^self ].
+        1 to: n do: [ :seq |
+            sent := sent + 1.
+            rtt := self blockingPingSeq: seq.
+            self reportSeq: seq rtt: rtt ].
+        sock close.
+        self summary.
+        ^self
+    ]
+    blockingPingSeq: seq [
         | t0 rc reply |
         t0 := Time millisecondClockValue.
         rc := sock sendEchoTo: addr id: 4660 seq: seq.
         rc < 0 ifTrue: [ ^nil ].
         reply := sock receiveReply.
-        reply isNil ifTrue: [ ^nil ].
-        (reply at: 1) = IcmpSocket echoReplyType ifFalse: [ ^nil ].
+        (reply notNil and: [ (reply at: 1) = IcmpSocket echoReplyType ]) ifFalse: [ ^nil ].
         ^Time millisecondClockValue - t0
     ]
 
-    runHost: aString count: n [
-        | rtt |
-        addr := InetAddress fromString: aString.
-        addr isNil ifTrue: [ Transcript show: 'ping: bad address ', aString; cr. ^self ].
-        self open ifFalse: [
-            Transcript show: 'ping: could not open an ICMP socket (errno ',
-                Posix errno printString, ')'; cr. ^self ].
-        Transcript show: 'PING ', addr printString, ' — ', n printString,
-            ' echo requests, each byte crafted in Smalltalk'; cr.
-        sent := 0. received := 0. totalRtt := 0.
-        1 to: n do: [ :seq |
-            sent := sent + 1.
-            rtt := self pingSeq: seq.
-            rtt isNil
-                ifTrue: [ Transcript show: '  seq=', seq printString, '  no reply'; cr ]
-                ifFalse: [
-                    received := received + 1.
-                    totalRtt := totalRtt + rtt.
-                    Transcript show: '  ', addr printString,
-                        ': icmp_seq=', seq printString,
-                        '  time=', rtt printString, ' ms'; cr ] ].
-        sock close.
+    reportSeq: seq rtt: rtt [
+        rtt isNil
+            ifTrue: [ Transcript show: '  seq=', seq printString, '  no reply'; cr ]
+            ifFalse: [
+                received := received + 1. totalRtt := totalRtt + rtt.
+                Transcript show: '  ', addr printString, ': icmp_seq=', seq printString,
+                    '  time=', rtt printString, ' ms'; cr ]
+    ]
+    summary [
         Transcript show: '--- ', addr printString, ' ping statistics ---'; cr.
         Transcript show: '  ', sent printString, ' sent, ', received printString,
             ' received, ',
             (sent = 0 ifTrue: [ 0 ] ifFalse: [ (sent - received) * 100 // sent ]) printString,
             '% loss'; cr.
         received > 0 ifTrue: [
-            Transcript show: '  avg RTT ', (totalRtt // received) printString, ' ms'; cr ].
-        ^self
+            Transcript show: '  avg RTT ', (totalRtt // received) printString, ' ms'; cr ]
     ]
 ]

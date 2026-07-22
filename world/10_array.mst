@@ -170,6 +170,16 @@ ArrayedCollection subclass: Array [
         r at: 4 put: d.
         ^r
     ]
+    Array class >> with: a with: b with: c with: d with: e [
+        | r |
+        r := self new: 5.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        r at: 3 put: c.
+        r at: 4 put: d.
+        r at: 5 put: e.
+        ^r
+    ]
     at: i [
         <primitive: 26>
     ]

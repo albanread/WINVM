@@ -25,10 +25,8 @@ Object subclass: Posix [
     Posix class >> sendtoFd: fd buf: b len: n flags: f addr: a addrLen: al [
         <primitive: FFI function: #sendto ret: #g args: #(g g g g g g)>
     ]
-    "recvfrom(fd, buf, len, flags, src_sockaddr, &src_len) — src/len 0/0 to ignore."
-    Posix class >> recvfromFd: fd buf: b len: n flags: f addr: a addrLenPtr: alp [
-        <primitive: FFI function: #recvfrom ret: #g args: #(g g g g g g)>
-    ]
+    "recvfrom (peer-capturing datagram read) lives in world/61 — the
+     IoWorker's datagram drain needs it and loads first."
     "send(fd, buf, len, flags) — a connected socket's datagram/stream write."
     Posix class >> sendFd: fd buf: b len: n flags: f [
         <primitive: FFI function: #send ret: #g args: #(g g g g)>
@@ -153,7 +151,7 @@ Object subclass: InetAddress [
  multiplexing. Every operation answers a value; I never raise. Close me
  with close (my lifecycle is explicit, like every native resource here)."
 Object subclass: Socket [
-    | fd buf |
+    | fd buf io |
 
     "The general constructor: any domain/type/protocol. A negative fd means
      the OS refused (errno readable) — e.g. SOCK_RAW without privilege."
@@ -231,6 +229,24 @@ Object subclass: Socket [
         ^Array with: s
                with: (InetAddress fromOctets: (buf sockaddrInOctetsAt: 64))
                with: (buf sockaddrInPortAt: 64)
+    ]
+
+    "── non-blocking datagram receive via an IoWorker (the proper async
+     path — `receive` above blocks in recvfrom, fine for a one-shot but
+     wrong for a server) ──
+     `iow` is an IoWorker; `aBlock` is [:bytes :from :port | ...] with
+     `from` an InetAddress. The IoWorker recvfrom's on my fd and messages
+     each datagram back, so no VM ever blocks waiting for a peer. Stop
+     with unwatchFrom:."
+    via: iow onPacket: aBlock [
+        io := iow.
+        iow watchDatagram: fd onPacket: [ :bytes :octets :port |
+            aBlock value: bytes value: (InetAddress fromOctets: octets) value: port ].
+        ^self
+    ]
+    unwatchFrom: iow [
+        iow unwatchDatagram: fd.
+        ^self
     ]
 
     "── options (typed as a 4-byte int, the common case) ──"
@@ -330,9 +346,27 @@ Socket subclass: IcmpSocket [
                addr: buf address addrLen: 16
     ]
 
-    "Receive one reply and parse it. macOS hands the FULL IP datagram to a
-     DGRAM-ICMP socket, so skip the IP header ((firstByte & 0x0f) * 4 bytes)
-     to reach the ICMP header. Answers { icmpType. icmpCode. seq } or nil."
+    "Non-blocking ICMP replies via an IoWorker — the proper async answer to
+     the blocking receiveReply below. `aBlock` is [:type :code :seq | ...],
+     parsed from the IP+ICMP reply (skip the IP header). Each reply arrives
+     as a message, so pinging a real host never freezes the VM."
+    via: iow onReply: aBlock [
+        io := iow.
+        iow watchDatagram: fd onPacket: [ :bytes :octets :port |
+            | ihl |
+            bytes size >= 28 ifTrue: [
+                ihl := ((bytes at: 1) bitAnd: 15) * 4.
+                aBlock value: (bytes at: ihl + 1)
+                       value: (bytes at: ihl + 2)
+                       value: ((bytes at: ihl + 7) * 256 + (bytes at: ihl + 8)) ] ].
+        ^self
+    ]
+
+    "Receive one reply and parse it — the BLOCKING one-shot (the escape
+     hatch; via:onReply: above is the non-blocking path). macOS hands the
+     FULL IP datagram to a DGRAM-ICMP socket, so skip the IP header
+     ((firstByte & 0x0f) * 4 bytes) to reach the ICMP header. Answers
+     { icmpType. icmpCode. seq } or nil."
     receiveReply [
         | n ihl icmp |
         n := Posix recvfromFd: fd buf: buf address + 1024 len: 2048 flags: 0

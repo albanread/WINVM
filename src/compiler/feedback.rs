@@ -185,9 +185,10 @@ pub(crate) fn resolve_method_ro(
 /// `Untaken → Mono`, and a guard storm is `Mono → Poly` — both tag-visible).
 /// A klass-set-preserving change (same-tag re-targeting) is invisible here,
 /// but redefinition already invalidates through the dependency index.
-pub fn snapshot_profile(_vm: &VmState, method: MethodOop) -> u64 {
+pub fn snapshot_profile(vm: &VmState, method: MethodOop) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
-    snapshot_into(method, &mut h, 0);
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    snapshot_into(vm, method, &mut h, 0, &mut visited);
     h
 }
 
@@ -195,37 +196,40 @@ pub fn snapshot_profile(_vm: &VmState, method: MethodOop) -> u64 {
 /// site in the root method, the ICs of the method that site resolves to
 /// against `key_klass` — the same resolution B3 self-devirt grafting uses.
 ///
-/// Why the plain hash was not enough, found on deltablue: `markInputs:`
-/// (one method on AbstractConstraint) crossed the compile threshold on
-/// EqualityConstraint receivers, so when a ScaleConstraint FIRST received
-/// it, the customized compile happened immediately — grafting
-/// `ScaleConstraint>>inputsDo:`, a method that had never executed. Every
-/// send in that graft lowered as an Empty-IC trap, by design ("first call
-/// is the trap"). The traps then warmed `inputsDo:`'s OWN ICs — but the
-/// effectiveness check hashed only the root method and its literal
-/// blocks, saw no change, and declined the recompile forever: a permanent
-/// deopt storm (141k traps in a 100-solve run at threshold=20, the whole
-/// gap between t=20's 103ms and t=1000's 55ms). S24 B5 5b fixed exactly
-/// this for grafted BLOCKS, on this same benchmark; this is the method
-/// flavor.
+/// ## Why this layer is needed ON TOP of the IC-following recursion
+///
+/// `snapshot_into` below (upstream, 2026-07) already follows the Mono/Poly
+/// targets each SITE's own feedback names — but a customized compile can
+/// graft a callee the site's IC has never seen. Found on deltablue:
+/// `markInputs:` (one method on AbstractConstraint) crossed the compile
+/// threshold on EqualityConstraint receivers, so its `inputsDo:` site's IC
+/// was Mono #EqualityConstraint. When a ScaleConstraint FIRST received it,
+/// the customized compile grafted `ScaleConstraint>>inputsDo:` — resolved
+/// via the CUSTOMIZATION klass, not the IC — from wholly-empty feedback,
+/// so every send in the graft lowered as a trap. The traps warmed Scale's
+/// `inputsDo:` ICs, but the trap re-executes only the INNER frame, so the
+/// outer site never re-dispatches and its IC stays Mono on Equality:
+/// IC-following hashes the WRONG klass's callee forever, the hash never
+/// flips, and the storm never heals (141k traps in a 100-solve run at
+/// threshold=20; upstream's commit observed the same residual and
+/// attributed it to "a different graft bug" — it is this one).
 ///
 /// Deliberately OVER-inclusive rather than a faithful replay of the
-/// inliner's decisions: every send site is resolved against `key_klass`,
-/// whether or not it is a self-send and whether or not the inliner took
-/// it. Both producers of the hash (the compile, and the decline check)
-/// compute it identically, so determinism holds; the cost of including a
-/// callee the graft ignored is at worst one extra recompile — and this
-/// hash is only ever CONSULTED while the method is already storming,
-/// where an extra recompile attempt is precisely the desired behaviour
-/// (`MAX_VERSIONS` still caps thrash). Duplicating the inliner's real
-/// policy here would be exact today and silently wrong after its next
-/// change.
+/// inliner's decisions: every root send site is resolved against
+/// `key_klass`, self-send or not, grafted or not. Both producers of the
+/// hash compute it identically so determinism holds, and it is only ever
+/// CONSULTED while the method is already storming, where an extra
+/// recompile attempt is precisely the desired behaviour (`MAX_VERSIONS`
+/// still caps thrash). The shared `visited` set dedups against the
+/// IC-following pass, so a callee both passes reach is hashed once.
 pub fn snapshot_profile_customized(
-    vm: &mut VmState,
+    vm: &VmState,
     method: MethodOop,
     key_klass: crate::oops::wrappers::KlassOop,
 ) -> u64 {
-    let mut h = snapshot_profile(vm, method);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    snapshot_into(vm, method, &mut h, 0, &mut visited);
     let fnv = |h: &mut u64, byte: u8| {
         *h ^= byte as u64;
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -236,13 +240,9 @@ pub fn snapshot_profile_customized(
         let (instr, next) = decode_at(method, bci);
         if let Instr::Send { ic, super_: false } = instr {
             let ic_view = crate::interpreter::ic::InterpreterIc::at(method, ic);
-            if let Some(callee) = crate::runtime::lookup::lookup(vm, key_klass, ic_view.selector())
-            {
-                // Never the root itself (a self-recursive send would loop).
-                if callee.oop().raw() != method.oop().raw() {
-                    fnv(&mut h, 0xC7);
-                    snapshot_into(callee, &mut h, 1);
-                }
+            if let Some(callee) = resolve_method_ro(vm, key_klass, ic_view.selector()) {
+                fnv(&mut h, 0xC7);
+                snapshot_into(vm, callee, &mut h, 1, &mut visited);
             }
         }
         bci = next;
@@ -250,17 +250,48 @@ pub fn snapshot_profile_customized(
     h
 }
 
+/// How deep to follow grafted callee methods when snapshotting. The inliner
+/// grafts a bounded proto-chain (a depth-3 blockarg chain is the deepest it
+/// builds); the visited-set below already makes the walk terminating, so this
+/// cap only stops a deep-but-acyclic call graph from making the storm-check
+/// snapshot needlessly expensive. One past the observed graft depth for slack.
+const GRAFT_SNAPSHOT_DEPTH: u8 = 4;
+
+
 /// One method's (or block's) send-IC states folded into `h`, recursing into
-/// literal blocks (S24 B5 5b): a compile GRAFTS block bodies inline and reads
-/// THEIR ICs for lowering decisions, so a trap inside a grafted block that
-/// warms only the block's own IC must still flip the profile hash — before
-/// this, `note_uncommon_trap` hashed the root method alone and declined the
-/// recompile forever ("profile unchanged"), a permanent deopt storm on
-/// deltablue's constraintsConsuming:do: once multi-BB blockarg splicing
-/// landed. `depth` seeds each nesting level so identical IC layouts at
-/// different levels don't cancel.
-fn snapshot_into(method: MethodOop, h: &mut u64, depth: u8) {
+/// everything a compile GRAFTS inline — literal blocks (S24 B5 5b) AND the
+/// Mono/Poly callee METHODS the inliner devirtualizes (2026-07). The compiler
+/// reads a grafted callee's ICs for its lowering decisions, so a trap inside a
+/// grafted callee that warms only THAT callee's IC must still flip the profile
+/// hash — otherwise `note_uncommon_trap` hashes the root method alone, sees no
+/// change, and declines the recompile FOREVER ("profile unchanged"). That was
+/// a permanent deopt storm across deltablue (`Dictionary>>at:` grafts
+/// `scanFor:`, whose `probe = key` goes nil→Symbol poly; `markInputs:` grafts
+/// `inputsDo:`; `recalculate` grafts the constraint accessors) — ~500
+/// bail-to-interpreter traps per run that could never heal. Block recursion
+/// (B5 5b) already covered grafted BLOCKS; this covers grafted METHODS the
+/// same way.
+///
+/// `read_send_site` gives the grafted target(s) exactly as the inliner sees
+/// them (Mono → the one method, Poly → the dominant + fallback cases). The
+/// `visited` set (method identity) makes mutual/self recursion terminate and
+/// dedups a method reached by two grafted paths; the depth cap bounds the
+/// rest. `depth` seeds each level so identical IC layouts at different levels
+/// don't cancel.
+fn snapshot_into(
+    vm: &VmState,
+    method: MethodOop,
+    h: &mut u64,
+    depth: u8,
+    visited: &mut std::collections::HashSet<u64>,
+) {
     use crate::interpreter::ic::{ic_state, IcState};
+    // Terminating: a method (or block) reached again — via a cycle or a second
+    // grafted path — was already folded in; skip it. Bytecode-order traversal
+    // is deterministic, so the hash is a stable function of the reachable set.
+    if !visited.insert(method.oop().raw()) {
+        return;
+    }
     let fnv = |h: &mut u64, byte: u8| {
         *h ^= byte as u64;
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -282,10 +313,27 @@ fn snapshot_into(method: MethodOop, h: &mut u64, depth: u8) {
                 fnv(h, ic as u8);
                 fnv(h, (ic >> 8) as u8);
                 fnv(h, tag);
+                // Follow the grafted callee(s) — the inliner devirtualizes a
+                // Mono/Poly site and reads the callee's own feedback, so its
+                // warmed ICs must reach this hash. Mega is a plain dynamic
+                // send (nothing grafted); Untaken has no target yet.
+                if depth < GRAFT_SNAPSHOT_DEPTH {
+                    match read_send_site(vm, method, ic, None) {
+                        SiteFeedback::Mono { method: target, .. } => {
+                            snapshot_into(vm, target, h, depth.saturating_add(1), visited);
+                        }
+                        SiteFeedback::Poly { cases } => {
+                            for c in cases {
+                                snapshot_into(vm, c.method, h, depth.saturating_add(1), visited);
+                            }
+                        }
+                        SiteFeedback::Untaken | SiteFeedback::Mega => {}
+                    }
+                }
             }
             Instr::PushClosure { lit, .. } => {
                 if let Some(blk) = MethodOop::try_from(method.literals().at(lit as usize)) {
-                    snapshot_into(blk, h, depth.saturating_add(1));
+                    snapshot_into(vm, blk, h, depth.saturating_add(1), visited);
                 }
             }
             _ => {}

@@ -105,6 +105,11 @@ pub enum JitMode {
     Threshold(u32),
 }
 
+/// The threshold `MACVM_JIT=threshold=1` is bumped up to (`parse_jit`): a real
+/// warmup window so an inlined callee is interpreted — and its ICs warmed —
+/// before its caller compiles, instead of grafting from empty feedback.
+pub(crate) const JIT_THRESHOLD_FLOOR: u32 = 20;
+
 impl JitMode {
     /// Provisional (SPRINTS.md standing rule 3: S10 has no perf gate beyond
     /// a 2× tripwire) — plausible enough to exercise real compilation in an
@@ -758,6 +763,24 @@ impl VmOptions {
             .strip_prefix("threshold=")
             .and_then(|n| n.parse::<u32>().ok())
         {
+            // `threshold=1` compiles a method on its VERY FIRST call, before
+            // any callee it inlines has been interpreted even once — so every
+            // graft is built from empty ICs and lowers its cold sends to
+            // uncommon traps. It measures cold-compile deopt behavior, NEVER
+            // steady-state speed (a 5x "slowdown" that is really 20x once the
+            // ICs warm). It is a compiler-correctness test tool ONLY (the embed
+            // tests that want it set `JitMode::Threshold(1)` in Rust directly,
+            // bypassing this env parse). Reaching it through `MACVM_JIT` is
+            // always a mistake, so refuse it: bump to a real threshold and say
+            // so, loudly, rather than hand back a garbage benchmark.
+            if n == 1 {
+                eprintln!(
+                    "MACVM_JIT: threshold=1 is not a valid measurement config \
+                     (compiles before any inlined callee warms — measures cold-\
+                     compile deopts, not speed). Using threshold={JIT_THRESHOLD_FLOOR} instead."
+                );
+                return JitMode::Threshold(JIT_THRESHOLD_FLOOR);
+            }
             return JitMode::Threshold(n);
         }
         eprintln!("MACVM_JIT: unrecognized value {s:?}, defaulting to off");
@@ -1436,9 +1459,16 @@ mod tests {
     fn jit_flag_parsing() {
         assert_eq!(VmOptions::parse_jit(None), JitMode::Off);
         assert_eq!(VmOptions::parse_jit(Some("off")), JitMode::Off);
+        // threshold=1 via the env var is a footgun (compiles before any
+        // inlined callee warms) — bumped to the floor, not honored literally.
         assert_eq!(
             VmOptions::parse_jit(Some("threshold=1")),
-            JitMode::Threshold(1)
+            JitMode::Threshold(JIT_THRESHOLD_FLOOR)
+        );
+        // threshold=2 and up are honored as written (only 1 is refused).
+        assert_eq!(
+            VmOptions::parse_jit(Some("threshold=2")),
+            JitMode::Threshold(2)
         );
         assert_eq!(
             VmOptions::parse_jit(Some("threshold=10000")),

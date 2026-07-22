@@ -70,6 +70,14 @@ Object subclass: Posix [
     Posix class >> bind: fd addr: sa len: l [
         <primitive: FFI function: #bind ret: #g args: #(g g g)>
     ]
+    "recvfrom(fd, buf, len, flags, src_sockaddr, &src_len) — the datagram
+     read that CAPTURES the peer (unlike read, which drops it), so a
+     datagram server can answer its sender. Lives here (not in the socket
+     class layer, world/61c) because the IoWorker's datagram drain
+     (world/62) needs it and loads first. src/len 0/0 ignores the peer."
+    Posix class >> recvfromFd: fd buf: b len: n flags: f addr: a addrLenPtr: alp [
+        <primitive: FFI function: #recvfrom ret: #g args: #(g g g g g g)>
+    ]
     Posix class >> listen: fd backlog: b [
         <primitive: FFI function: #listen ret: #g args: #(g g)>
     ]

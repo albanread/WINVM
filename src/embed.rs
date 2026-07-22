@@ -2834,6 +2834,162 @@ mod tests {
         );
     }
 
+    /// Granular sockets, the DATAGRAM async path (docs/sockets_design.md):
+    /// a UDP echo server whose event loop is the IoWorker. The server
+    /// watches its socket with `via:onPacket:` — the IoWorker recvfrom's
+    /// (capturing the peer, which a plain read drops) and messages each
+    /// packet back as `[:bytes :from :port]`. The server echoes straight
+    /// to that peer, and the client — also watched non-blocking — gets the
+    /// echo. Proves the whole point of the rework: a datagram server
+    /// multiplexes non-blocking WITH the sender, no VM ever sleeps in
+    /// recvfrom. Loopback only.
+    #[test]
+    fn ioworker_udp_echo_recovers_peer_and_round_trips() {
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: UdpProbe [
+                <classVars: Server Client Got FromPort ServerGot>
+                UdpProbe class >> setUp: iow [
+                    Got := nil. ServerGot := nil.
+                    Server := UdpSocket boundToLoopback.
+                    Server via: iow onPacket: [ :bytes :from :port |
+                        ServerGot := bytes. FromPort := port.
+                        Server sendTo: from port: port data: bytes ].
+                    Client := UdpSocket new.
+                    Client via: iow onPacket: [ :bytes :from :port | Got := bytes ].
+                    iow startPumping.
+                    Client sendTo: InetAddress loopback port: Server localPort data: 'ECHO!' ]
+                UdpProbe class >> got [ ^Got ]
+                UdpProbe class >> gotSum [ | s | s := 0. Got isNil ifTrue: [ ^-1 ]. Got do: [ :b | s := s + b ]. ^s ]
+                UdpProbe class >> gotStr [
+                    | s |
+                    Got isNil ifTrue: [ ^'' ].
+                    s := String new: Got size.
+                    1 to: Got size do: [ :i | s basicByteAt: i put: (Got at: i) ].
+                    ^s ]
+                UdpProbe class >> fromPort [ ^FromPort ]
+                UdpProbe class >> clientPort [ ^Client localPort ]
+            ]",
+        )
+        .expect("define UdpProbe");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("WkTest w1: IoWorker spawn.").expect("spawn IoWorker");
+        vm.exec("UdpProbe setUp: WkTest w1.")
+            .expect("bind server, watch both sockets, send");
+        vm.exec("Worker runLoopWhile: [ (WkTest tickCapped: 300) and: [ UdpProbe got isNil ] ].")
+            .expect("pump until the echo returns");
+        assert_eq!(
+            vm.eval("UdpProbe gotStr = 'ECHO!'").expect("got").trim(),
+            "true",
+            "the datagram (raw bytes) echoed back to the client through the IoWorker, no blocking"
+        );
+        // E+C+H+O+! = 69+67+72+79+33 — the exact payload, not just any 5 bytes.
+        assert_eq!(vm.eval("UdpProbe gotSum").expect("sum").trim(), "320");
+        // The peer the server's recvfrom recovered IS the client's own
+        // ephemeral source port — the thing a plain read() would have lost.
+        assert_eq!(
+            vm.eval("UdpProbe fromPort = UdpProbe clientPort")
+                .expect("peer")
+                .trim(),
+            "true",
+            "the server recovered the client's real source port from recvfrom"
+        );
+        // Wind the pumping worker down (poke-wakes its infinite kevent) so
+        // the test binary exits promptly instead of waiting on a blocked
+        // I/O thread.
+        vm.exec("WkTest w1 terminate.").ok();
+    }
+
+    /// The non-blocking ICMP path: a real loopback ping whose reply arrives
+    /// as a continuation through the IoWorker (never a blocking recvfrom on
+    /// the pinging VM). Proves `IcmpSocket via:onReply:` parses the IP+ICMP
+    /// reply and hands back the sequence, all off the primary's thread.
+    #[test]
+    fn ioworker_icmp_ping_reply_is_a_continuation() {
+        let mut vm = boot_worker_primary();
+        vm.exec(
+            "Object subclass: PingProbe [
+                <classVars: Sock ReplySeq ReplyType>
+                PingProbe class >> setUp: iow [
+                    ReplySeq := nil.
+                    Sock := IcmpSocket new.
+                    Sock isOpen ifTrue: [
+                        Sock via: iow onReply: [ :type :code :seq |
+                            ReplyType := type. ReplySeq := seq ].
+                        iow startPumping.
+                        Sock sendEchoTo: InetAddress loopback id: 4660 seq: 42 ] ]
+                PingProbe class >> open [ ^Sock notNil and: [ Sock isOpen ] ]
+                PingProbe class >> replySeq [ ^ReplySeq ]
+                PingProbe class >> replySeqOr: d [ ^ReplySeq isNil ifTrue: [ d ] ifFalse: [ ReplySeq ] ]
+                PingProbe class >> replyType [ ^ReplyType ]
+            ]",
+        )
+        .expect("define PingProbe");
+        vm.exec("WkTest reset.").expect("reset");
+        vm.exec("WkTest w1: IoWorker spawn.").expect("spawn IoWorker");
+        vm.exec("PingProbe setUp: WkTest w1.")
+            .expect("open ICMP, watch reply, send echo");
+        // Where the OS refuses even the unprivileged ICMP socket, skip
+        // cleanly (the socket is closed — the layer's honest failure mode).
+        if vm.eval("PingProbe open").expect("open").trim() == "true" {
+            vm.exec(
+                "Worker runLoopWhile: [ (WkTest tickCapped: 300) and: [ PingProbe replySeq isNil ] ].",
+            )
+            .expect("pump until the echo reply lands");
+            assert_eq!(
+                vm.eval("PingProbe replySeqOr: -1").expect("seq").trim(),
+                "42",
+                "the echo reply's sequence came back as a continuation, off-thread"
+            );
+            assert_eq!(
+                vm.eval("PingProbe replyType").expect("type").trim(),
+                "0",
+                "ICMP type 0 = echo reply, parsed past the IP header"
+            );
+        }
+        vm.exec("WkTest w1 terminate.").ok();
+    }
+
+    /// The reworked Ping tool driven non-blocking through the IoWorker
+    /// (`Ping via:host:count:`): fire the echoes, pump the inbox loop until
+    /// the replies land as continuations, print the classic lines. Captures
+    /// the transcript and confirms it reports the loopback replies received
+    /// — the whole Ping driver end to end, never a blocking recvfrom.
+    #[test]
+    fn ping_via_ioworker_reports_loopback_replies() {
+        struct VecSink(Arc<Mutex<Vec<String>>>);
+        impl TranscriptSink for VecSink {
+            fn show(&mut self, text: &str) {
+                self.0.lock().unwrap().push(text.to_string());
+            }
+        }
+        let mut vm = boot_worker_primary();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        vm.set_transcript(Box::new(VecSink(captured.clone())));
+        // Skip cleanly where the OS refuses the unprivileged ICMP socket.
+        let icmp_ok = vm
+            .eval("IcmpSocket new isOpen")
+            .expect("probe icmp")
+            .trim()
+            .to_string();
+        if icmp_ok == "true" {
+            vm.exec("WkTest reset.").expect("reset");
+            vm.exec("WkTest w1: IoWorker spawn.").expect("spawn IoWorker");
+            vm.exec("Ping via: WkTest w1 host: '127.0.0.1' count: 3.")
+                .expect("run a non-blocking loopback ping");
+            let out = captured.lock().unwrap().concat();
+            assert!(
+                out.contains("3 sent, 3 received"),
+                "ping should report all three loopback replies received, got:\n{out}"
+            );
+            assert!(
+                out.contains("icmp_seq=1") && out.contains("icmp_seq=3"),
+                "ping should print a line per echo, got:\n{out}"
+            );
+            vm.exec("WkTest w1 terminate.").ok();
+        }
+    }
+
     /// The slice-C capstone (docs/asyncio_design.md): the STREAM library end
     /// to end. A line-echo TCP server built entirely from the ergonomic
     /// surface — `TcpListener onConnection:` hands the accepted fd over as a

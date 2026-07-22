@@ -16,6 +16,12 @@ ArrayedCollection subclass: ByteArray [
     at: i put: v [
         <primitive: 41>
     ]
+    "Raw byte access, the same name String uses (basicByteAt: is String's
+     un-Character'd byte accessor). Here it is just `at:` — a ByteArray's
+     element already IS a raw byte — so byte-copy code (e.g. Socket's send
+     path) works uniformly on a String OR a ByteArray without caring which."
+    basicByteAt: i [ ^self at: i ]
+    basicByteAt: i put: v [ ^self at: i put: v ]
     size [
         <primitive: 28>
     ]
