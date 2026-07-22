@@ -639,3 +639,37 @@ exercise. fib reached PARITY (175 vs 181) after the smi-speculation fix.
 
 Still not baselined: floats, anything block-heavy.
 
+
+## 2026-07-22 — alloc: DIAGNOSED AND FIXED (145ms -> 52ms; 13ms with a Cog-sized nursery)
+
+The verified cause above was right about the disease but wrong about the
+site. The fused `Ir::Alloc` DID land in each constructor's own nmethod —
+and changed nothing, because small constructors are SPLICED into their
+callers, and neither the nonleaf nor the CFG splicer had an alloc arm:
+the spliced body's `basicNew` demoted to a generic `CallSend`. On x64,
+prim 23 has no shim, so that send linked to a c2i adapter — one full
+interpreter round trip (~46ns) per object. Counter-instrumented run of
+the alloc microbenches: **24,000,000 interpreted `basicNew` sends**,
+deopt_count=0, total scavenge time 4ms. The entire gap was c2i.
+
+Fix (dca37b9), two halves shared with the Mac:
+
+- Customized `self basicNew` (gc_alloc_gap.md cost 1): a body whose
+  receiver klass is a statically-proven metaclass recovers the sole
+  instance from the globals namespace and lowers to `Ir::Alloc`, target
+  resolved against the live world (no IC warmth), invalidation kept
+  sound by a `(metaclass, selector)` inline dep.
+- `alloc_site_klass_on`: the alloc gate generalized to a spliced
+  callee's own IC table; both splicers now fuse in-body `basicNew`, and
+  their `PushGlobal` arms track `const_class` like the root.
+
+| bench | before | after | after + MACVM_EDEN=32768 | Cog |
+|---|---|---|---|---|
+| alloc (warm) | 137-145 | 52 | **13** | 16-17 |
+| deltablue (warm) | 6-7 | 5 | 5 | <1 |
+
+Callee-shaped microbench (`^Association basicNew` called 2M times):
+89ms -> 5ms. The remaining default-eden gap is nursery geometry
+(gc_alloc_gap.md cost 2, upstream's item): the 4MB eden forces ~122
+scavenges/run; 32MB makes WINVM FASTER than Cog on its own alloc bench.
+richards is unchanged (~90 warm) — its loss is not allocation.
