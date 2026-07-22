@@ -772,9 +772,8 @@ fn worker_loop(
     // can't be established at all, fall back to the old `.mst` boot + mock
     // seed so the GUI still works.
     let image_path = resolve_image_path(world_dir);
-    eprintln!("PROBE worker_loop: image_path={}", image_path.display());
     let (image, mut vm) = match open_or_seed_image(world_dir, &image_path) {
-        Ok(img) => match { eprintln!("PROBE: image opened, booting vm"); let r = boot_vm_from_image(&img, responses.clone(), wake); eprintln!("PROBE: boot_vm_from_image -> {}", r.is_some()); r } {
+        Ok(img) => match boot_vm_from_image(&img, responses.clone(), wake) {
             Some(vm) => (Some(img), vm),
             // The image opened but the world load failed — most likely a
             // STALE image written by an older importer. Fall back to the
@@ -3216,33 +3215,24 @@ mod tests {
         );
 
         // A shape that genuinely isn't built (an unknown send) renders nothing,
-        // so the GUI keeps the G0 placeholder box.
-        //
-        // macOS-only for now: reaching this asserts that the DNU the unknown
-        // send raises is CAUGHT — that is guest-fatal recovery (`siglongjmp`
-        // back to `eval`'s `sigsetjmp`), and on Windows both are still stubs,
-        // so the abort would take the whole test binary down rather than fail
-        // this assertion. See `worker_survives_an_unhandled_runtime_error_
-        // and_serves_the_next_request` for the full note and `../MIGRATION.md`
-        // §6 for the tracked follow-up. The rest of this round trip is
-        // platform-neutral and does run on Windows.
-        #[cfg(target_os = "macos")]
-        {
-            let unbuildable = handle(
-                VmRequest::SmapplRender {
-                    id: "s1".to_string(),
-                    code: "Object doesNotExistXyz".to_string(),
-                },
-                &mut world,
-                &mut selection,
-                None,
-                &mut vm,
-            );
-            assert!(
-                unbuildable.is_empty(),
-                "an unbuildable shape must yield no fragment, got {unbuildable:?}"
-            );
-        }
+        // so the GUI keeps the G0 placeholder box. Reaching this asserts the DNU
+        // the unknown send raises is CAUGHT — guest-fatal recovery (`siglongjmp`
+        // back to `eval`'s `sigsetjmp`), which now works on Windows too (the
+        // hand-written non-unwinding setjmp/longjmp, `../MIGRATION.md` §6).
+        let unbuildable = handle(
+            VmRequest::SmapplRender {
+                id: "s1".to_string(),
+                code: "Object doesNotExistXyz".to_string(),
+            },
+            &mut world,
+            &mut selection,
+            None,
+            &mut vm,
+        );
+        assert!(
+            unbuildable.is_empty(),
+            "an unbuildable shape must yield no fragment, got {unbuildable:?}"
+        );
 
         // CodeView (gui/smappl.md §3.5) IS built now — it renders a source box,
         // with the source HTML-escaped once (a `<` in the source → `&lt;`).
@@ -4396,19 +4386,13 @@ mod tests {
     /// Wake target is absent — `Waker::notify` short-circuits, so
     /// this needs no windowing system (headless-safe).
     ///
-    /// **macOS-only until Windows guest-fatal recovery lands** (the known
-    /// Phase-2 follow-up in `../MIGRATION.md` §6, not a GUI-port regression).
-    /// The recovery this asserts *is* `siglongjmp` back to `eval`'s
-    /// `sigsetjmp`, and on Windows both are stubs:
-    /// `codecache::deopt_trap::siglongjmp` calls `std::process::abort()`
-    /// (which is what surfaces as `STATUS_STACK_BUFFER_OVERRUN`/0xc0000409).
-    /// So on Windows today a DNU reports its error to the transcript and then
-    /// takes the process down — this test would not fail, it would abort the
-    /// whole test binary and take every sibling test with it.
-    ///
-    /// Re-enable by deleting this gate once the `catch_unwind`-based recovery
-    /// `MIGRATION.md` proposes exists; it is the acceptance test for it.
-    #[cfg(target_os = "macos")]
+    /// Runs on Windows too, as of the Windows guest-fatal recovery
+    /// (`../MIGRATION.md` §6 / `codecache::deopt_trap`'s hand-written
+    /// non-unwinding `sigsetjmp`/`siglongjmp`): the recovery this asserts *is*
+    /// `siglongjmp` back to `eval`'s `sigsetjmp`, and this is its end-to-end
+    /// acceptance test on both platforms. Before that landed, a DNU on Windows
+    /// aborted the whole test binary (the `siglongjmp` stub called
+    /// `process::abort`, surfacing as 0xC0000409).
     #[test]
     fn worker_survives_an_unhandled_runtime_error_and_serves_the_next_request() {
         // Isolate the image to a temp dir, pre-seeded once, so the worker boots

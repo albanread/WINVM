@@ -38,7 +38,7 @@ rewriting the architecture-specific back half of the compiler.
 | `src/compiler/` back end: `assembler.rs`, `emit.rs` (142 KB), `regalloc.rs` (70 KB), `oopmap.rs`, `jasm_assembler.rs`, `disasm_a64.rs` | ~6 k+ | **Rewrite for x64.** This is the core of the port. |
 | `src/codecache/` | 9,061 | **Heavy arch content.** `stubs.rs` (157 KB) and `deopt_trap.rs` (116 KB) emit AArch64 and use Mach signal traps; `pics.rs`, `adapters.rs`, `nmethod.rs` patch fixed-width A64 sites; `flush.rs` does icache maintenance. All need x64 equivalents — but each has a design doc in `docs/`. |
 | `src/vendor/wfasm/` | 8,239 | **Re-vendor from E:\JASM** — swap `a64/` encoder for `rasm/`, `native_macos.rs` for `native.rs`/`win32.rs`, keep `relocpatch.rs` shape with x64 reloc kinds. The vendor header explicitly says "keep the diff against upstream minimal so re-vendoring stays mechanical." |
-| `gui/` (WKWebView) | — | **Port shell to WebView2**; the HTML/CSS/JS Strongtalk environment itself is portable. |
+| `gui/` (WKWebView) | — | **DONE (M6).** Shell ported to Win32 + WebView2 behind `gui/src/shell/`; the HTML/CSS/JS Strongtalk environment itself needed **no edits at all**. |
 | `cocoa_gui/` (AppKit) | — | **Defer / replace** with a Win32-native shell later (JASM's generated Win32 bindings + WF66's `igui` experience are the raw material). |
 | Metal/AVFoundation game demos | — | **Defer.** D3D11/XAudio2 stretch goal. |
 | `QBEJIT/` (1.5 MB C) | — | Vendored experiment; **exclude** from the Windows build unless `cargo build` proves otherwise. |
@@ -470,6 +470,134 @@ relative-to-C ratios.
   `verified_entry_off` — and requires the same answer, which is what
   makes that offset a genuine entry point rather than a number.
   699 lib tests pass; world interpreter still 5891/0.
+
+- **2026-07-21 — M6 done (Phase 6, the GUI). The web environment runs on
+  Windows.** `gui/` is now cross-platform and builds as `winvm-gui`; the
+  HTML/CSS/JS environment, the page pipeline (`preprocess`), the render
+  modules, and the VM worker (`vm_host`) all ported **unmodified**. What
+  changed is the shell, now behind one narrow seam (`gui/src/shell/`:
+  `mod.rs` defines it, `mac.rs` is the relocated Cocoa/WKWebView shell,
+  `win.rs` is the new Win32 + WebView2 one). `main.rs` no longer contains a
+  single platform call: the shell owns the event loop and calls *up*
+  (`on_script_message`, `on_vm_drain`, `on_menu_action`, `on_metrics_tick`),
+  `main.rs` calls *down* for effects.
+  - **Three mechanisms had no counterpart and needed replacing, not porting.**
+    (1) *Local assets.* WKWebView widens a `file://` page's sandbox via
+    `loadFileURL:allowingReadAccessToURL:`; WebView2 has no such grant, and a
+    `file://` page cannot load `smtk.js` or a theme stylesheet at all. The
+    equivalent is `SetVirtualHostNameToFolderMapping`, publishing the GUI root
+    at `http://winvm.local`, so `preprocess` emits origin-relative URLs on
+    Windows and `file://` on macOS — same tree, different grant model.
+    (2) *The JS bridge.* `assets/smtk.js` is shared verbatim with MACVM and
+    posts through `window.webkit.messageHandlers`; rather than fork the asset
+    (it would drift), the shell injects a shim via
+    `AddScriptToExecuteOnDocumentCreated` forwarding to
+    `window.chrome.webview.postMessage`. **The web environment needed no
+    Windows-specific edit at all** — §1's "the HTML/CSS/JS environment itself
+    is portable" held exactly. (3) *The worker→UI wakeup.*
+    `performSelectorOnMainThread:` → `PostMessageW`; both are the platform's
+    one documented thread-safe way into the UI thread.
+  - **Never block on an async WebView2 call from inside a callback.**
+    `wait_for_async_operation` runs a *nested message loop*; calling it from
+    inside `WebMessageReceived` pumps messages re-entrantly inside a COM
+    callback and deadlocks. So `eval_js` is fire-and-forget — which costs
+    nothing, since the macOS side passes a nil completion handler for exactly
+    the same reason. Learned by hanging a probe, not by reading docs.
+  - **The bug that mattered was, once again, two correct components
+    disagreeing about a convention.** `main` spawns the VM worker *before*
+    creating the window (so the world boots while the shell comes up), and the
+    first Windows `Waker` captured `HWND_MAIN` at construction — i.e. 0. Every
+    wakeup for the life of the process then silently did nothing: the VM
+    computed correct answers that never reached the page. The macOS waker has
+    no such hazard (it lazily builds its bridge object), so the seam hid the
+    difference. The waker now reads the handle at `notify` time, and startup
+    posts one drain once the window exists. **Found by driving a real doit
+    through the running app and watching nothing happen** — the fifth time in
+    this port that running the thing beat reading it.
+  - **A genuine cross-platform performance bug, surfaced by Windows.**
+    `image_store::backfill_method_sends` committed one transaction per
+    inserted send-edge — ~5,900 of them, each an fsync. On macOS that is
+    merely slow; on Windows/NTFS it took minutes, and since it sits on the VM
+    worker's boot path the whole environment appeared to start and then never
+    serve a request. Now one transaction and one prepared statement; this
+    helps macOS too.
+  - **Verified against the running app**, not just compiled: page served over
+    the virtual host, 3 stylesheets + `smtk.js` + 15 toolbar icons loaded (no
+    broken subresources), UTF-8 intact, the shim live, `Transcript show:` round
+    tripping page→shim→Rust→VM worker→`PostMessageW`→drain→DOM in ~1s, the
+    metrics dashboard sampling (516 nmethods — the x64 JIT compiling under the
+    GUI), the **class browser listing 160 classes and loading a selected
+    class's 46 methods**, and the Workspace opening. That is M6's
+    "class browser + workspace usable on Windows."
+  - **Deferred, deliberately:** the native game pane and the game demos are
+    behind an off-by-default `gamepane` feature (macOS-only; §1 defers
+    D3D11/XAudio2). Note a cargo path dependency's manifest must be *readable*
+    for the workspace to resolve at all — even `optional` and target-gated —
+    so the MacGamePane path deps are not declared in this checkout; `gui/
+    Cargo.toml` records how to restore them.
+  - `winvm-gui`: **99 unit + 1 integration test pass**; the main crate is
+    unchanged at **730 lib tests**.
+  - **Guest-fatal recovery — FIXED (see the next entry).** The DNU-takes-the-
+    GUI-down limitation this entry originally flagged is closed; the two
+    `vm_host` tests and the smappl round-trip section are un-gated and run on
+    Windows. Still open, and unrelated: the world's
+    `Time class>>millisecondClockValue` is POSIX (`mmap` + `clock_gettime`),
+    so it needs a Windows implementation via `GetSystemTimeAsFileTime` through
+    the winkb resolver — a world-level FFI gap, not a recovery one.
+- **2026-07-21 — Windows guest-fatal recovery (the GUI's DNU gap, closed).**
+  An unhandled Smalltalk error — a DNU or `self error:`, i.e. the most common
+  Workspace typo — now recovers on Windows exactly as on macOS: the error is
+  reported to the transcript, the current computation is abandoned, and the VM
+  keeps serving. Before this, `codecache::deopt_trap::siglongjmp` was a stub
+  that called `process::abort()`, so the first DNU took the whole GUI down.
+  - **The mechanism is a hand-written, NON-unwinding `sigsetjmp`/`siglongjmp`
+    (`codecache::deopt_trap`, x86-64 `global_asm!`), not SEH unwinding.** This
+    is the crux, and the reason a naive port fails: the recovery jump crosses
+    interpreter AND JIT-compiled frames, and JIT frames carry no unwind info,
+    so unwinding through them is undefined — the CRT's own `longjmp` unwinds on
+    x64 and is therefore unusable, and `panic!`/`catch_unwind` is unsound for
+    the same reason (the standing project rule: never unwind through JIT
+    frames). The POSIX side already solved this by using libc's asm
+    `sigsetjmp`; Windows has no `sigsetjmp`, so this supplies the same shape:
+    save the callee-saved set + the CALLER's return address and post-return
+    RSP, then `jmp` straight back into `eval`'s frame, abandoning everything
+    between without touching it. The VM resets its own stack/arena afterward
+    (`restore_after_guest_fatal`), so no `Drop` needs to run — which is exactly
+    what "no unwind" means.
+  - **`RtlCaptureContext`/`RtlRestoreContext` were tried first and are subtly
+    wrong** — worth recording so it isn't re-attempted. Wrapped in a Rust
+    helper they capture the *helper's* frame, but `sigsetjmp` returns, so that
+    frame is dead by the time a later `siglongjmp` targets it; the restore then
+    resumes into reused stack memory. `setjmp` must save the *caller's*
+    continuation, which is why the real implementations are asm and why this
+    one is too. Caught in an isolated probe (return-twice, a 60-frame jump with
+    zero `Drop`s, int+XMM integrity) before any of it touched the VM — the same
+    "validate the fault mechanism in a scratchpad first" discipline the macOS
+    layer's own comments describe.
+  - **Windows callee-saved is wider than SysV** — RBX RBP RDI RSI R12–R15 plus
+    MXCSR, the x87 control word, and XMM6–XMM15 (all nonvolatile on Win64) — so
+    the buffer saves all of them; a caller holding a live float in an XMM
+    nonvolatile across the call is reconstituted correctly.
+  - **Two triggers, both wired.** (1) The DNU/`error:` path (`raise_guest_fatal`)
+    is a plain call and now just works via the new `siglongjmp` — this is what
+    fixes the GUI, and it never involves the VEH. (2) The hardware-fault path:
+    the VEH (`handle_win_fault`) now mirrors the macOS `sig_fault_handler`
+    foreign branch — a genuinely foreign access violation (a wild deref in
+    interpreter/FFI code, not in a code cache where PROBE's dossier is right) on
+    a thread with a recovery slot is redirected into `winvm_longjmp` via a
+    context rewrite and `EXCEPTION_CONTINUE_EXECUTION`, reusing the asm restore
+    rather than duplicating the buffer layout. `STATUS_STACK_OVERFLOW` is
+    deliberately excluded (Windows has consumed the guard page by then; a
+    respawn is the right response), a defensible divergence from the literal
+    macOS mirror, documented at the site.
+  - **Verified in the running app, not just in tests:** a DNU in the live
+    Workspace reports to the transcript and the VM serves the next doit
+    (`STILL-ALIVE-81`), then survives a SECOND DNU and serves again
+    (`AND-AGAIN-158`) — the process stays up throughout. Plus: two focused
+    `deopt_trap` tests (a 50-frame `siglongjmp` with zero `Drop`s; a real
+    access violation recovered through the VEH with the faulting address read
+    back), and the `winvm-gui` suite at **100 unit + 1 integration**, main
+    crate at **732 lib** (two new).
 
 ## 8. The remaining gap to a firing JIT — measured, not estimated
 

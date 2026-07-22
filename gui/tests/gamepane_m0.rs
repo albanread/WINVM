@@ -1,3 +1,11 @@
+//! **Requires the `gamepane` feature** (macOS + a MacGamePane checkout beside
+//! this repo). It is off by default: `../MIGRATION.md` §1 defers the game
+//! demos on Windows, and the MacGamePane path dependencies are not declared in
+//! this checkout at all (see `Cargo.toml`'s `gamepane` feature for how to
+//! restore them). Without the gate this file would fail to compile on every
+//! default build rather than simply not running.
+#![cfg(feature = "gamepane")]
+
 //! M0 (docs/gamepane_design.md, "Milestone ladder"): prove the metal-crate
 //! coupling. This test exists to retire the single biggest integration unknown
 //! *before* any Smalltalk surface is built: that MACVM's `gui` crate can link

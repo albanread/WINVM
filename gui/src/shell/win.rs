@@ -159,41 +159,55 @@ pub fn base_url(dir: &Path) -> String {
 // ── Worker -> UI wakeup ────────────────────────────────────────────────────
 
 /// A thread-safe handle the VM worker uses to wake the UI thread
-/// (`vm_host.rs`). Carries only the window handle as an integer, so it is
-/// trivially `Send`/`Copy`; the actual cross-thread call is `PostMessageW`,
-/// which is documented as safe from any thread.
+/// (`vm_host.rs`). The actual cross-thread call is `PostMessageW`, which is
+/// documented as safe from any thread — the property this whole design rests
+/// on.
+///
+/// It deliberately carries only "am I a real waker", and reads the window
+/// handle from [`HWND_MAIN`] at `notify` time rather than capturing it at
+/// construction. That is not defensive style, it is a bug fix: `main` spawns
+/// the VM worker *before* creating the window, so it can boot the world while
+/// the shell comes up. A waker that captured the handle would capture 0, and
+/// then every wakeup for the life of the process would silently do nothing —
+/// the VM would compute correct answers that never reached the page. The
+/// macOS waker has no such hazard (it lazily builds its bridge object), so
+/// this is exactly the kind of shared-convention mismatch between two
+/// separately-correct components that this port keeps turning up.
+///
+/// Found by driving a real doit through the running app and watching nothing
+/// happen, not by reading the code.
 #[derive(Clone, Copy)]
 pub struct Waker {
-    hwnd: isize,
+    enabled: bool,
 }
 
 impl Waker {
-    /// A waker with no window behind it — headless tests drive
-    /// `VmHost::drain_responses` directly and must not need a UI thread.
+    /// A waker with no UI thread behind it — headless tests drive
+    /// `VmHost::drain_responses` directly and must not need a window. Unused
+    /// outside `cfg(test)` by design.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn none() -> Self {
-        Self { hwnd: 0 }
+        Self { enabled: false }
     }
 
     pub fn notify(self) {
-        if self.hwnd == 0 {
+        if !self.enabled {
             return;
         }
+        let hwnd = HWND_MAIN.load(Ordering::Relaxed);
+        if hwnd == 0 {
+            return; // window not up yet; the next response will wake it
+        }
         unsafe {
-            let _ = PostMessageW(
-                Some(HWND(self.hwnd as *mut _)),
-                WM_VM_DRAIN,
-                WPARAM(0),
-                LPARAM(0),
-            );
+            let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_VM_DRAIN, WPARAM(0), LPARAM(0));
         }
     }
 }
 
-/// The waker for this process's main window.
+/// The waker for this process's main window. Safe to call before the window
+/// exists — see [`Waker`].
 pub fn waker() -> Waker {
-    Waker {
-        hwnd: HWND_MAIN.load(Ordering::Relaxed),
-    }
+    Waker { enabled: true }
 }
 
 // ── Startup ────────────────────────────────────────────────────────────────
@@ -409,7 +423,7 @@ pub fn create_window_and_webview() {
 
         let (tx, rx) = mpsc::channel();
         CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
-            Box::new(move |handler| unsafe {
+            Box::new(move |handler| {
                 CreateCoreWebView2EnvironmentWithOptions(
                     PCWSTR::null(),
                     PCWSTR(user_data_w.as_ptr()),
@@ -432,7 +446,7 @@ pub fn create_window_and_webview() {
 
         let (tx, rx) = mpsc::channel();
         CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
-            Box::new(move |handler| unsafe {
+            Box::new(move |handler| {
                 environment
                     .CreateCoreWebView2Controller(window, &handler)
                     .map_err(Into::into)
@@ -506,8 +520,8 @@ fn install_message_handler(webview: &ICoreWebView2) {
             &WebMessageReceivedEventHandler::create(Box::new(move |_wv, args| {
                 let Some(args) = args else { return Ok(()) };
                 let mut json = PWSTR::null();
-                unsafe { args.WebMessageAsJson(&mut json)? };
-                let text = unsafe { json.to_string() }.unwrap_or_default();
+                args.WebMessageAsJson(&mut json)?;
+                let text = json.to_string().unwrap_or_default();
                 let message = crate::shell::ScriptMessage::from_fields(parse_flat_json(&text));
                 crate::on_script_message(&message);
                 Ok(())
@@ -627,6 +641,11 @@ pub fn edit_action(action: &str) {
 
 /// Return keyboard focus to the page. On Windows the web view is a child of
 /// the host window, so focus can sit on the bare host after a frame click.
+///
+/// Part of the shell seam both platforms implement; its only caller today is
+/// the game pane's teardown, which is macOS-only — hence unused here rather
+/// than missing.
+#[allow(dead_code)]
 pub fn focus_webview() {
     CONTROLLER.with(|c| {
         if let Some(controller) = c.borrow().as_ref() {

@@ -694,16 +694,49 @@ impl Image {
                 stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // ONE transaction and ONE prepared statement for the whole backfill.
+        //
+        // This is not a micro-optimisation. Outside an explicit transaction
+        // SQLite commits every `INSERT` separately, and a commit is an fsync:
+        // the world's ~1,300 methods send tens of thousands of selectors, so
+        // the unbatched form asks the OS to flush the DB to disk tens of
+        // thousands of times. On macOS that is merely slow (fsync there does
+        // not force a device-level flush); on Windows/NTFS — with a real
+        // flush per commit, and a virus scanner watching the file — the same
+        // loop takes minutes, which is indistinguishable from a hang.
+        //
+        // That is exactly how it presented: the GUI's VM worker calls this on
+        // the boot path (`vm_host::open_or_seed_image`), so the whole
+        // environment appeared to start and then never serve a single
+        // request. Batching makes it one commit, and helps macOS too.
         let mut inserted = 0usize;
-        for (version_id, source) in pending {
-            for selector in crate::mst::sent_selectors(&source) {
-                inserted += self.conn.execute(
-                    "INSERT OR IGNORE INTO method_sends (method_version_id, selector) VALUES (?1, ?2)",
-                    params![version_id, selector],
-                )?;
+        self.conn.execute_batch("BEGIN")?;
+        let result = (|| -> rusqlite::Result<()> {
+            let mut stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO method_sends (method_version_id, selector) VALUES (?1, ?2)",
+            )?;
+            for (version_id, source) in pending {
+                for selector in crate::mst::sent_selectors(&source) {
+                    inserted += stmt.execute(params![version_id, selector])?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(inserted)
+            }
+            Err(e) => {
+                // Leave no open transaction behind on this connection — a
+                // later write would otherwise fail or silently join it.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
             }
         }
-        Ok(inserted)
     }
 
     /// Whether a method is live / a deletion tombstone / absent

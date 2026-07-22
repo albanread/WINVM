@@ -254,7 +254,7 @@ fn macvm_help_index() -> PathBuf {
 /// read access to the whole `gui/` root covers the rendered file, the
 /// original page's own directory (so *its* relative links/images keep
 /// resolving), and `assets/`/`reference/icons-png/` in one grant.
-/// `macvm-gui render <page.html> [--theme NAME] [--world DIR] [-o OUT]` — the
+/// `winvm-gui render <page.html> [--theme NAME] [--world DIR] [-o OUT]` — the
 /// headless "eyes" command. Runs the full page pipeline (preprocess + real-VM
 /// smappl resolution + icon theming) with NO Cocoa window, inlines the theme
 /// CSS so the output is self-contained, and writes it (default:
@@ -293,7 +293,7 @@ fn cmd_render(args: &[String]) {
         i += 1;
     }
     let Some(page) = page else {
-        eprintln!("usage: macvm-gui render <page.html> [--theme NAME] [--world DIR] [-o OUT]");
+        eprintln!("usage: winvm-gui render <page.html> [--theme NAME] [--world DIR] [-o OUT]");
         std::process::exit(2);
     };
 
@@ -368,7 +368,7 @@ fn cmd_render(args: &[String]) {
     println!("{}", out.display());
 }
 
-/// `macvm-gui seed [--world DIR]` — import `world/*.mst` into
+/// `winvm-gui seed [--world DIR]` — import `world/*.mst` into
 /// `<world_dir>/image.sqlite3` without launching the GUI. Headless complement
 /// to `render`: the class browser and the ClassOutliner's method-source
 /// blocks read their text from this DB (the running VM keeps no source).
@@ -408,14 +408,14 @@ fn cmd_seed(args: &[String]) {
     }
 }
 
-/// `macvm-gui run <file.mst> [--world DIR] [--from-image]` (M7,
+/// `winvm-gui run <file.mst> [--world DIR] [--from-image]` (M7,
 /// `docs/package_aware_editing_design.md` §4.5/§6). Boots a VM and runs a
 /// `.mst` program to completion, exactly as the bare `macvm run` CLI does —
 /// with an OPT-IN `--from-image` that boots the world from the SQLite image
 /// (via the M2-extracted `world_boot::load_world_from_image`, requesting the
 /// base `WORLD_LISTS`) instead of the `.mst`-direct default.
 ///
-/// Why this lives in `macvm-gui`, not the bare `macvm` bin (the design doc's
+/// Why this lives in `winvm-gui`, not the bare `macvm` bin (the design doc's
 /// literal M7 target): `image_store` depends on `macvm`, so the root `macvm`
 /// bin cannot depend on `image_store` — a dependency cycle. This crate
 /// depends on both, so it is the CLI home for a DB-boot path. The `.mst`
@@ -444,14 +444,14 @@ fn cmd_run_gui(args: &[String]) {
             "--from-image" => from_image = true,
             other if file.is_none() => file = Some(other.to_string()),
             other => {
-                eprintln!("macvm-gui run: unexpected argument {other:?}");
+                eprintln!("winvm-gui run: unexpected argument {other:?}");
                 std::process::exit(2);
             }
         }
         i += 1;
     }
     let Some(file) = file else {
-        eprintln!("usage: macvm-gui run <file.mst> [--world DIR] [--from-image]");
+        eprintln!("usage: winvm-gui run <file.mst> [--world DIR] [--from-image]");
         std::process::exit(2);
     };
 
@@ -461,7 +461,7 @@ fn cmd_run_gui(args: &[String]) {
         let image = match image_store::import::open_or_seed(&world_dir, &image_path) {
             Ok(img) => img,
             Err(e) => {
-                eprintln!("macvm-gui run --from-image: {e}");
+                eprintln!("winvm-gui run --from-image: {e}");
                 std::process::exit(1);
             }
         };
@@ -472,7 +472,7 @@ fn cmd_run_gui(args: &[String]) {
             vm_host::WORLD_LISTS,
             vm_host::WORLD_DOITS,
         ) {
-            eprintln!("macvm-gui run --from-image: DB-boot failed: {e}");
+            eprintln!("winvm-gui run --from-image: DB-boot failed: {e}");
             std::process::exit(1);
         }
         vm
@@ -480,7 +480,7 @@ fn cmd_run_gui(args: &[String]) {
         match macvm::embed::VmHandle::boot(opts, &world_dir) {
             Ok(vm) => vm,
             Err(e) => {
-                eprintln!("macvm-gui run: boot failed: {}", e.msg);
+                eprintln!("winvm-gui run: boot failed: {}", e.msg);
                 std::process::exit(1);
             }
         }
@@ -495,7 +495,7 @@ fn cmd_run_gui(args: &[String]) {
     }
 }
 
-/// `macvm-gui export --world DIR` — write the image back over `DIR`'s
+/// `winvm-gui export --world DIR` — write the image back over `DIR`'s
 /// `world/*.mst` (in place, surgically) so interactive edits can be reviewed and
 /// checked into source control. Headless complement to `seed` (the reverse
 /// direction); the GUI's File ▸ "Save World to Files" runs the same code.
@@ -601,7 +601,7 @@ fn navigate_to(path: &Path) -> bool {
     ) {
         Ok(html) => html,
         Err(e) => {
-            eprintln!("macvm-gui: failed to load {}: {e}", path.display());
+            eprintln!("winvm-gui: failed to load {}: {e}", path.display());
             return false;
         }
     };
@@ -2146,6 +2146,14 @@ fn main() {
     shell::build_menu_bar();
     update_theme_menu_checkmarks();
     navigate_to(&start);
+
+    // The worker was spawned before the window existed (so the world boots
+    // while the shell comes up), which means anything it finished in that
+    // window — its boot transcript, most visibly — was queued with no UI
+    // thread to wake. Ask for one drain now that there is one; without it
+    // those responses would sit in the channel until the *next* wakeup
+    // happened to arrive.
+    shell::waker().notify();
 
     // Demo trigger (docs/gamepane_design.md): open the native game pane and
     // start a real Smalltalk-driven frame loop, exercising the whole M4 path

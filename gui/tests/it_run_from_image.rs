@@ -21,12 +21,12 @@ const PROGRAM: &str = "\
 Transcript showCr: (3 + 4) printString.
 Transcript showCr: ((1 to: 5) inject: 0 into: [:a :b | a + b]) printString.
 Transcript showCr: (OrderedCollection new add: #alpha; add: #beta; yourself) printString.
-Transcript showCr: 'macvm-gui run: done'.
+Transcript showCr: 'winvm-gui run: done'.
 ";
 
 #[test]
 fn run_from_image_boots_identically_to_mst_direct() {
-    let bin = env!("CARGO_BIN_EXE_macvm-gui");
+    let bin = env!("CARGO_BIN_EXE_winvm-gui");
     let tag = std::process::id();
     let prog = std::env::temp_dir().join(format!("macvm_m7_prog_{tag}.mst"));
     let image = std::env::temp_dir().join(format!("macvm_m7_image_{tag}.sqlite3"));
@@ -58,7 +58,7 @@ fn run_from_image_boots_identically_to_mst_direct() {
     let mst_direct = run(false);
     // Sanity: the default path actually ran the program (not an empty world).
     assert!(
-        mst_direct.contains("macvm-gui run: done") && mst_direct.contains('7'),
+        mst_direct.contains("winvm-gui run: done") && mst_direct.contains('7'),
         "the .mst-direct run produced unexpected output:\n{mst_direct}"
     );
 
