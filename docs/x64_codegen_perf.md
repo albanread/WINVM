@@ -480,3 +480,53 @@ instruction numbering, and — once fixed — any future dominance/liveness
 consumer), and an edge it lies about is a trap for the next analysis that
 trusts it. One-line fix: add `| Ir::BoolNot { fail, .. }` to the
 `succs.push(*fail)` group.
+
+### 3. F7's entry-scan stop condition is too weak — latent, tightened on the Mac
+
+A third 9cb272e finding, from porting F7 to arm64 (MACVM `3072c77`; verified
+against this checkout, all three ingredients present).
+
+`entry_early_defs` (regalloc.rs ~1231) counts a def as "unconditionally
+executed before any safepoint" if it appears in the entry block before the
+first `is_safepoint(op)`. But `is_safepoint` (correctly) lists only
+CallSend / CallRuntime / Alloc / FBox / UncommonTrap / Poll — **not** the
+mid-block fail-edge ops (`SmiArith`'s overflow arm, `GuardKlass`,
+`ArrayAt`'s bounds arm, `BoolNot`'s non-boolean arm). Such an op can leave
+the entry block EARLY, before a def sitting after it ever runs. That
+matters because of task-#94's own back-recording (regalloc.rs ~345: each
+trap-referenced vreg is "recorded at EVERY safepoint up to and including
+the trap"): a vreg referenced by a LATER trap is in the oop map of an
+EARLIER trap too — including one reached through that early exit. On the
+diverted path the def never ran, the prologue no longer nil-fills the
+slot, and the GC that can strike during deopt materialization scans
+uninitialized native stack.
+
+Why the suite still passes: in practice the frontend emits params and temp
+nil-initializers at the very top of the entry block, before any guard, so
+the counted defs genuinely dominate. The hole needs a def BETWEEN a
+fail-edge op and the first call/trap in the entry block — rare, but
+nothing forbids it, and it is exactly the kind of path-shape a future
+frontend or IR transform could produce silently.
+
+Fix as landed on the Mac — replace the stop condition with a WHITELIST of
+the leading run: only ops that can neither divert control nor skip their
+def count, and the scan stops at the first op of any other kind:
+
+    for op in &entry.code {
+        match op {
+            Ir::Param { .. }
+            | Ir::ConstPool { .. }
+            | Ir::ConstSmi { .. }
+            | Ir::Move { .. } => op.defs(|v| {
+                set.insert(v.0);
+            }),
+            _ => break,
+        }
+    }
+
+Strictly more conservative, and it keeps F7's entire practical payload
+(params + immediate temp initializers are exactly these four ops). Measured
+on the Mac after the swap: fib 153 -> 142 ms (its three param/const fills
+removed), watch rows unchanged, the 6000-test differential byte-identical
+across interp / JIT / GC-stress / full-GC-period / deopt-stress and a
+4-way parallel soak.
