@@ -1280,6 +1280,31 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `GuardKlassIn`: the membership form of the klass guard — one smi
+    /// rejection, ONE klass load, then a compare chain (hottest klass first,
+    /// the decision layer's count order) falling to `cold` only when none
+    /// match. Mirrors the x64 emitter's `emit_klass_guard_in`.
+    fn emit_guard_klass_in(&mut self, obj: VReg, expects: &[PoolLit], fail: BlockId) {
+        debug_assert!(!expects.is_empty());
+        let robj = self.resolve(obj, 16);
+        let cold = self.block_label(fail);
+        self.asm.emit("tst", &[Operand::Reg(robj), imm(3)]);
+        self.asm.b_cond(Cond::Eq, cold);
+        self.asm.emit("ldur", &[x(17), mem(robj.num, 7)]);
+        let ok = self.asm.new_label();
+        for (i, expect) in expects.iter().enumerate() {
+            let expect_lit = self.literal_ids[expect.0 as usize];
+            self.asm.ldr_literal(xr(16), expect_lit);
+            self.asm.emit("cmp", &[x(17), x(16)]);
+            if i + 1 == expects.len() {
+                self.asm.b_cond(Cond::Ne, cold);
+            } else {
+                self.asm.b_cond(Cond::Eq, ok);
+            }
+        }
+        self.asm.bind(ok);
+    }
+
     fn emit_smi_cmp_br(
         &mut self,
         op: CmpOp,
@@ -2052,6 +2077,11 @@ fn emit_ir(e: &mut Emitter, ir: &Ir, next_in_order: Option<BlockId>) {
             fail,
             kind,
         } => e.emit_guard_klass(obj, expect, fail, kind),
+        Ir::GuardKlassIn {
+            obj,
+            ref expects,
+            fail,
+        } => e.emit_guard_klass_in(obj, expects, fail),
         Ir::LoadField { dst, obj, byte_off } => e.emit_load_field(dst, obj, byte_off),
         Ir::StoreField {
             obj,

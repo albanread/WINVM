@@ -75,6 +75,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "LoadKlass",
     "LoadField",
     "GuardKlass",
+    "GuardKlassIn",
     "SmiArith",
     "SmiCmpBr",
     "SmiCmpVal",
@@ -796,6 +797,31 @@ impl<'a> Emitter<'a> {
         self.asm.emit("cmp", &[r64(SCRATCH1), r64(SCRATCH0)]);
         self.asm.jcc(Cond::Ne, cold);
     }
+
+    /// `GuardKlassIn`: one smi rejection + ONE klass load, then a compare
+    /// chain over the expected klasses (hottest first — the decision layer
+    /// orders them by count), branching to `fail` only when NONE match.
+    /// Same smi-first rule and scratch discipline as [`emit_klass_guard`].
+    fn emit_klass_guard_in(&mut self, robj: u8, expects: &[PoolLit], fail: BlockId) {
+        debug_assert!(!expects.is_empty());
+        let cold = self.labels[fail.0 as usize];
+        self.asm.emit("test", &[r64(robj), imm(3)]);
+        self.asm.jcc(Cond::E, cold);
+        self.asm
+            .emit("mov", &[r64(SCRATCH1), mem(robj, KLASS_OFF_FROM_TAGGED)]);
+        let ok = self.asm.new_label();
+        for (i, expect) in expects.iter().enumerate() {
+            let lit = self.literal_ids[expect.0 as usize];
+            self.asm.load_literal(SCRATCH0, lit);
+            self.asm.emit("cmp", &[r64(SCRATCH1), r64(SCRATCH0)]);
+            if i + 1 == expects.len() {
+                self.asm.jcc(Cond::Ne, cold);
+            } else {
+                self.asm.jcc(Cond::E, ok);
+            }
+        }
+        self.asm.bind(ok);
+    }
 }
 
 /// Map an IR comparison to the x86 condition for a SIGNED compare —
@@ -1303,6 +1329,11 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
                 GuardShape::SmiTest => e.emit_smi_guard(o, *fail),
                 GuardShape::KlassTest => e.emit_klass_guard(o, *expect, *fail),
             }
+        }
+
+        Ir::GuardKlassIn { obj, expects, fail } => {
+            let o = e.read_into(*obj, SCRATCH0);
+            e.emit_klass_guard_in(o, expects, *fail);
         }
 
         Ir::UncommonTrap { bci } => {
@@ -2045,6 +2076,7 @@ pub fn ir_op_name(op: &Ir) -> &'static str {
         Ir::Jump { .. } => "Jump",
         Ir::BoolBr { .. } => "BoolBr",
         Ir::GuardKlass { .. } => "GuardKlass",
+        Ir::GuardKlassIn { .. } => "GuardKlassIn",
         Ir::CallSend { .. } => "CallSend",
         Ir::CallRuntime { .. } => "CallRuntime",
         Ir::Alloc { .. } => "Alloc",

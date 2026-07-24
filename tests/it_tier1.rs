@@ -6651,6 +6651,100 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
     }
 }
 
+/// dart124 items 2+3 slice 2: SAME-TARGET poly — richards' schedule-loop
+/// shape. Four sibling klasses inherit ONE superclass method; the site's
+/// counts are FLAT (the exact profile slice-1's dominance rule declines);
+/// the compile must splice the shared body ONCE behind a klass-membership
+/// guard (`GuardKlassIn`) whose fail edge is the rejoining real send. Every
+/// seen sibling takes the fast path, the UNSEEN fifth takes the slow send,
+/// and all five must match the interpreter. One dep per SEEN klass.
+#[test]
+fn poly_same_target_inlines_membership_guard() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let object_klass = vm.universe.object_klass;
+    let sup = vm
+        .universe
+        .new_klass(object_klass, "STBase", Format::Slots, false, HEADER_WORDS);
+    let mut subs: Vec<KlassOop> = Vec::new();
+    for n in ["STA", "STB", "STC", "STD", "STE"] {
+        subs.push(
+            vm.universe
+                .new_klass(sup, n, Format::Slots, false, HEADER_WORDS),
+        );
+    }
+
+    // ONE leaf implementation, on the superclass — every sibling inherits it.
+    let v_sel = vm.universe.intern(b"v");
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(33);
+    b.ret_tos();
+    let shared = b.finish(&mut vm, v_sel, 0, 0);
+    install_method(&mut vm, sup, v_sel, shared);
+
+    // `call: x [ ^x v ]` on the smi klass; receiver is the ARG.
+    let call_sel = vm.universe.intern(b"call:");
+    let mut cb = BytecodeBuilder::new();
+    cb.push_temp(0);
+    cb.send(&mut vm, v_sel, 0);
+    cb.ret_tos();
+    let call_m = cb.finish(&mut vm, call_sel, 1, 0);
+    install_method(&mut vm, smi_klass, call_sel, call_m);
+
+    // Seed POLY with the four SEEN siblings (STE stays unseen), all mapping
+    // to the ONE shared method, counts FLAT at 10 — total 40 clears the
+    // evidence floor while no single arm clears the 34% dominance share.
+    let array_klass = vm.universe.array_klass;
+    let pairs = macvm::memory::alloc::alloc_indexable_oops(
+        &mut vm,
+        array_klass,
+        macvm::oops::layout::IC_POLY_ARRAY_LEN,
+    );
+    for i in 0..4 {
+        pairs.at_put(2 * i, subs[i].oop());
+        pairs.at_put(2 * i + 1, shared.oop());
+        pairs.at_put(
+            2 * macvm::oops::layout::IC_POLY_MAX_PAIRS + i,
+            SmallInt::new(10).oop(),
+        );
+    }
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(call_m, 0).set_poly(&mut vm, pairs, epoch);
+
+    let id = driver::compile_method(&mut vm, smi_klass, call_m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert_eq!(
+            nm.ic_sites.len(),
+            1,
+            "exactly one compiled IC site: the rejoining slow-path send"
+        );
+        assert_eq!(
+            nm.inline_deps.len(),
+            4,
+            "one (klass, selector) dep per SEEN sibling"
+        );
+    }
+
+    let self_smi = SmallInt::new(5).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for k in &subs {
+        let recv = alloc::alloc_slots(&mut vm, *k).oop();
+        let interp = macvm::interpreter::run_method(&mut vm, call_m, self_smi, &[recv]);
+        assert_eq!(interp.raw(), SmallInt::new(33).oop().raw());
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), recv.raw()].as_ptr(), 2) };
+        assert_eq!(
+            result,
+            SmallInt::new(33).oop().raw(),
+            "membership fast path (seen siblings) AND rejoining slow path \
+             (the unseen fifth) must both match the interpreter"
+        );
+    }
+}
+
 /// Step-9 soak-gate regression (THE materializer ordering bug): an inlined
 /// callee's in-body trap deopts with the CALLER's frozen operand stack
 /// non-empty — `lo + (self next ...)` freezes `[lo]` across the spliced

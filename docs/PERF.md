@@ -831,3 +831,52 @@ session: it_tier1 COMPILES ON WINDOWS for the first time (is_osr fields,
 native_sp x64 asm — 467bd12); the suite's first-ever x64 run dies at
 c2i_adapter_dispatches_to_interpreted_method (FOREIGN pc 0, pre-existing;
 tracked as its own porting task).
+
+## 2026-07-24 — same-target poly splice + the dead-tail unlock: richards 27 → 22 (dart124 items 2+3, slice 2)
+
+Slice 2 proper: a poly site whose arms ALL resolve to one method (richards'
+schedule loop: four Task klasses, one TaskState/TCB implementation) now
+splices the shared body ONCE behind a klass-MEMBERSHIP guard — new
+`Ir::GuardKlassIn` (one klass load, hottest-first compare chain, both
+emitters), decision `InlineDecision::SameTargetPoly` (no share floor —
+flatness by klass is irrelevant when the target is unanimous; smi-seen
+sites excluded), fail edge = the same rejoining real send, one
+`(klass, selector)` dep per seen klass. `MACVM_TRACE=sametarget` prints
+each decision.
+
+**The trace immediately caught something bigger:** `#link` and `#identity`
+declined with `spliceable=false blocks=2` — every mst-compiled method
+carries the frontend's implicit `^self` tail as a DEAD trailing block, so
+`try_inline_leaf`'s `blocks.len() == 1` precondition (and the dominant
+path's dry-run copy of it) rejected every real-world accessor.
+`DominantWithSlowPath` had NEVER fired outside hand-built tests. The
+splice walker already breaks at the first Return, so the fix is the
+predicate, not the walker: require entry-block-Return (trailing blocks
+are unreachable by construction). This also lets every MONO accessor
+inline take the cheap leaf splicer instead of the CFG machinery.
+
+| bench | before (slice-1) | after | confirm runs |
+|---|---|---|---|
+| richards | 27 (26-28 band all day) | **22** | 22, 22, 24 |
+| deltablue | 4 | 3-4 (band edge) | 4, 4 |
+| arith | 34 | 33-35 | — |
+| others | — | flat | — |
+
+**First real perf movement of the dart124 arc — richards ~19%,** and vs
+Cog's same-machine 32-34 the scoreboard now reads ~1.4-1.5× AHEAD on the
+benchmark that was 2.6× behind on 2026-07-22.
+
+Gates: 742 lib tests (3 new decision tests: flat-4 same-target inlines,
+smi-case declines, under-sampled declines); it_tier1
+`poly_same_target_inlines_membership_guard` end-to-end (4 seen siblings
+via the membership fast path, the UNSEEN fifth via the rejoining send,
+all interpreter-identical, 4 deps, 1 IC site); world differential off vs
+t=200 byte-identical plain + GC_STRESS=1 + full:64 + DEOPT_STRESS=64
+(release); dominant-path test still green.
+
+Known residue, next lever (slice 3): the TaskState PREDICATES
+(`isTaskHoldingOrWaiting` etc.) are genuinely multi-block leaves (fused
+`or:`/`and:` branches) and still decline — same-target needs the CFG
+splicer, not just the leaf splicer. richards' remaining gap to the
+measured 4.6 ms/×10 ceiling (dart 1.24.3, RESULTS.md in dart_origins) is
+that plus F3c.
