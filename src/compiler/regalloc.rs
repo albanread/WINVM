@@ -145,7 +145,7 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
             // does).
             | Ir::BoolNot { fail, .. }
             | Ir::VecArith { fail, .. } => succs.push(*fail),
-            Ir::GuardKlass { fail, .. } => succs.push(*fail),
+            Ir::GuardKlass { fail, .. } | Ir::GuardKlassIn { fail, .. } => succs.push(*fail),
             // S11 D7: `Alloc` is self-contained (fast path + internal slow
             // call, `emit::emit_alloc`) — no slow CFG successor. It stays a
             // safepoint via `is_safepoint` so live-across vregs spill before
@@ -1270,12 +1270,78 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         }
         set
     };
+    // Vregs with more than one static DEFINITION — the merge/phi values. A
+    // single-def vreg's def DOMINATES all its live points (a well-formed use is
+    // never reached without passing the sole def), so it is always written
+    // before any safepoint its interval crosses and never needs a nil-fill.
+    // Only a multi-def merge value can be live across a safepoint on a SIBLING
+    // arm that never wrote it — which is the exact hole this fill closes.
+    let multi_def: std::collections::HashSet<u32> = {
+        let mut seen = std::collections::HashSet::new();
+        let mut multi = std::collections::HashSet::new();
+        for blk in &method.blocks {
+            for ir in &blk.code {
+                ir.defs(|v| {
+                    if !seen.insert(v.0) {
+                        multi.insert(v.0);
+                    }
+                });
+            }
+        }
+        multi
+    };
     let mut deopt_nil_init_slots: Vec<SpillSlot> = {
         let referenced: std::collections::HashSet<u32> =
             extra_oop_live.iter().map(|&(v, _)| v.0).collect();
         intervals
             .iter()
-            .filter(|iv| referenced.contains(&iv.vreg.0))
+            // A slot must be nil-filled if `oopmap::build_for_position` can
+            // MARK it at a safepoint without it being guaranteed written on the
+            // path reaching that safepoint. `build_for_position` marks a slot
+            // when the plain interval spans the position (`start < pos < end`),
+            // on the assumption that `start < pos` ⇒ "written before pos". That
+            // holds in the LINEAR numbering but NOT in the CFG when the def does
+            // not DOMINATE the safepoint — a MERGE value written only on a
+            // sibling arm (e.g. a coercion arm of `SmallInteger>>+`) is marked
+            // at a safepoint on the OTHER arm, which reached it without ever
+            // writing the slot. `extra_oop_live` was added to avoid interval
+            // WIDENING for exactly this hazard, but an *organic* (unwidened)
+            // interval hits it too, and those vregs are not in `extra_oop_live`,
+            // so they were never nil-filled. A GC striking there (GC_STRESS, or
+            // an alloc slow-edge scavenge) then traced native-stack garbage as
+            // an oop and SIGSEGV'd inside `memory::scavenge::scavenge_oop` (the
+            // `0x…01` wild word; crash_next_steps.md / frameless_x64_findings.md
+            // finding 2). Gated on `multi_def` so the fill stays OFF the common
+            // single-def case (call arguments, temps) that F7 worked to strip —
+            // those are dominance-safe — adding nil-fills only for the genuinely
+            // at-risk merge slots.
+            //
+            // On AArch64 the 16-register file spills far less, so the same
+            // interval usually keeps a register and never gets a scanned slot —
+            // which is why this stayed latent there and surfaced only under
+            // x86-64 spill pressure. The fix lives in this shared file and
+            // closes the latent hole on both targets.
+            //
+            // `extra_oop_live` members are kept unconditionally (they may be
+            // non-oop deopt slots the materializer still needs zeroed), so this
+            // can only ever ADD nil-fills over the previous behaviour.
+            //
+            // The crossing test is the STRICT `start < sp < end`, byte-for-byte
+            // `build_for_position`'s own interval test — NOT `crosses_safepoint`
+            // (`start <= sp`, the spill POLICY). The difference is an interval
+            // that merely STARTS at a safepoint (a call's own dst): the map
+            // never marks it there, and by the next safepoint the call return
+            // has written it, so it never needs a fill. Matching the map
+            // exactly keeps the set minimal and in lockstep with what the GC
+            // actually scans.
+            .filter(|iv| {
+                referenced.contains(&iv.vreg.0)
+                    || (iv.is_oop
+                        && multi_def.contains(&iv.vreg.0)
+                        && safepoint_positions
+                            .iter()
+                            .any(|&sp| iv.start < sp && iv.end > sp))
+            })
             .filter(|iv| !entry_early_defs.contains(&iv.vreg.0))
             .filter_map(|iv| match iv.assignment {
                 Some(Assignment::Spill(slot)) => Some(slot),

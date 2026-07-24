@@ -773,3 +773,143 @@ remains the flappy outlier (~1.2-1.4x behind, pure call-chain — the F3c /
 frameless-x64 territory). The 07-22 session's "~1.15x richards residual"
 is now inverted. Frameless emission (Mac F0-F3) stays arm64-only; its x64
 port is the top remaining lever for fib and the named follow-up.
+
+## 2026-07-24 — F6b: no-barrier propagation through Move (dart124 lessons item 8)
+
+The Dart-1.24.3 extraction's cheapest item, audited first: F6 already
+elides smi/old-const stores and the runtime barrier's three early-outs
+bound what's left, so the remaining compile-time gap was values LAUNDERED
+through `Move`s — merge shapes (richards' `destination:`) whose arms are
+inlined constants. The no-barrier pass is now a monotone fixpoint with
+`Move` propagating its source's verdict; a listing test pins both sides
+(a Param-valued store keeps the card `shr`, Move-of-ConstSmi elides it).
+
+Same-session pinned pair (threshold=20): richards 28 → 27 warm, all other
+benches flat. Honest reading: noise-adjacent — the elided sequence was
+already early-outing at runtime; taken because it is free, principled,
+and richards has inverted on a millisecond before.
+
+Gates: 735 lib tests; world differential off vs t=200 byte-identical
+(5860 run, 0 failed) plain and under GC_STRESS=1 / GC_STRESS=full:64 /
+DEOPT_STRESS=64; clippy clean on changed lines. **Measurement note for
+the record: stress differentials must run the RELEASE binary — the debug
+build under GC_STRESS=1 did not finish one pair in 40 minutes; release
+runs each pair in ~3 s.**
+
+Remaining item-8 slice (deferred, documented): fresh-`Alloc` receiver
+elision for constructor init runs — fold into the F3c slow-path
+restructuring, which touches the same Poll/alloc-slow sites.
+
+## 2026-07-24 — PIC arm counts + count-proven dominance (dart124 items 2+3, slice 1)
+
+The counts substrate: the poly pairs array gains a smi count tail
+(`[k1,m1,…,c1..c4]`, layout.rs; SPEC §4.3 updated), bumped only by the
+interpreter's row-7 hit — the unoptimized tier is the profiler, compiled
+code never counts (Dart's cost model). `read_poly` returns cases
+count-descending (stable vs first-seen); `snapshot_into` hashes poly
+recursion in klass-raw order so count DRIFT cannot flap the profile hash;
+reverification carries counts through compaction. `decide_with_budget`
+retires the "first-seen, trusted only at len==2" pin: a dominant inlines
+at ANY arity past an evidence floor (16 samples, 34% share), and an
+under-sampled 2-case site now honestly declines. BoolNot's poly walk
+fixed to the pairs region (`len()/2` would have read counts as klasses).
+
+Bench pair (same session, t=20): FLAT — richards 26→27 (its band today),
+fib 205→191 (its documented flappiness), rest identical. The instructive
+negative: richards' hot poly sites (schedule-loop predicates) are
+flat-BY-KLASS with a SHARED target — four Task klasses, one TaskState
+method — so no arm clears 34% and by-klass dominance correctly declines.
+The unlock for those sites is slice 2: duplicate-target dedup (one
+spliced body behind a multi-klass guard chain) and/or CHA guard-free
+devirt (lessons item 4), both of which key on the TARGET, not the klass.
+
+Gates: 739 lib tests (4 new: count bump/reverify-carry, arity-3 dominant,
+flat-4 declines, under-sampled declines); world differential off vs t=200
+byte-identical plain + GC_STRESS=1 + full:64 + DEOPT_STRESS=64 (release);
+it_tier1's poly/dominant tests pass with count-seeded evidence. Also this
+session: it_tier1 COMPILES ON WINDOWS for the first time (is_osr fields,
+native_sp x64 asm — 467bd12); the suite's first-ever x64 run dies at
+c2i_adapter_dispatches_to_interpreted_method (FOREIGN pc 0, pre-existing;
+tracked as its own porting task).
+
+## 2026-07-24 — same-target poly splice + the dead-tail unlock: richards 27 → 22 (dart124 items 2+3, slice 2)
+
+Slice 2 proper: a poly site whose arms ALL resolve to one method (richards'
+schedule loop: four Task klasses, one TaskState/TCB implementation) now
+splices the shared body ONCE behind a klass-MEMBERSHIP guard — new
+`Ir::GuardKlassIn` (one klass load, hottest-first compare chain, both
+emitters), decision `InlineDecision::SameTargetPoly` (no share floor —
+flatness by klass is irrelevant when the target is unanimous; smi-seen
+sites excluded), fail edge = the same rejoining real send, one
+`(klass, selector)` dep per seen klass. `MACVM_TRACE=sametarget` prints
+each decision.
+
+**The trace immediately caught something bigger:** `#link` and `#identity`
+declined with `spliceable=false blocks=2` — every mst-compiled method
+carries the frontend's implicit `^self` tail as a DEAD trailing block, so
+`try_inline_leaf`'s `blocks.len() == 1` precondition (and the dominant
+path's dry-run copy of it) rejected every real-world accessor.
+`DominantWithSlowPath` had NEVER fired outside hand-built tests. The
+splice walker already breaks at the first Return, so the fix is the
+predicate, not the walker: require entry-block-Return (trailing blocks
+are unreachable by construction). This also lets every MONO accessor
+inline take the cheap leaf splicer instead of the CFG machinery.
+
+| bench | before (slice-1) | after | confirm runs |
+|---|---|---|---|
+| richards | 27 (26-28 band all day) | **22** | 22, 22, 24 |
+| deltablue | 4 | 3-4 (band edge) | 4, 4 |
+| arith | 34 | 33-35 | — |
+| others | — | flat | — |
+
+**First real perf movement of the dart124 arc — richards ~19%,** and vs
+Cog's same-machine 32-34 the scoreboard now reads ~1.4-1.5× AHEAD on the
+benchmark that was 2.6× behind on 2026-07-22.
+
+Gates: 742 lib tests (3 new decision tests: flat-4 same-target inlines,
+smi-case declines, under-sampled declines); it_tier1
+`poly_same_target_inlines_membership_guard` end-to-end (4 seen siblings
+via the membership fast path, the UNSEEN fifth via the rejoining send,
+all interpreter-identical, 4 deps, 1 IC site); world differential off vs
+t=200 byte-identical plain + GC_STRESS=1 + full:64 + DEOPT_STRESS=64
+(release); dominant-path test still green.
+
+Known residue, next lever (slice 3): the TaskState PREDICATES
+(`isTaskHoldingOrWaiting` etc.) are genuinely multi-block leaves (fused
+`or:`/`and:` branches) and still decline — same-target needs the CFG
+splicer, not just the leaf splicer. richards' remaining gap to the
+measured 4.6 ms/×10 ceiling (dart 1.24.3, RESULTS.md in dart_origins) is
+that plus F3c.
+
+## 2026-07-24 — same-target CFG graft: the predicates splice, richards 22 → 21 (dart124 items 2+3, slice 3)
+
+The slice-2 residue, closed: `SameTargetPoly`'s decision gate widened from
+`is_leaf` to `is_leaf || is_inline_eligible_cfg` (the Mono `Inline` arm's
+own ladder), and the lowering gained a CFG leg — `GuardKlassIn` fronts a
+guard-free `try_inline_cfg` graft; the graft's own continuation block is
+claimed as a stub that moves the graft result into the shared `dst` and
+jumps to OUR rejoin, so the fast (graft) and slow (real send) paths both
+enter it with `dst` written. `MACVM_TRACE=sametarget` on richards now
+reads `#isTaskHoldingOrWaiting arms=4 leg=cfg blocks=8` — the fused
+or:/and:/not predicate grafts whole, its inner `not` fusing to `BoolNot`
+against the callee's own warm ICs.
+
+The e2e test's ORGANIC warm-up (round-robin interpreted probes, richards'
+own access pattern) exposed a counting gap: the mono→poly upgrade and the
+poly-append dispatches never counted themselves, and mono-era hits are
+invisible — a sequential warm-up left the site at 12 samples, under the
+16 floor. Rows 6 and 9 now seed the triggering arm's count at 1 (that
+dispatch IS a hit); mono-era history stays honestly uncounted.
+
+richards 21/22/21 (slice-2 same-session baseline 22/22/24); others flat.
+**Day cumulative: richards 28 → 21 (−25%), vs Cog's 32-34 → ~1.55×
+AHEAD.** Gates: 742 lib; it_tier1 poly suite ×5 green including the new
+multi-block-predicate e2e (source-compiled or:/not/and: body, both branch
+arms exercised through the graft, unseen fifth sibling through the
+rejoining send, organic PIC counts); world differential off vs t=200
+byte-identical plain + GC_STRESS=1 + full:64 + DEOPT_STRESS=64 (release).
+
+Remaining richards decomposition: F3c (spill-all across safepoints — the
+slow-path SaveLiveRegisters blueprint, lessons item 1) is now the
+dominant residual on the road to the measured 4.6 ms/×10 cross-VM
+ceiling.

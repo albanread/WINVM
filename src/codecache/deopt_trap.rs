@@ -422,6 +422,84 @@ pub(crate) fn claim_jmp_slot() -> usize {
     slot
 }
 
+// ── G0 (dolphin_ui_sprints.md V1 / docs/dolphin/g0_reentrant_entries.md):
+//    per-thread LIFO stack of recovery ENTRY FRAMES. Win32 is synchronously
+//    re-entrant (a handler → `CreateWindowExW` → wndproc → nested embed entry,
+//    to arbitrary depth), so the single-slot model above — `claim_jmp_slot`
+//    reuses one slot per thread and each entry's `sigsetjmp` overwrites its
+//    buffer — is replaced, for embed entries, by a stack: every entry claims a
+//    FRESH slot so a nested entry cannot clobber the outer frame's `sigjmp_buf`,
+//    and a fault recovers the LIFO top. `push`/`pop` are ordinary-code helpers
+//    (run at entry/exit, never in the fault handler); `entry_slot_top` is the
+//    value the handler's slot lookup will consult once the embed wiring lands
+//    (G0 step 2). This slice is the foundation only — proven by a bookkeeping
+//    unit test — with the `sigsetjmp` integration and `lookup_jmp_slot_for_
+//    current_thread` change deliberately deferred to keep it additive + green.
+thread_local! {
+    /// The LIFO of registry slots this thread has pushed as entry frames.
+    /// Touched only in ordinary code; the fault handler never reads it.
+    static ENTRY_SLOT_STACK: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The current top entry slot (`usize::MAX` = none). Kept in lockstep with
+    /// the stack's last element; a plain `Cell<usize>` so the fault handler can
+    /// read the LIFO recovery target with a signal-safe load once wired.
+    static TOP_ENTRY_SLOT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Push a fresh recovery frame for a (possibly NESTED) embed entry (G0/V1).
+/// Unlike [`claim_jmp_slot`], which reuses this thread's single slot, this
+/// claims a NEW free registry slot each time — a nested entry must never
+/// clobber the outer frame's `sigjmp_buf` — records it as this thread's LIFO
+/// top, and returns it for the caller's INLINE `sigsetjmp` (the [`jmp_buf_ptr`]
+/// rule: `sigsetjmp` at the caller's own live frame, never through a wrapper).
+#[allow(dead_code)] // wired into eval/exec/dispatch_callback in G0 step 2
+pub(crate) fn push_entry_frame() -> usize {
+    let me = current_thread_id();
+    let slot = {
+        let _g = JMP_REGISTRY_LOCK.lock().unwrap();
+        let s = (0..JMP_REGISTRY_CAP)
+            .find(|&i| JMP_OWNER[i].load(Ordering::Acquire) == 0)
+            .expect(
+                "deopt_trap: jmp registry overflow (nested entries × embedded VMs \
+                 exceeded JMP_REGISTRY_CAP)",
+            );
+        JMP_OWNER[s].store(me, Ordering::Release);
+        s
+    };
+    ENTRY_SLOT_STACK.with(|st| st.borrow_mut().push(slot));
+    TOP_ENTRY_SLOT.with(|c| c.set(slot));
+    slot
+}
+
+/// Pop this thread's top entry frame (normal return, or after a recovery arm
+/// rewound to it): release the slot back to the registry and restore the
+/// previous frame as the LIFO top.
+#[allow(dead_code)] // wired in G0 step 2
+pub(crate) fn pop_entry_frame() {
+    ENTRY_SLOT_STACK.with(|st| {
+        let mut stack = st.borrow_mut();
+        if let Some(slot) = stack.pop() {
+            JMP_OWNER[slot].store(0, Ordering::Release);
+        }
+        TOP_ENTRY_SLOT.with(|c| c.set(stack.last().copied().unwrap_or(usize::MAX)));
+    });
+}
+
+/// This thread's current LIFO top entry slot, or `None`. The recovery-target
+/// accessor the fault handler's slot lookup will consult once wired (G0 step 2)
+/// — under the signal-safety constraint documented at
+/// [`lookup_jmp_slot_for_current_thread`].
+#[allow(dead_code)]
+pub(crate) fn entry_slot_top() -> Option<usize> {
+    let t = TOP_ENTRY_SLOT.with(|c| c.get());
+    if t == usize::MAX {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 /// The raw `*mut c_int` for slot `i`'s own `sigjmp_buf` storage — pass this
 /// DIRECTLY to [`sigsetjmp`] (never copy it, never route it through another
 /// function first) at the exact call site whose frame must remain live for
@@ -2479,6 +2557,43 @@ unsafe fn test_arm_handler(lo: u64, hi: u64, uncommon_tramp: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G0 step 1 (docs/dolphin/g0_reentrant_entries.md): the recovery-slot
+    /// STACK foundation, as pure bookkeeping — no `sigsetjmp` yet. Three nested
+    /// `push_entry_frame`s claim DISTINCT fresh slots, `entry_slot_top` tracks
+    /// the LIFO, each frame's `JMP_OWNER` is set while claimed, and `pop`
+    /// releases its slot and restores the previous top. Balanced push/pop
+    /// returns the thread to its prior top (robust to a reused test thread).
+    /// This proves the stack the nested-entry `sigsetjmp` + embed wiring build
+    /// on before either exists — the sprint's "surface a flaw in the re-entry
+    /// model before anything is built on it" applied to its first brick.
+    #[test]
+    fn entry_frame_stack_is_lifo_and_releases_slots() {
+        let me = current_thread_id();
+        let initial = entry_slot_top();
+
+        let a = push_entry_frame();
+        assert_eq!(entry_slot_top(), Some(a));
+        assert_eq!(JMP_OWNER[a].load(Ordering::Acquire), me, "claimed slot owned");
+        let b = push_entry_frame();
+        let c = push_entry_frame();
+        assert!(a != b && b != c && a != c, "each frame gets a FRESH slot");
+        assert_eq!(entry_slot_top(), Some(c), "top is the most-recent push");
+        assert_eq!(JMP_OWNER[c].load(Ordering::Acquire), me);
+
+        pop_entry_frame();
+        assert_eq!(entry_slot_top(), Some(b), "pop restores the previous top");
+        assert_eq!(
+            JMP_OWNER[c].load(Ordering::Acquire),
+            0,
+            "popped slot released back to the registry"
+        );
+        pop_entry_frame();
+        assert_eq!(entry_slot_top(), Some(a));
+        pop_entry_frame();
+        assert_eq!(entry_slot_top(), initial, "balanced push/pop restores prior top");
+        assert_eq!(JMP_OWNER[a].load(Ordering::Acquire), 0);
+    }
 
     /// WINVM M2 gate (MIGRATION.md §4 Phase 2): the x64 twin of
     /// `handler_redirect_smoke`, live end-to-end — a hand-built blob whose

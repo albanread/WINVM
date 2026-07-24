@@ -371,6 +371,19 @@ pub enum Ir {
         fail: BlockId,
         kind: GuardShape,
     },
+    /// Membership variant of `GuardKlass` for a SAME-TARGET poly site
+    /// (dart124 items 2+3, slice 2): the receiver must be a heap object
+    /// whose klass is ANY of `expects` (count-descending — hottest first),
+    /// else branch to `fail` — a REAL rejoining block, never a trap, same
+    /// rule as `DominantWithSlowPath`'s guard. One klass load, a compare
+    /// chain, one fail edge. A smi receiver takes `fail` (the decision
+    /// layer never picks this shape for smi-seen sites). NOT a safepoint,
+    /// exactly like `GuardKlass`.
+    GuardKlassIn {
+        obj: VReg,
+        expects: Vec<PoolLit>,
+        fail: BlockId,
+    },
     CallSend {
         dst: VReg,
         site: u16,
@@ -480,7 +493,7 @@ impl Ir {
                 f(*val);
             }
             Ir::BoolBr { val, .. } => f(*val),
-            Ir::GuardKlass { obj, .. } => f(*obj),
+            Ir::GuardKlass { obj, .. } | Ir::GuardKlassIn { obj, .. } => f(*obj),
             Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
                 for &v in args {
                     f(v);
@@ -551,6 +564,7 @@ impl Ir {
             | Ir::Jump { .. }
             | Ir::BoolBr { .. }
             | Ir::GuardKlass { .. }
+            | Ir::GuardKlassIn { .. }
             | Ir::CallRuntime { dst: None, .. }
             | Ir::Poll
             | Ir::UncommonTrap { .. }
@@ -1766,7 +1780,10 @@ impl<'a> Translator<'a> {
             crate::interpreter::ic::IcState::Poly(_)
         ) {
             match crate::oops::wrappers::ArrayOop::try_from(ic.target()) {
-                Some(pairs) => (0..pairs.len() / 2).all(|i| {
+                // Pairs region only — never `len()/2`: the array carries a
+                // count tail after the pairs (layout.rs IC_POLY_ARRAY_LEN)
+                // whose smis must not be mistaken for receiver klasses.
+                Some(pairs) => (0..crate::oops::layout::IC_POLY_MAX_PAIRS).all(|i| {
                     let k = pairs.at(2 * i).raw();
                     k == tk || k == fk || k == u.nil_obj.raw()
                 }),
@@ -2019,18 +2036,22 @@ impl<'a> Translator<'a> {
         pre_pop_stack: &[VReg],
         code: &mut Vec<Ir>,
     ) -> Option<VReg> {
-        // MINIMUM viable scope: the callee must be a SINGLE straight-line block
-        // ending in a return, and its arity must match what we popped. A
-        // multi-block leaf (a branch/loop with no sends) or an arity mismatch is
-        // out of this narrow step's scope — decline, and the caller does a plain
-        // Call. Validate against the CFG BEFORE emitting anything.
+        // MINIMUM viable scope: the callee's ENTRY block must run straight
+        // into a return, and its arity must match what we popped. A branch/
+        // loop before the first return or an arity mismatch is out of this
+        // narrow step's scope — decline, and the caller does a plain Call.
+        // Trailing blocks after a Return-terminated entry are UNREACHABLE by
+        // construction (a Return has no successors) — every mst-compiled
+        // method carries the frontend's implicit `^self` tail as exactly such
+        // a dead block, and requiring `blocks.len() == 1` here was rejecting
+        // every real-world accessor (dart124 slice-2 trace finding: `#link`
+        // and `#identity` declined with blocks=2). The splice walker below
+        // breaks at the first Return, so a dead tail is never translated.
         let callee_cfg = crate::compiler::decode::decode(callee);
-        if callee_cfg.blocks.len() != 1
-            || !matches!(
-                callee_cfg.blocks[0].terminator,
-                crate::compiler::decode::Terminator::Return
-            )
-            || callee.argc() != args.len()
+        if !matches!(
+            callee_cfg.blocks[0].terminator,
+            crate::compiler::decode::Terminator::Return
+        ) || callee.argc() != args.len()
         {
             return None;
         }
@@ -5046,6 +5067,12 @@ impl<'a> Translator<'a> {
                         self.splice_declined_budget += 1;
                         crate::compiler::inline::InlineDecision::Call
                     }
+                    crate::compiler::inline::InlineDecision::SameTargetPoly { callee, .. }
+                        if self.budget_would_exceed(callee) =>
+                    {
+                        self.splice_declined_budget += 1;
+                        crate::compiler::inline::InlineDecision::Call
+                    }
                     other => other,
                 };
                 // S14 step 6: a POLY site with a dominant case — inline the
@@ -5069,13 +5096,15 @@ impl<'a> Translator<'a> {
                     // splice succeeds before emitting anything (the slow block
                     // is minted first, and an orphaned block would be dead
                     // weight; a half-spliced fast path would be corruption).
+                    // Entry-block-Return, not blocks.len()==1 — the mst
+                    // frontend's implicit `^self` tail is a dead trailing
+                    // block every real accessor carries (see the same
+                    // relaxation in `try_inline_leaf`).
                     let callee_cfg = crate::compiler::decode::decode(case_method);
-                    let spliceable = callee_cfg.blocks.len() == 1
-                        && matches!(
-                            callee_cfg.blocks[0].terminator,
-                            crate::compiler::decode::Terminator::Return
-                        )
-                        && case_method.argc() == real_argc as usize
+                    let spliceable = matches!(
+                        callee_cfg.blocks[0].terminator,
+                        crate::compiler::decode::Terminator::Return
+                    ) && case_method.argc() == real_argc as usize
                         && leaf_body_is_spliceable(case_method);
                     if spliceable {
                         let selector = ic_view.selector();
@@ -5171,6 +5200,252 @@ impl<'a> Translator<'a> {
                     }
                     // Unspliceable dominant shape: fall through to the plain
                     // generic CallSend tail below (nothing was emitted).
+                }
+
+                // dart124 items 2+3 slice 2: SAME-TARGET poly. The membership
+                // guard (`GuardKlassIn`, hottest klass first) covers every
+                // observed klass; the ONE spliced body serves them all (klass
+                // dominance is irrelevant when the target is unanimous); the
+                // fail edge is the identical rejoining real-send slow block.
+                // Deps: one (klass, selector) pair PER observed klass — an
+                // override arriving under ANY of them must invalidate.
+                if let crate::compiler::inline::InlineDecision::SameTargetPoly {
+                    klasses,
+                    callee,
+                } = &feedback_inline
+                {
+                    let callee = *callee;
+                    let klasses = klasses.clone();
+                    // Same dry-run rule as the dominant path above: prove the
+                    // whole splice succeeds before emitting anything. Entry-
+                    // block-Return, not blocks.len()==1 (the implicit `^self`
+                    // dead tail — see `try_inline_leaf`).
+                    let callee_cfg = crate::compiler::decode::decode(callee);
+                    let spliceable = matches!(
+                        callee_cfg.blocks[0].terminator,
+                        crate::compiler::decode::Terminator::Return
+                    ) && callee.argc() == real_argc as usize
+                        && leaf_body_is_spliceable(callee);
+                    // Slice-3 leg pick: single-entry-block bodies take the
+                    // cheap leaf splice; multi-block leaves (richards'
+                    // fused or:/and: predicates) route through the CFG
+                    // splicer below. Pre-validated here so a post-guard
+                    // decline (which would orphan the slow block) is
+                    // impossible — mirrors try_inline_cfg's own top checks.
+                    let cfg_ok = !spliceable
+                        && crate::compiler::inline::is_inline_eligible_cfg(callee)
+                        && callee.argc() == real_argc as usize
+                        && !callee_cfg.blocks.is_empty();
+                    // `MACVM_TRACE=sametarget`: one grep-friendly line per
+                    // decision — selector, arm count, and which leg fired.
+                    if self.vm.options.trace.is_enabled("sametarget") {
+                        eprintln!(
+                            "[sametarget] {} arms={} leg={} blocks={}",
+                            crate::memory::print_oop(&self.vm.universe, ic_view.selector().oop()),
+                            klasses.len(),
+                            if spliceable {
+                                "leaf"
+                            } else if cfg_ok {
+                                "cfg"
+                            } else {
+                                "declined"
+                            },
+                            callee_cfg.blocks.len(),
+                        );
+                    }
+                    if spliceable {
+                        let selector = ic_view.selector();
+                        let pre_pop_stack = stack.clone();
+                        let mut inline_args: Vec<VReg> = (0..real_argc)
+                            .map(|_| {
+                                stack.pop().expect("same-target send: missing arg operand")
+                            })
+                            .collect();
+                        inline_args.reverse();
+                        let receiver = stack
+                            .pop()
+                            .expect("same-target send: missing receiver operand");
+
+                        let continuation_id = self.fresh_block_id();
+                        let slow_id = self.fresh_block_id();
+                        let dst = self.fresh(true);
+                        let dst_slow = self.fresh(true);
+                        let mut send_args = vec![receiver];
+                        send_args.extend_from_slice(&inline_args);
+                        let site = self.call_sites.len() as u16;
+                        self.call_sites.push(CallSiteInfo {
+                            selector,
+                            argc: real_argc + 1,
+                            static_klass: None,
+                        });
+                        self.site_feedback.push(feedback.clone());
+                        self.finish_block(IrBlock {
+                            id: slow_id,
+                            bci,
+                            code: vec![
+                                Ir::CallSend {
+                                    dst: dst_slow,
+                                    site,
+                                    args: send_args,
+                                },
+                                Ir::Move { dst, src: dst_slow },
+                                Ir::Jump {
+                                    target: continuation_id,
+                                },
+                            ],
+                            entry_stack: Vec::new(),
+                            deopt_sites: vec![(
+                                0,
+                                DeoptRaw {
+                                    stack: stack.clone(),
+                                    bci,
+                                    kind: SafepointKind::Call,
+                                    reexecute: false,
+                                    stack_closures: Vec::new(),
+                                    inline: None,
+                                },
+                            )],
+                        });
+
+                        let expects: Vec<PoolLit> = klasses
+                            .iter()
+                            .map(|k| self.pool.intern(k.oop().raw(), Some(RelocKind::Oop)))
+                            .collect();
+                        code.push(Ir::GuardKlassIn {
+                            obj: receiver,
+                            expects,
+                            fail: slow_id,
+                        });
+                        let result = self
+                            .try_inline_leaf(
+                                callee,
+                                None,
+                                klasses[0],
+                                selector,
+                                receiver,
+                                &inline_args,
+                                bci,
+                                &pre_pop_stack,
+                                code,
+                            )
+                            .expect("same-target leaf was pre-validated spliceable");
+                        for k in &klasses[1..] {
+                            self.record_inline_dep(*k, selector);
+                        }
+                        code.push(Ir::Move { dst, src: result });
+                        stack.push(dst);
+                        return Some(continuation_id);
+                    }
+                    // Slice 3 (dart124 items 2+3): a MULTI-BLOCK leaf — the
+                    // richards predicates' fused or:/and: shape — routes
+                    // through the CFG splicer, guard-free (GuardKlassIn
+                    // fronts the graft; its fail edge is the same rejoining
+                    // real send). Composition mirrors the super-send CFG leg:
+                    // the current block jumps to the graft entry
+                    // (pending_jump_target), and the graft's own continuation
+                    // block becomes a STUB that moves the graft result into
+                    // the shared `dst` and jumps to OUR continuation — so the
+                    // fast (graft) and slow (send) paths both enter the
+                    // continuation with `dst` written.
+                    if cfg_ok {
+                        let selector = ic_view.selector();
+                        let pre_pop_stack = stack.clone();
+                        let mut inline_args: Vec<VReg> = (0..real_argc)
+                            .map(|_| {
+                                stack
+                                    .pop()
+                                    .expect("same-target cfg send: missing arg operand")
+                            })
+                            .collect();
+                        inline_args.reverse();
+                        let receiver = stack
+                            .pop()
+                            .expect("same-target cfg send: missing receiver operand");
+
+                        let my_cont = self.fresh_block_id();
+                        let slow_id = self.fresh_block_id();
+                        let dst = self.fresh(true);
+                        let dst_slow = self.fresh(true);
+                        let mut send_args = vec![receiver];
+                        send_args.extend_from_slice(&inline_args);
+                        let site = self.call_sites.len() as u16;
+                        self.call_sites.push(CallSiteInfo {
+                            selector,
+                            argc: real_argc + 1,
+                            static_klass: None,
+                        });
+                        self.site_feedback.push(feedback.clone());
+                        self.finish_block(IrBlock {
+                            id: slow_id,
+                            bci,
+                            code: vec![
+                                Ir::CallSend {
+                                    dst: dst_slow,
+                                    site,
+                                    args: send_args,
+                                },
+                                Ir::Move { dst, src: dst_slow },
+                                Ir::Jump { target: my_cont },
+                            ],
+                            entry_stack: Vec::new(),
+                            deopt_sites: vec![(
+                                0,
+                                DeoptRaw {
+                                    stack: stack.clone(),
+                                    bci,
+                                    kind: SafepointKind::Call,
+                                    reexecute: false,
+                                    stack_closures: Vec::new(),
+                                    inline: None,
+                                },
+                            )],
+                        });
+
+                        let expects: Vec<PoolLit> = klasses
+                            .iter()
+                            .map(|k| self.pool.intern(k.oop().raw(), Some(RelocKind::Oop)))
+                            .collect();
+                        code.push(Ir::GuardKlassIn {
+                            obj: receiver,
+                            expects,
+                            fail: slow_id,
+                        });
+                        let (result, entry_id, cfg_cont) = self
+                            .try_inline_cfg(
+                                callee,
+                                None,
+                                klasses[0],
+                                selector,
+                                receiver,
+                                &inline_args,
+                                bci,
+                                &pre_pop_stack,
+                                code,
+                                deopt,
+                                None,
+                                GraftMode::Method,
+                            )
+                            .expect("same-target CFG was pre-validated eligible");
+                        self.finish_block(IrBlock {
+                            id: cfg_cont,
+                            bci,
+                            code: vec![
+                                Ir::Move { dst, src: result },
+                                Ir::Jump { target: my_cont },
+                            ],
+                            entry_stack: Vec::new(),
+                            deopt_sites: Vec::new(),
+                        });
+                        for k in &klasses[1..] {
+                            self.record_inline_dep(*k, selector);
+                        }
+                        debug_assert!(self.pending_jump_target.is_none());
+                        self.pending_jump_target = Some(entry_id);
+                        stack.push(dst);
+                        return Some(my_cont);
+                    }
+                    // Unspliceable same-target shape: fall through to the
+                    // plain generic CallSend tail below (nothing was emitted).
                 }
 
                 if let crate::compiler::inline::InlineDecision::Inline { callee, guard } =
@@ -6684,7 +6959,7 @@ fn map_uses(op: &mut Ir, mut f: impl FnMut(VReg) -> VReg) {
             *val = f(*val);
         }
         Ir::BoolBr { val, .. } => *val = f(*val),
-        Ir::GuardKlass { obj, .. } => *obj = f(*obj),
+        Ir::GuardKlass { obj, .. } | Ir::GuardKlassIn { obj, .. } => *obj = f(*obj),
         Ir::CallSend { args, .. } | Ir::CallRuntime { args, .. } => {
             for v in args.iter_mut() {
                 *v = f(*v);
@@ -6834,7 +7109,8 @@ pub(crate) fn copy_propagate(m: &mut IrMethod) {
                     | Ir::SmiCmpVal { fail, .. }
                     | Ir::SmiCmpBr { fail, .. }
                     | Ir::BoolNot { fail, .. }
-                    | Ir::GuardKlass { fail, .. } => {
+                    | Ir::GuardKlass { fail, .. }
+                    | Ir::GuardKlassIn { fail, .. } => {
                         fail_rewrites.push((*fail, alias.clone()));
                     }
                     Ir::BoolBr { not_bool, .. } => {

@@ -235,6 +235,18 @@ pub enum InlineDecision {
         case_method: MethodOop,
         guard: GuardKind,
     },
+    /// SAME-TARGET poly (dart124 items 2+3, slice 2): every observed case
+    /// resolves to ONE method — richards' shape exactly (four Task klasses,
+    /// one TaskState predicate; flat by klass, unanimous by target) — so
+    /// klass dominance is irrelevant: splice the single body ONCE behind a
+    /// klass-MEMBERSHIP guard (`Ir::GuardKlassIn`, klasses count-descending
+    /// so the hottest compares first), fail edge = the same real rejoining
+    /// send `DominantWithSlowPath` carries. This is Dart's
+    /// `CheckInlinedDuplicate` collapsed to its all-arms-duplicate case.
+    SameTargetPoly {
+        klasses: Vec<KlassOop>,
+        callee: MethodOop,
+    },
     /// A real compiled send (S11 compiled IC): `Mono`/`Poly`/`Mega` sites all
     /// map here in step 3 (inlining them is later steps).
     Call,
@@ -344,18 +356,64 @@ pub fn decide_with_budget(
                 InlineDecision::Call
             }
         }
-        // S14 step 6: a POLY site with a DOMINANT case inlines the dominant
-        // body behind a klass guard whose fail edge is a REAL compiled send
-        // (never a trap — the minority receivers are known-taken, trapping
-        // would deopt-storm; SPEC §8.4). The interpreter's POLY array carries
-        // no counts, so dominance is a first-seen guess — trusted ONLY at
-        // exactly two cases (the doc's pinned restriction until compiled-PIC
-        // counts arrive on recompile: beyond two, first-seen is too weak).
+        // S14 step 6, upgraded by the dart124 items-2+3 counts substrate: a
+        // POLY site with a DOMINANT case inlines the dominant body behind a
+        // klass guard whose fail edge is a REAL compiled send (never a trap —
+        // the minority receivers are known-taken, trapping would deopt-storm;
+        // SPEC §8.4). Dominance is now MEASURED — cases arrive count-
+        // descending from the interpreter PIC's count tail — so the old
+        // "first-seen, trusted only at exactly two cases" pin retires: any
+        // arity qualifies when the top arm carries real evidence. Two floors
+        // keep it honest: an absolute sample floor (a 2-sample site proves
+        // nothing) and a share floor (a flat 4-way site has no dominant).
+        // Dominance DRIFT after compile is tag-invisible to the profile hash
+        // by design — the stale dominant's guard-fail edge is the same real
+        // send this decision always carried: slower, never wrong.
         // Leaf-only in this slice: the fast path then contains NO safepoint
         // of its own, so no in-body deopt scope interplay with the rejoin.
-        SiteFeedback::Poly { cases } if cases.len() == 2 => {
+        SiteFeedback::Poly { cases } if !cases.is_empty() => {
+            const DOMINANT_MIN_SAMPLES: u64 = 16;
+            const DOMINANT_MIN_SHARE_PCT: u64 = 34;
+            let total: u64 = cases.iter().map(|c| c.count.unwrap_or(0) as u64).sum();
+
+            // Slice 2, checked FIRST: a unanimous target needs no dominance
+            // at all — flat-by-klass is exactly the shape it exists for.
+            // Only the absolute evidence floor applies (the SITE must be
+            // really-taken); no share floor (all arms run the same body).
+            // Smi-seen sites are excluded: the membership guard is a
+            // heap-klass compare chain, and a smi receiver takes its fail
+            // edge — correct but pointlessly slow for the smi majority.
+            let dedup = &cases[0];
+            let same_target = cases.len() >= 2
+                && cases
+                    .iter()
+                    .all(|c| c.method.oop().raw() == dedup.method.oop().raw());
+            let no_smi_case = cases.iter().all(|c| c.klass.oop().raw() != smi_klass_bits);
+            // Eligibility ladder mirrors the Mono `Inline` arm: a send-free
+            // leaf takes the cheap splice, and a body WITH sends (richards'
+            // predicates carry a `not`) qualifies via the CFG walker — its
+            // inner sends compile from the callee's own warm ICs, exactly as
+            // every production super-send/B5 graft already does. Slice-3
+            // lowering picks the leg (`leaf` vs `cfg`).
+            if same_target
+                && no_smi_case
+                && total >= DOMINANT_MIN_SAMPLES
+                && dedup.method.primitive() == 0
+                && inline_cost(dedup.method) <= budget.per_call_cost
+                && (is_leaf(dedup.method) || is_inline_eligible_cfg(dedup.method))
+            {
+                return InlineDecision::SameTargetPoly {
+                    klasses: cases.iter().map(|c| c.klass).collect(),
+                    callee: dedup.method,
+                };
+            }
+
             let dominant = &cases[0];
-            let inlinable = dominant.method.primitive() == 0
+            let dom = dominant.count.unwrap_or(0) as u64;
+            let proven =
+                dom >= DOMINANT_MIN_SAMPLES && dom * 100 >= total * DOMINANT_MIN_SHARE_PCT;
+            let inlinable = proven
+                && dominant.method.primitive() == 0
                 && inline_cost(dominant.method) <= budget.per_call_cost
                 && is_leaf(dominant.method);
             if inlinable {
@@ -445,6 +503,134 @@ mod tests {
     #[test]
     fn mega_calls() {
         assert!(matches!(decide(&SiteFeedback::Mega), InlineDecision::Call));
+    }
+
+    /// dart124 items 2+3: dominance is measured, so a count-proven dominant
+    /// inlines at ANY arity — the len==2 first-seen pin is retired.
+    #[test]
+    fn poly_dominant_proven_by_counts_inlines_at_arity_three() {
+        let mut vm = test_vm();
+        let (klass, method) = a_klass_and_method(&mut vm);
+        let case = |count: u32| FeedbackCase {
+            klass,
+            method,
+            count: Some(count),
+        };
+        let fb = SiteFeedback::Poly {
+            cases: vec![case(100), case(10), case(5)],
+        };
+        assert!(matches!(
+            decide_with_budget(&fb, &budget_for_level(1), vm.universe.smi_klass.oop().raw()),
+            InlineDecision::DominantWithSlowPath { .. }
+        ));
+    }
+
+    /// A flat profile has no dominant: 25% share misses the 34% floor.
+    #[test]
+    fn poly_flat_counts_call() {
+        let mut vm = test_vm();
+        let (klass, method) = a_klass_and_method(&mut vm);
+        let case = |count: u32| FeedbackCase {
+            klass,
+            method,
+            count: Some(count),
+        };
+        let fb = SiteFeedback::Poly {
+            cases: vec![case(20), case(20), case(20), case(20)],
+        };
+        assert!(matches!(
+            decide_with_budget(&fb, &budget_for_level(1), vm.universe.smi_klass.oop().raw()),
+            InlineDecision::Call
+        ));
+    }
+
+    /// dart124 items 2+3 slice 2: a FLAT 4-way site whose arms all resolve
+    /// to ONE method (richards' schedule-loop shape) inlines the shared
+    /// body behind a membership guard — klass dominance is irrelevant when
+    /// the target is unanimous.
+    #[test]
+    fn poly_same_target_flat_inlines_membership() {
+        let mut vm = test_vm();
+        let (klass, method) = a_klass_and_method(&mut vm);
+        let case = |count: u32| FeedbackCase {
+            klass,
+            method,
+            count: Some(count),
+        };
+        let fb = SiteFeedback::Poly {
+            cases: vec![case(10), case(10), case(10), case(10)],
+        };
+        // smi_klass IS the test klass here, so use a non-smi bits value to
+        // exercise the heap-klass path the decision requires.
+        let not_smi_bits = 0u64;
+        match decide_with_budget(&fb, &budget_for_level(1), not_smi_bits) {
+            InlineDecision::SameTargetPoly { klasses, callee } => {
+                assert_eq!(klasses.len(), 4);
+                assert_eq!(callee.oop().raw(), method.oop().raw());
+            }
+            _ => panic!("expected SameTargetPoly"),
+        }
+    }
+
+    /// The same flat site with a smi-seen arm must NOT take the membership
+    /// guard (a smi receiver would eat the fail edge every time).
+    #[test]
+    fn poly_same_target_with_smi_case_calls() {
+        let mut vm = test_vm();
+        let (klass, method) = a_klass_and_method(&mut vm);
+        let case = |count: u32| FeedbackCase {
+            klass,
+            method,
+            count: Some(count),
+        };
+        let fb = SiteFeedback::Poly {
+            cases: vec![case(10), case(10), case(10), case(10)],
+        };
+        // klass IS smi_klass in this fixture — passing its bits excludes it.
+        assert!(matches!(
+            decide_with_budget(&fb, &budget_for_level(1), vm.universe.smi_klass.oop().raw()),
+            InlineDecision::Call
+        ));
+    }
+
+    /// A same-target site below the absolute evidence floor stays a Call.
+    #[test]
+    fn poly_same_target_under_sampled_calls() {
+        let mut vm = test_vm();
+        let (klass, method) = a_klass_and_method(&mut vm);
+        let case = |count: u32| FeedbackCase {
+            klass,
+            method,
+            count: Some(count),
+        };
+        let fb = SiteFeedback::Poly {
+            cases: vec![case(3), case(3)],
+        };
+        assert!(matches!(
+            decide_with_budget(&fb, &budget_for_level(1), 0u64),
+            InlineDecision::Call
+        ));
+    }
+
+    /// Below the absolute sample floor nothing is proven — even a 2-case
+    /// site (which the OLD rule would have trusted first-seen) stays a Call
+    /// until the interpreter has really seen it.
+    #[test]
+    fn poly_under_sampled_calls() {
+        let mut vm = test_vm();
+        let (klass, method) = a_klass_and_method(&mut vm);
+        let case = |count: u32| FeedbackCase {
+            klass,
+            method,
+            count: Some(count),
+        };
+        let fb = SiteFeedback::Poly {
+            cases: vec![case(8), case(2)],
+        };
+        assert!(matches!(
+            decide_with_budget(&fb, &budget_for_level(1), vm.universe.smi_klass.oop().raw()),
+            InlineDecision::Call
+        ));
     }
 
     use crate::bytecode::builder::BytecodeBuilder;

@@ -301,7 +301,12 @@ pub const IC_GUARD_POLY: i64 = 1;
 pub const IC_GUARD_MEGA: i64 = 2;
 
 pub const IC_POLY_MAX_PAIRS: usize = 4;
-pub const IC_POLY_ARRAY_LEN: usize = IC_POLY_MAX_PAIRS * 2;
+/// `[k0,m0, k1,m1, k2,m2, k3,m3, c0,c1,c2,c3]` — the stride-2 pairs region
+/// (SPEC §4.3 lattice payload, layout unchanged) followed by a COUNT TAIL
+/// (dart124_compiler_lessons items 2+3 substrate): one smi per arm, `nil`
+/// reads as 0, bumped ONLY by the interpreter's row-7 poly hit — the
+/// unoptimized tier is the profiler, compiled code never counts.
+pub const IC_POLY_ARRAY_LEN: usize = IC_POLY_MAX_PAIRS * 3;
 
 // --- method counters (SPEC §4.4) --------------------------------------------
 

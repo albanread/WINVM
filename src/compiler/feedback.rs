@@ -39,9 +39,11 @@ pub enum SiteFeedback {
         klass: KlassOop,
         method: MethodOop,
     },
-    /// Cases ordered by count when counts exist (compiled PIC, a later step),
-    /// else by first-seen order — the interpreter POLY array is count-free
-    /// (stride pinned by SPEC §4.3), so every `count` here is `None` for now.
+    /// Cases ordered count-descending (the interpreter PIC's count tail —
+    /// `layout.rs IC_POLY_ARRAY_LEN`, dart124 items 2+3 substrate), stable
+    /// against first-seen order among ties. `count` is `Some` for every
+    /// interpreter-sourced case; compiled-PIC-sourced counts remain a later
+    /// step (`read_send_site`'s `prev`).
     Poly {
         cases: Vec<FeedbackCase>,
     },
@@ -93,9 +95,12 @@ pub fn read_send_site(
     }
 }
 
-/// Walk the `[k1, m1, k2, m2, …]` pairs array (empty slots hold `nil` in the
-/// key position — `KlassOop::try_from` rejects them, `ic::poly_arity`'s own
-/// convention). First-seen order, counts `None`.
+/// Walk the `[k1, m1, k2, m2, …, c1..c4]` pairs array (empty slots hold `nil`
+/// in the key position — `KlassOop::try_from` rejects them, `ic::poly_arity`'s
+/// own convention). Cases arrive COUNT-DESCENDING — the interpreter's row-7
+/// hit counter (ic.rs count tail) is the dominance evidence `decide_with_
+/// budget` trusts — with first-seen order preserved among ties (stable sort),
+/// so a never-yet-counted site reads exactly as it always did.
 fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
     let pairs = ArrayOop::try_from(ic.target()).expect("poly IC target must be an Array");
     let mut cases = Vec::new();
@@ -110,12 +115,14 @@ fn read_poly(vm: &VmState, ic: InterpreterIc) -> SiteFeedback {
         let Some(method) = resolve_target(vm, pairs.at(2 * i + 1), klass, ic.selector()) else {
             continue;
         };
+        let count = crate::interpreter::ic::poly_count_at(pairs, i);
         cases.push(FeedbackCase {
             klass,
             method,
-            count: None,
+            count: Some(count.clamp(0, u32::MAX as i64) as u32),
         });
     }
+    cases.sort_by(|a, b| b.count.cmp(&a.count));
     SiteFeedback::Poly { cases }
 }
 
@@ -323,7 +330,14 @@ fn snapshot_into(
                             snapshot_into(vm, target, h, depth.saturating_add(1), visited);
                         }
                         SiteFeedback::Poly { cases } => {
-                            for c in cases {
+                            // Count-independent visit order: cases arrive
+                            // count-sorted, and counts DRIFT — hashing the
+                            // recursion in that order would flip the hash on
+                            // every dominance change and churn recompiles.
+                            // Klass raw is run-stable (old space never moves).
+                            let mut sorted = cases;
+                            sorted.sort_by_key(|c| c.klass.oop().raw());
+                            for c in sorted {
                                 snapshot_into(vm, c.method, h, depth.saturating_add(1), visited);
                             }
                         }
@@ -425,7 +439,7 @@ mod tests {
 
     /// The interpreter POLY array is count-free and first-seen ordered.
     #[test]
-    fn reads_poly_first_seen_order_count_free() {
+    fn reads_poly_fresh_counts_zero_first_seen_order() {
         let mut vm = test_vm();
         let host = host_with_send(&mut vm);
         let k1 = vm.universe.smi_klass;
@@ -453,9 +467,10 @@ mod tests {
                     "first-seen order"
                 );
                 assert_eq!(cases[0].method.oop().raw(), m1.oop().raw());
-                assert!(
-                    cases[0].count.is_none(),
-                    "interpreter POLY carries no counts"
+                assert_eq!(
+                    cases[0].count,
+                    Some(0),
+                    "fresh pairs carry zero counts (nil count tail reads 0)"
                 );
                 assert_eq!(cases[1].klass.oop().raw(), k2.oop().raw());
                 assert_eq!(cases[1].method.oop().raw(), m2.oop().raw());

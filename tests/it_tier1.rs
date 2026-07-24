@@ -134,6 +134,7 @@ fn run_ir_raw() {
     let method = IrMethod {
 
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0, block1, block2, block3],
         vregs,
         pool: Vec::new(),
@@ -286,6 +287,7 @@ fn mul_method() -> IrMethod {
     };
     IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0, block1],
         vregs: (0..4).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         pool: Vec::new(),
@@ -419,6 +421,7 @@ fn run_ir_raw_forces_spill() {
     };
     let method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0, block1],
         vregs,
         pool: Vec::new(),
@@ -1415,15 +1418,18 @@ fn redefining_superclass_method_invalidates_subclass_nmethod() {
     );
 }
 
-/// The current AArch64 native stack pointer — `sp` never appears as an
-/// ordinary register operand (AArch64 requires `mov`/add-immediate forms
-/// for it), so reading it needs one inline-asm instruction; this whole
-/// file already carries the crate's "allowed unsafe" exemption for exactly
-/// this kind of raw-machine-state check.
+/// The current native stack pointer — on AArch64 `sp` never appears as an
+/// ordinary register operand (it requires `mov`/add-immediate forms), so
+/// reading it needs one inline-asm instruction; x86_64 reads `rsp` the same
+/// way. This whole file already carries the crate's "allowed unsafe"
+/// exemption for exactly this kind of raw-machine-state check.
 fn native_sp() -> u64 {
     let sp: u64;
     unsafe {
+        #[cfg(target_arch = "aarch64")]
         std::arch::asm!("mov {}, sp", out(reg) sp);
+        #[cfg(target_arch = "x86_64")]
+        std::arch::asm!("mov {}, rsp", out(reg) sp);
     }
     sp
 }
@@ -2536,6 +2542,7 @@ fn mono_resolve_patches_call_site_and_dispatches() {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -2726,6 +2733,7 @@ fn build_c2i_scenario(vm: &mut VmState) -> (u64, KlassOop, NmethodId) {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -2980,6 +2988,7 @@ fn full_ic_lattice_mono_to_pic_to_mega() {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -3228,6 +3237,7 @@ fn dnu_from_compiled_code_reaches_does_not_understand() {
     };
     let caller_method = IrMethod {
         osr_cold_sends: 0,
+        is_osr: false,
         blocks: vec![block0],
         vregs,
         pool: Vec::new(),
@@ -6582,8 +6592,9 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
     install_method(&mut vm, kb, v_sel, vb);
 
     // `call: x [ ^x v ]` — receiver is the ARG (self-send devirt must not
-    // interfere), IC seeded POLY with exactly two cases, A first (the
-    // countless-interpreter-POLY dominance rule trusts cases[0] at len==2).
+    // interfere), IC seeded POLY with two cases whose COUNT TAIL proves A
+    // dominant (dart124 items 2+3: dominance is measured — 32 vs 4 clears
+    // both the 16-sample floor and the 34% share floor).
     let call_sel = vm.universe.intern(b"call:");
     let mut cb = BytecodeBuilder::new();
     cb.push_temp(0);
@@ -6601,6 +6612,9 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
     pairs.at_put(1, va.oop());
     pairs.at_put(2, kb.oop());
     pairs.at_put(3, vb.oop());
+    let count_tail = 2 * macvm::oops::layout::IC_POLY_MAX_PAIRS;
+    pairs.at_put(count_tail, SmallInt::new(32).oop());
+    pairs.at_put(count_tail + 1, SmallInt::new(4).oop());
     let epoch = vm.ic_epoch;
     InterpreterIc::at(call_m, 0).set_poly(&mut vm, pairs, epoch);
 
@@ -6635,6 +6649,219 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
             "dominant fast path AND rejoining slow path must both match the interpreter"
         );
     }
+}
+
+/// dart124 items 2+3 slice 2: SAME-TARGET poly — richards' schedule-loop
+/// shape. Four sibling klasses inherit ONE superclass method; the site's
+/// counts are FLAT (the exact profile slice-1's dominance rule declines);
+/// the compile must splice the shared body ONCE behind a klass-membership
+/// guard (`GuardKlassIn`) whose fail edge is the rejoining real send. Every
+/// seen sibling takes the fast path, the UNSEEN fifth takes the slow send,
+/// and all five must match the interpreter. One dep per SEEN klass.
+#[test]
+fn poly_same_target_inlines_membership_guard() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    let object_klass = vm.universe.object_klass;
+    let sup = vm
+        .universe
+        .new_klass(object_klass, "STBase", Format::Slots, false, HEADER_WORDS);
+    let mut subs: Vec<KlassOop> = Vec::new();
+    for n in ["STA", "STB", "STC", "STD", "STE"] {
+        subs.push(
+            vm.universe
+                .new_klass(sup, n, Format::Slots, false, HEADER_WORDS),
+        );
+    }
+
+    // ONE leaf implementation, on the superclass — every sibling inherits it.
+    let v_sel = vm.universe.intern(b"v");
+    let mut b = BytecodeBuilder::new();
+    b.push_smi_i8(33);
+    b.ret_tos();
+    let shared = b.finish(&mut vm, v_sel, 0, 0);
+    install_method(&mut vm, sup, v_sel, shared);
+
+    // `call: x [ ^x v ]` on the smi klass; receiver is the ARG.
+    let call_sel = vm.universe.intern(b"call:");
+    let mut cb = BytecodeBuilder::new();
+    cb.push_temp(0);
+    cb.send(&mut vm, v_sel, 0);
+    cb.ret_tos();
+    let call_m = cb.finish(&mut vm, call_sel, 1, 0);
+    install_method(&mut vm, smi_klass, call_sel, call_m);
+
+    // Seed POLY with the four SEEN siblings (STE stays unseen), all mapping
+    // to the ONE shared method, counts FLAT at 10 — total 40 clears the
+    // evidence floor while no single arm clears the 34% dominance share.
+    let array_klass = vm.universe.array_klass;
+    let pairs = macvm::memory::alloc::alloc_indexable_oops(
+        &mut vm,
+        array_klass,
+        macvm::oops::layout::IC_POLY_ARRAY_LEN,
+    );
+    for i in 0..4 {
+        pairs.at_put(2 * i, subs[i].oop());
+        pairs.at_put(2 * i + 1, shared.oop());
+        pairs.at_put(
+            2 * macvm::oops::layout::IC_POLY_MAX_PAIRS + i,
+            SmallInt::new(10).oop(),
+        );
+    }
+    let epoch = vm.ic_epoch;
+    InterpreterIc::at(call_m, 0).set_poly(&mut vm, pairs, epoch);
+
+    let id = driver::compile_method(&mut vm, smi_klass, call_m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert_eq!(
+            nm.ic_sites.len(),
+            1,
+            "exactly one compiled IC site: the rejoining slow-path send"
+        );
+        assert_eq!(
+            nm.inline_deps.len(),
+            4,
+            "one (klass, selector) dep per SEEN sibling"
+        );
+    }
+
+    let self_smi = SmallInt::new(5).oop();
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for k in &subs {
+        let recv = alloc::alloc_slots(&mut vm, *k).oop();
+        let interp = macvm::interpreter::run_method(&mut vm, call_m, self_smi, &[recv]);
+        assert_eq!(interp.raw(), SmallInt::new(33).oop().raw());
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [self_smi.raw(), recv.raw()].as_ptr(), 2) };
+        assert_eq!(
+            result,
+            SmallInt::new(33).oop().raw(),
+            "membership fast path (seen siblings) AND rejoining slow path \
+             (the unseen fifth) must both match the interpreter"
+        );
+    }
+}
+
+/// dart124 items 2+3 slice 3: same-target CFG splice — the authentic
+/// richards predicate shape (`or:` + `not` + `and:` — multi-block, carries
+/// a real Send) grafted behind the membership guard. Warm-up is ORGANIC:
+/// interpreted probes accrue the PIC count tail through the row-7 path,
+/// then the compile must pick `leg=cfg`. Four seen siblings exercise both
+/// branch arms of the predicate through the graft; the unseen fifth takes
+/// the rejoining slow send; every result must match the interpreter.
+#[test]
+fn poly_same_target_cfg_splices_multiblock_predicate() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    load_source(
+        &mut vm,
+        "Object subclass: P3Base [\n\
+        \x20   | pending waiting holding |\n\
+        \x20   setP: p w: w h: h [ pending := p. waiting := w. holding := h ]\n\
+        \x20   busy [ ^holding or: [ pending not and: [ waiting ] ] ]\n\
+        ]\n\
+        P3Base subclass: P3A []\n\
+        P3Base subclass: P3B []\n\
+        P3Base subclass: P3C []\n\
+        P3Base subclass: P3D []\n\
+        P3Base subclass: P3E []\n\
+        Object subclass: P3Probe [\n\
+        \x20   probe: x [ ^x busy ]\n\
+        ]\n",
+    );
+    // The fixture world has bare True/False klasses — install the CANONICAL
+    // not flips (the graft's not→BoolNot fusion verifies against exactly
+    // these bodies).
+    let not_sel = vm.universe.intern(b"not");
+    let mut nb = BytecodeBuilder::new();
+    nb.push_false();
+    nb.ret_tos();
+    let true_not = nb.finish(&mut vm, not_sel, 0, 0);
+    let true_klass = vm.universe.true_klass;
+    install_method(&mut vm, true_klass, not_sel, true_not);
+    let mut nb = BytecodeBuilder::new();
+    nb.push_true();
+    nb.ret_tos();
+    let false_not = nb.finish(&mut vm, not_sel, 0, 0);
+    let false_klass = vm.universe.false_klass;
+    install_method(&mut vm, false_klass, not_sel, false_not);
+
+    let mut subs: Vec<KlassOop> = Vec::new();
+    for n in ["P3A", "P3B", "P3C", "P3D", "P3E"] {
+        subs.push(klass_named(&mut vm, n));
+    }
+    let base_klass = klass_named(&mut vm, "P3Base");
+    let probe_klass = klass_named(&mut vm, "P3Probe");
+    let probe_m = method_named(&mut vm, probe_klass, "probe:");
+    let set_m = method_named(&mut vm, base_klass, "setP:w:h:");
+
+    let t = vm.universe.true_obj;
+    let f = vm.universe.false_obj;
+    // (pending, waiting, holding) -> busy = holding or (not pending and waiting)
+    let cfgs: [(Oop, Oop, Oop, Oop); 4] = [
+        (f, f, t, t), // holding wins the first arm
+        (f, t, f, t), // second arm: not pending and waiting
+        (t, t, f, f), // pending kills the second arm
+        (f, f, f, f), // nothing set
+    ];
+    let probe_recv = alloc::alloc_slots(&mut vm, probe_klass).oop();
+
+    // Organic ROUND-ROBIN warm-up (richards' own access pattern): the first
+    // round forms the poly IC (mono → upgrade → appends, each seeding its
+    // arm's first hit), the following rounds accrue row-7 bumps — 6 rounds
+    // x 4 siblings lands the total well past the 16-sample evidence floor,
+    // flat by klass.
+    let mut recvs: Vec<(Oop, Oop)> = Vec::new();
+    for (i, &(p, w, h, expect)) in cfgs.iter().enumerate() {
+        let recv = alloc::alloc_slots(&mut vm, subs[i]).oop();
+        macvm::interpreter::run_method(&mut vm, set_m, recv, &[p, w, h]);
+        recvs.push((recv, expect));
+    }
+    for _ in 0..6 {
+        for &(recv, expect) in recvs.iter() {
+            let got = macvm::interpreter::run_method(&mut vm, probe_m, probe_recv, &[recv]);
+            assert_eq!(got.raw(), expect.raw(), "interpreted predicate");
+        }
+    }
+    // The unseen fifth sibling: never probed before the compile.
+    let recv_e = alloc::alloc_slots(&mut vm, subs[4]).oop();
+    macvm::interpreter::run_method(&mut vm, set_m, recv_e, &[f, t, f]);
+
+    let id = driver::compile_method(&mut vm, probe_klass, probe_m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.inline_deps.len() >= 4,
+            "at least one (klass, selector) dep per seen sibling (inner \
+             fusions may add true/false deps): got {}",
+            nm.inline_deps.len()
+        );
+    }
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for &(recv, expect) in recvs.iter() {
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [probe_recv.raw(), recv.raw()].as_ptr(), 2) };
+        assert_eq!(
+            result,
+            expect.raw(),
+            "grafted predicate fast path must match the interpreter"
+        );
+    }
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [probe_recv.raw(), recv_e.raw()].as_ptr(), 2) };
+    assert_eq!(
+        result,
+        t.raw(),
+        "unseen sibling must take the rejoining slow send and still agree"
+    );
 }
 
 /// Step-9 soak-gate regression (THE materializer ordering bug): an inlined
