@@ -5,6 +5,16 @@
 no GUI/Dolphin code, testable with Rust doubles. Everything downstream builds on
 it, so it lands first and is proven to depth before any Dolphin class arrives.
 
+**Scope decision (2026-07-24): Dolphin is Windows-only for now.** The entire
+re-entrant nesting path serves the Win32 wndproc, so the whole G0 stack machinery
+— the LIFO recovery stack, the top-of-stack fault lookup, the fail-closed removal,
+the `&mut` re-entry token — is **`#[cfg(windows)]`**. macOS/Cocoa keeps its
+existing single-slot, top-level-only model (`claim_jmp_slot` + single idle
+baseline + the fail-closed `dispatch_callback` guard) **byte-identical to today**;
+Cocoa's own "always top-level" doctrine means it never needs nesting. Consequence:
+**no thread-local is ever read from a POSIX signal handler** — the signal-safety
+hazard below is resolved by construction, not by careful POSIX handling.
+
 This spec is grounded in a read of the current substrate; file:line are on this
 branch's tree.
 
@@ -48,16 +58,12 @@ so recovery of the innermost is all that's ever needed). Depth is a counter.
 - `lookup_jmp_slot_for_current_thread()` ([`:523`](../../src/codecache/deopt_trap.rs))
   returns the **top**.
 
-  ⚠️ **Signal-safety hazard.** This is read from the fault handler. On Windows
-  (VEH, `handle_win_fault`) a thread-local `Cell::get` is fine — same thread,
-  TLS intact. On **POSIX** (`sig_fault_handler`) a thread-local read may call
-  `__tls_get_addr`, which is *not* async-signal-safe. Resolution: keep the top
-  in a form the POSIX handler can read safely, or `#[cfg]` the top-of-stack read
-  to Windows and leave POSIX on the existing single-slot `JMP_OWNER` search
-  (macOS/Cocoa has its own nesting model and does not need this path). The Win32
-  GUI is Windows-only, so Windows correctness is the gate; POSIX must merely stay
-  byte-identical to today. Decide at implementation time; **do not** silently
-  introduce a TLS read into the POSIX signal path.
+  ✅ **Signal-safety — resolved by the Windows-only scope.** The top-of-stack
+  read happens only in the Windows VEH (`handle_win_fault`), where a thread-local
+  `Cell::get` is safe (same thread, TLS intact), and it is **`#[cfg(windows)]`**.
+  The POSIX `sig_fault_handler` keeps the existing single-slot `JMP_OWNER` search
+  and never reads a thread-local (a TLS read there could call `__tls_get_addr`,
+  which is not async-signal-safe). The hazard cannot arise.
 
 ### Change 2 — baseline stack + depth (`embed.rs`)
 
