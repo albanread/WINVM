@@ -94,6 +94,45 @@ sees a new shape.
   block reloads from seeded slots once, then goes register-resident);
   FP save slots for float loops.
 
+## Recon deltas (2026-07-24, second pass — the diff-level facts)
+
+- **The deopt side is one arm, not a subsystem.** Deopt metadata encodes
+  per-vreg `ValueLoc::FrameSlot(byte_off)` (driver's
+  `build_deopt_metadata`/`resolve_frame_loc`; golden test at
+  driver.rs:~2578 shows the exact `-8*(slot+1)` mapping). A
+  register-resident vreg at a `LoopPoll` site resolves to
+  `FrameSlot(-8*(frame_slots + reg_index + 1))` — same encoding, so the
+  MATERIALIZER IS UNCHANGED, exactly as designed.
+- **`verify_spill_all` (regalloc.rs:1123) anticipated this change** — a
+  RELEASE-mode assert whose doc names silent heap corruption as the
+  failure mode. S1 evolves it: register across a CALL-SHAPED safepoint
+  still panics; register across a poll panics UNLESS that poll's save
+  record covers the (vreg, poll) pair.
+- **The organic-span pin rule (subtle, load-bearing).** `LoopPoll`
+  deopt-referenced vregs pin today via MEMBERSHIP (`deopt_referenced`,
+  regalloc.rs:647 — intervals stay organic per task #94). A poll-deopt
+  vreg whose organic interval does NOT span the poll (interpreter-
+  visible, dead in compiled code) must KEEP membership pinning — its
+  register could be legally reused before the poll, so there is nothing
+  to save. The exemption applies ONLY to intervals organically spanning
+  the poll (`start <= p && end > p` from real uses) — which is precisely
+  the loop-carried hot set (arith's `s`/`i`), so the win is untouched.
+- **`extra_oop_live` entries may now name register-assigned vregs**
+  (recorded conservatively at every earlier safepoint, task #94);
+  `build_for_position` must skip non-`Spill` assignments — their poll
+  bits come from the save record instead.
+- **Pin computation site**: regalloc.rs:669-673 (`crosses_safepoint` =
+  membership ∪ spans-any-safepoint). S1: spans-any-PINNING-position ∪
+  trap-membership ∪ non-spanning-poll-membership; `is_fp` and
+  `method.is_osr` keep the old full pin.
+- **Frame size**: emit_x64.rs:1026 (`raw = 8 * frame_slots`) grows by
+  the save area; the nil-fill loop at :1173 does NOT cover save slots
+  (their bits are set only at poll positions the stores dominate).
+- **OopMap** is a plain bitmap (`nmethod.rs:46`); `build_for_position(
+  intervals, frame_slots, position, extra_oop_live)` (oopmap.rs:52,
+  called from driver.rs:1354) gains the per-poll save records and the
+  widened slot universe.
+
 ## Touch points (slice 1)
 
 | Where | What |
