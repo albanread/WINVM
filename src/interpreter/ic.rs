@@ -151,6 +151,22 @@ fn poly_arity(pairs: ArrayOop) -> u8 {
     n
 }
 
+/// Arm `i`'s hit count from the pairs array's count tail (see
+/// `IC_POLY_ARRAY_LEN`): a smi, with `nil` (fresh slot, or one cleared by
+/// `reverify_poly`) reading as 0.
+pub fn poly_count_at(pairs: ArrayOop, i: usize) -> i64 {
+    SmallInt::try_from(pairs.at(2 * IC_POLY_MAX_PAIRS + i)).map_or(0, |s| s.value())
+}
+
+/// Row-7 profiling: saturating bump of arm `i`'s count. A smi store into an
+/// existing slot — no barrier, no allocation, nothing for GC to see.
+fn poly_count_bump(pairs: ArrayOop, i: usize) {
+    let c = poly_count_at(pairs, i);
+    if c < i32::MAX as i64 {
+        pairs.at_put(2 * IC_POLY_MAX_PAIRS + i, SmallInt::new(c + 1).oop());
+    }
+}
+
 /// Test + S14 feedback readout (SPEC §8.4): reconstructs the lattice state
 /// from the raw guard/target slots.
 pub fn ic_state(method: MethodOop, ic_idx: u16) -> IcState {
@@ -212,22 +228,26 @@ fn reverify_poly(
     pairs: ArrayOop,
 ) -> ArrayOop {
     let arity = poly_arity(pairs);
-    let mut kept: Vec<(Oop, Oop)> = Vec::with_capacity(arity as usize);
+    let mut kept: Vec<(Oop, Oop, i64)> = Vec::with_capacity(arity as usize);
     for i in 0..arity as usize {
         let k = pairs.at(2 * i);
         let kk = KlassOop::try_from(k).expect("reverify_poly: pair key is not a KlassOop");
         if let Some(m) = resolve(vm, caller, selector, is_super, kk) {
-            kept.push((k, m.oop()));
+            // The count travels with its arm through compaction — dropping
+            // it would let one redefinition erase a hot arm's dominance.
+            kept.push((k, m.oop(), poly_count_at(pairs, i)));
         }
     }
     let nil = vm.universe.nil_obj;
-    for (i, &(k, m)) in kept.iter().enumerate() {
+    for (i, &(k, m, c)) in kept.iter().enumerate() {
         pairs.at_put(2 * i, k);
         pairs.at_put(2 * i + 1, m);
+        pairs.at_put(2 * IC_POLY_MAX_PAIRS + i, SmallInt::new(c).oop());
     }
     for i in kept.len()..IC_POLY_MAX_PAIRS {
         pairs.at_put(2 * i, nil);
         pairs.at_put(2 * i + 1, nil);
+        pairs.at_put(2 * IC_POLY_MAX_PAIRS + i, nil);
     }
     // `pairs` is as long-lived as its IC — routinely old by reverify time,
     // while the re-resolved methods may be young (S7-10).
@@ -371,7 +391,10 @@ pub fn ic_transition(
             let arity = poly_arity(pairs);
             for i in 0..arity as usize {
                 if pairs.at(2 * i).raw() == rcvr_klass.oop().raw() {
-                    // Row 7.
+                    // Row 7 — and the profiling tier's one job (dart124
+                    // items 2+3): count the hit so `feedback::read_poly`
+                    // can order cases by measured dominance.
+                    poly_count_bump(pairs, i);
                     return MethodOop::try_from(pairs.at(2 * i + 1));
                 }
             }
@@ -780,6 +803,48 @@ mod tests {
         assert_eq!(pairs.at(2 * b_slot + 1), m_b2.oop());
     }
 
+    /// dart124 items 2+3 substrate: row-7 hits bump the count tail, and
+    /// reverification carries each surviving arm's count through compaction
+    /// while clearing the dropped tail — one redefinition must not erase a
+    /// hot arm's measured dominance, and a dead arm's count must not leak
+    /// into whichever arm compacts into its slot.
+    #[test]
+    fn ic_poly_counts_bump_and_survive_reverify() {
+        let mut vm = test_vm();
+        let sel = vm.universe.intern(b"foo");
+        let a = new_klass(&mut vm, "A");
+        let dead = new_klass(&mut vm, "Dead");
+        let m_a = method_returning(&mut vm, "foo_a", 1);
+        install_method(&mut vm, a, sel, m_a);
+        let caller = build_caller(&mut vm, sel, 0);
+
+        let stale_method = method_returning(&mut vm, "stale", 99);
+        let array_klass = vm.universe.array_klass;
+        let pairs =
+            crate::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, IC_POLY_ARRAY_LEN);
+        // dead first, a second: compaction must MOVE a's count left.
+        pairs.at_put(0, dead.oop());
+        pairs.at_put(1, stale_method.oop());
+        pairs.at_put(2, a.oop());
+        pairs.at_put(3, m_a.oop());
+        for _ in 0..3 {
+            poly_count_bump(pairs, 1); // a's arm
+        }
+        poly_count_bump(pairs, 0); // dead's arm
+        assert_eq!(poly_count_at(pairs, 0), 1);
+        assert_eq!(poly_count_at(pairs, 1), 3);
+
+        let pairs = reverify_poly(&mut vm, caller, sel, false, pairs);
+        assert_eq!(poly_arity(pairs), 1, "dead pair dropped");
+        assert_eq!(pairs.at(0).raw(), a.oop().raw());
+        assert_eq!(
+            poly_count_at(pairs, 0),
+            3,
+            "a's count traveled with its arm through compaction"
+        );
+        assert_eq!(poly_count_at(pairs, 1), 0, "dropped arm's count cleared");
+    }
+
     #[test]
     fn ic_poly_reverify_drops_dead() {
         // A pair's klass is only reachable through a live send in v1 (no
@@ -798,7 +863,8 @@ mod tests {
         // pair (dead, which has no `foo`).
         let stale_method = method_returning(&mut vm, "stale", 99);
         let array_klass = vm.universe.array_klass;
-        let pairs = crate::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, 8);
+        let pairs =
+            crate::memory::alloc::alloc_indexable_oops(&mut vm, array_klass, IC_POLY_ARRAY_LEN);
         pairs.at_put(0, a.oop());
         pairs.at_put(1, m_a.oop());
         pairs.at_put(2, dead.oop());

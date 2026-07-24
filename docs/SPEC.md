@@ -319,11 +319,14 @@ States (same lattice as Strongtalk's interpretedIC):
 - **monomorphic**: guard = klassOop, target = CompiledMethod **or** nmethod id
   (smi handle into the code cache — lets an interpreter IC point at compiled
   code, Strongtalk's `compiled_send` state).
-- **polymorphic**: guard = POLY marker, target = Array `[k1,m1,k2,m2,…]`,
-  max 4 pairs *(tunable)*, ordered first-seen. Interpreter POLY entries carry
-  **no hit counts** in v1; compiled PIC stubs add per-entry counters at S14
-  (the optimizer's dominant-case picker uses those, or first-seen order for
-  2-case interpreter sites).
+- **polymorphic**: guard = POLY marker, target = Array
+  `[k1,m1,k2,m2,…, c1..c4]` — max 4 pairs *(tunable)*, ordered first-seen,
+  followed by a smi COUNT TAIL (dart124 lessons items 2+3; `nil` reads 0)
+  bumped only by the interpreter's poly hit — the unoptimized tier is the
+  profiler, compiled code never counts. The optimizer's dominant-case
+  picker reads cases count-descending and trusts a dominant only past an
+  evidence floor (16 samples, 34% share); compiled-PIC-sourced counts on
+  recompile remain a later step.
 - **megamorphic**: guard = MEGA marker; always consults the lookup cache (§6.1).
 
 Because the table is a normal heap Array, **GC scans ICs for free** and the

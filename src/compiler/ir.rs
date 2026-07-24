@@ -1766,7 +1766,10 @@ impl<'a> Translator<'a> {
             crate::interpreter::ic::IcState::Poly(_)
         ) {
             match crate::oops::wrappers::ArrayOop::try_from(ic.target()) {
-                Some(pairs) => (0..pairs.len() / 2).all(|i| {
+                // Pairs region only — never `len()/2`: the array carries a
+                // count tail after the pairs (layout.rs IC_POLY_ARRAY_LEN)
+                // whose smis must not be mistaken for receiver klasses.
+                Some(pairs) => (0..crate::oops::layout::IC_POLY_MAX_PAIRS).all(|i| {
                     let k = pairs.at(2 * i).raw();
                     k == tk || k == fk || k == u.nil_obj.raw()
                 }),

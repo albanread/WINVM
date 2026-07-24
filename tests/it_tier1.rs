@@ -6592,8 +6592,9 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
     install_method(&mut vm, kb, v_sel, vb);
 
     // `call: x [ ^x v ]` — receiver is the ARG (self-send devirt must not
-    // interfere), IC seeded POLY with exactly two cases, A first (the
-    // countless-interpreter-POLY dominance rule trusts cases[0] at len==2).
+    // interfere), IC seeded POLY with two cases whose COUNT TAIL proves A
+    // dominant (dart124 items 2+3: dominance is measured — 32 vs 4 clears
+    // both the 16-sample floor and the 34% share floor).
     let call_sel = vm.universe.intern(b"call:");
     let mut cb = BytecodeBuilder::new();
     cb.push_temp(0);
@@ -6611,6 +6612,9 @@ fn poly_dominant_inlines_with_rejoining_slow_path() {
     pairs.at_put(1, va.oop());
     pairs.at_put(2, kb.oop());
     pairs.at_put(3, vb.oop());
+    let count_tail = 2 * macvm::oops::layout::IC_POLY_MAX_PAIRS;
+    pairs.at_put(count_tail, SmallInt::new(32).oop());
+    pairs.at_put(count_tail + 1, SmallInt::new(4).oop());
     let epoch = vm.ic_epoch;
     InterpreterIc::at(call_m, 0).set_poly(&mut vm, pairs, epoch);
 

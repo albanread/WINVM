@@ -799,3 +799,35 @@ runs each pair in ~3 s.**
 Remaining item-8 slice (deferred, documented): fresh-`Alloc` receiver
 elision for constructor init runs — fold into the F3c slow-path
 restructuring, which touches the same Poll/alloc-slow sites.
+
+## 2026-07-24 — PIC arm counts + count-proven dominance (dart124 items 2+3, slice 1)
+
+The counts substrate: the poly pairs array gains a smi count tail
+(`[k1,m1,…,c1..c4]`, layout.rs; SPEC §4.3 updated), bumped only by the
+interpreter's row-7 hit — the unoptimized tier is the profiler, compiled
+code never counts (Dart's cost model). `read_poly` returns cases
+count-descending (stable vs first-seen); `snapshot_into` hashes poly
+recursion in klass-raw order so count DRIFT cannot flap the profile hash;
+reverification carries counts through compaction. `decide_with_budget`
+retires the "first-seen, trusted only at len==2" pin: a dominant inlines
+at ANY arity past an evidence floor (16 samples, 34% share), and an
+under-sampled 2-case site now honestly declines. BoolNot's poly walk
+fixed to the pairs region (`len()/2` would have read counts as klasses).
+
+Bench pair (same session, t=20): FLAT — richards 26→27 (its band today),
+fib 205→191 (its documented flappiness), rest identical. The instructive
+negative: richards' hot poly sites (schedule-loop predicates) are
+flat-BY-KLASS with a SHARED target — four Task klasses, one TaskState
+method — so no arm clears 34% and by-klass dominance correctly declines.
+The unlock for those sites is slice 2: duplicate-target dedup (one
+spliced body behind a multi-klass guard chain) and/or CHA guard-free
+devirt (lessons item 4), both of which key on the TARGET, not the klass.
+
+Gates: 739 lib tests (4 new: count bump/reverify-carry, arity-3 dominant,
+flat-4 declines, under-sampled declines); world differential off vs t=200
+byte-identical plain + GC_STRESS=1 + full:64 + DEOPT_STRESS=64 (release);
+it_tier1's poly/dominant tests pass with count-seeded evidence. Also this
+session: it_tier1 COMPILES ON WINDOWS for the first time (is_osr fields,
+native_sp x64 asm — 467bd12); the suite's first-ever x64 run dies at
+c2i_adapter_dispatches_to_interpreted_method (FOREIGN pc 0, pre-existing;
+tracked as its own porting task).
