@@ -732,3 +732,44 @@ Day's arc: alloc was 8x behind, richards 2.6x, "sieve 3x" and
 "deltablue 6x" — the last two never real. What remains is a ~1.15-1.2x
 send-activation residual on the two deep-call benchmarks, which is F3c
 (register-resident oops across safepoints) plus fib's pure call chain.
+
+## 2026-07-24 — upstream sync features 1-3: richards inverts (27 vs 33)
+
+The MACVM-side sync (docs/upstream_sync_2026-07-24.md) staged per feature,
+benched before/after each (pinned, same-session pairs, warm ms per x10):
+
+| bench | baseline | +alloc-group | +BoolNot | +F7-whitelist | Cog (same runs) |
+|---|---|---|---|---|---|
+| arith | 34 | 34 | 35 | 35 | 49-50 |
+| dict | 13 | 12 | 12 | 12 | 16-17 |
+| alloc | 15 | 14 | 14 | 14 | 17 |
+| **richards** | **34** | **30** | **28** | **27** | **32-34** |
+| sieve | 3 | 3 | 3 | 3 | <1* (real: 4, see 07-22) |
+| deltablue | 4 | 4 | 4 | 4 | <1* (real: 4, see 07-22) |
+| fib | 195 | 208 | 209 | 211 | 133-183 (flappiest on both) |
+
+*Cog's harness on this side still quantizes to the ms tick (every value a
+x1000 multiple); the 2026-07-22 microsecond-clock session measured its
+sieve/deltablue at 4 ms each, i.e. parity with ours.
+
+What the stages actually were, after review showed most of "feature 1" and
+the eden work had already been replicated here (baseline alloc was already
+15 ms — the historical 138 ms table predates 9cb272e-era work):
+
+1. **Alloc-group residue** (5d79c27 docs, 86aec53 test re-arms, 8704792
+   pooled-arg smi guard + eden clamp). richards 34 -> 30.
+2. **BoolNot fires at last** (9cb272e findings 1+2, left in
+   x64_codegen_perf.md by the MACVM port's verification pass): the
+   canonical-flip check's dead `n1 >= len` conjunct dropped; the missing
+   successors() trap edge added. First time any `not` site compiled
+   inline. richards 30 -> 28.
+3. **F7 entry-scan whitelist** (finding 3): correctness, not perf —
+   richards 27 within noise of 28. Four-way suite green including
+   deopt-stress.
+
+Scoreboard after: **ahead on arith (1.4x), dict (1.4x), alloc (1.2x),
+richards (1.2x)**; sieve/deltablue parity against Cog's real clock; fib
+remains the flappy outlier (~1.2-1.4x behind, pure call-chain — the F3c /
+frameless-x64 territory). The 07-22 session's "~1.15x richards residual"
+is now inverted. Frameless emission (Mac F0-F3) stays arm64-only; its x64
+port is the top remaining lever for fib and the named follow-up.
