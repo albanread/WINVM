@@ -1235,20 +1235,38 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     // written before the first safepoint needs no prologue nil-fill — the
     // entry block's leading defs (every `Param`, the immediate temp
     // initializers) execute on every path before any safepoint can scan
-    // or materialize the slot. Not applied to OSR compiles: their entry
-    // jumps straight to the loop header, bypassing the entry block.
+    // or materialize the slot.
+    //
+    // "Unconditionally" is enforced by a WHITELIST walk of the entry
+    // block's leading run (9cb272e finding 3, from the MACVM port): only
+    // ops that can neither divert control nor skip their def count
+    // (`Param`, `ConstPool`, `ConstSmi`, `Move` — the params and immediate
+    // temp initializers that are F7's entire payload), and the scan stops
+    // at the FIRST op of any other kind. The original stopped only at
+    // `is_safepoint(op)`, which is unsound against task-#94's
+    // back-recording: a mid-block fail edge (a smi guard's overflow arm, a
+    // `GuardKlass`, `BoolNot`'s non-boolean arm) can leave the entry block
+    // EARLY, reach a trap whose oop map scans a later-trap-referenced slot
+    // via the earlier-safepoint facts — before the def sitting after that
+    // guard ever ran; the prologue would no longer nil-fill the slot, and
+    // a GC striking during deopt materialization would scan uninitialized
+    // native stack. Not applied to OSR compiles: their entry jumps
+    // straight to the loop header, bypassing the entry block.
     let entry_early_defs: std::collections::HashSet<u32> = if method.is_osr {
         Default::default()
     } else {
         let entry = &method.blocks[block_order[0].0 as usize];
         let mut set = std::collections::HashSet::new();
         for op in &entry.code {
-            if is_safepoint(op) {
-                break;
+            match op {
+                Ir::Param { .. }
+                | Ir::ConstPool { .. }
+                | Ir::ConstSmi { .. }
+                | Ir::Move { .. } => op.defs(|v| {
+                    set.insert(v.0);
+                }),
+                _ => break,
             }
-            op.defs(|v| {
-                set.insert(v.0);
-            });
         }
         set
     };
