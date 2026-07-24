@@ -849,11 +849,15 @@ pub fn emit_x64(
     // booleans the compare ops load, an old `ConstPool` constant). Old
     // objects never return to young space, so the compile-time address
     // check holds for the nmethod's lifetime; a still-young constant just
-    // keeps its barrier (conservative). Any other def — `Move`, `Param`,
-    // call results, a fresh `Alloc` (young by construction) — disqualifies
-    // the vreg. OSR slot seeding is covered: an OSR entry writes a vreg's
-    // slot with the interpreter's value for the SAME program point, which
-    // for these def shapes is the same smi/boolean/constant.
+    // keeps its barrier (conservative). F6b (dart124_compiler_lessons item
+    // 8): a `Move` is as free as its source, so a barrier-free value
+    // survives the block-arg moves a merge introduces — richards'
+    // `destination:` stores an inlined constant that always arrives through
+    // one. Any other def — `Param`, call results, a fresh `Alloc` (young by
+    // construction) — disqualifies the vreg. OSR slot seeding is covered:
+    // an OSR entry writes a vreg's slot with the interpreter's value for
+    // the SAME program point, which for these def shapes (Move chains
+    // included) is the same smi/boolean/constant.
     let pool_free = |lit_ix: usize| -> bool {
         use crate::oops::layout::MEM_TAG;
         // `.get`, not indexing: fixture methods may carry an empty pool with
@@ -866,22 +870,34 @@ pub fn emit_x64(
     };
     let bools_free =
         pool_free(method.true_lit.0 as usize) && pool_free(method.false_lit.0 as usize);
-    let mut nb: Vec<Option<bool>> = vec![None; method.vregs.len()];
-    for blk in &method.blocks {
-        for op in &blk.code {
-            let free = match op {
-                Ir::ConstSmi { .. } | Ir::SmiArith { .. } => true,
-                Ir::SmiCmpVal { .. } | Ir::FCmpVal { .. } => bools_free,
-                Ir::ConstPool { lit, .. } => pool_free(lit.0 as usize),
-                _ => false,
-            };
-            op.defs(|v| {
-                let e = &mut nb[v.0 as usize];
-                *e = Some(e.unwrap_or(true) && free);
-            });
+    // Fixpoint: `Move`'s contribution reads the previous round's verdicts,
+    // which start all-false and only ever flip false→true — the AND-over-defs
+    // is monotone, so this terminates (in practice one extra round per link
+    // of the longest move chain, i.e. two rounds for the common merge shape).
+    let mut no_barrier: Vec<bool> = vec![false; method.vregs.len()];
+    loop {
+        let mut nb: Vec<Option<bool>> = vec![None; method.vregs.len()];
+        for blk in &method.blocks {
+            for op in &blk.code {
+                let free = match op {
+                    Ir::ConstSmi { .. } | Ir::SmiArith { .. } => true,
+                    Ir::SmiCmpVal { .. } | Ir::FCmpVal { .. } => bools_free,
+                    Ir::ConstPool { lit, .. } => pool_free(lit.0 as usize),
+                    Ir::Move { src, .. } => no_barrier[src.0 as usize],
+                    _ => false,
+                };
+                op.defs(|v| {
+                    let e = &mut nb[v.0 as usize];
+                    *e = Some(e.unwrap_or(true) && free);
+                });
+            }
         }
+        let nb_now: Vec<bool> = nb.iter().map(|o| o.unwrap_or(false)).collect();
+        if nb_now == no_barrier {
+            break;
+        }
+        no_barrier = nb_now;
     }
-    let no_barrier: Vec<bool> = nb.iter().map(|o| o.unwrap_or(false)).collect();
 
     // F2-lite: single-def `ConstSmi` vregs rematerialize at reads. Multi-def
     // vregs (loop-carried temps) are excluded — their slot is the truth.
@@ -2688,6 +2704,68 @@ mod tests {
         // word index 3 == byte 24 from the untagged base.
         assert_eq!(obj[3], smi(77));
         let _ = &mut obj;
+    }
+
+    /// F6b (dart124_compiler_lessons item 8): a barrier-free value stays
+    /// barrier-free through the `Move`s a merge introduces. Same store, two
+    /// value provenances: a `Param` value must keep the card sequence (its
+    /// youngness is unknowable), a `Move`-of-`ConstSmi` value must elide it
+    /// — the barrier's `shr` (card-index shift) is the tell in the listing.
+    #[test]
+    fn no_barrier_propagates_through_move() {
+        let make = |via_move: bool| {
+            let mut code = vec![
+                Ir::Param {
+                    dst: VReg(0),
+                    index: 0,
+                },
+                Ir::Param {
+                    dst: VReg(1),
+                    index: 1,
+                },
+            ];
+            if via_move {
+                code.push(Ir::ConstSmi {
+                    dst: VReg(2),
+                    value: 7,
+                });
+                code.push(Ir::Move {
+                    dst: VReg(3),
+                    src: VReg(2),
+                });
+            }
+            code.push(Ir::StoreField {
+                obj: VReg(0),
+                byte_off: 24,
+                val: if via_move { VReg(3) } else { VReg(1) },
+                barrier: true,
+            });
+            code.push(Ir::Ret { val: VReg(0) });
+            hand_method(
+                vec![block(0, code)],
+                oops(if via_move { 4 } else { 2 }),
+                2,
+            )
+        };
+
+        let listing = |m: &IrMethod| {
+            let ra = regalloc(m);
+            emit_x64(m, &ra, RuntimeAddrs::default(), None, None, None)
+                .blob
+                .listing
+                .join("\n")
+        };
+
+        let kept = listing(&make(false));
+        let elided = listing(&make(true));
+        assert!(
+            kept.contains("shr"),
+            "a Param-valued store must keep the card barrier -- got:\n{kept}"
+        );
+        assert!(
+            !elided.contains("shr"),
+            "a Move-of-ConstSmi value must elide the barrier (F6b) -- got:\n{elided}"
+        );
     }
 
     /// The generational write barrier, executed against a stand-in VM

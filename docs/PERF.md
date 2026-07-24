@@ -773,3 +773,29 @@ remains the flappy outlier (~1.2-1.4x behind, pure call-chain — the F3c /
 frameless-x64 territory). The 07-22 session's "~1.15x richards residual"
 is now inverted. Frameless emission (Mac F0-F3) stays arm64-only; its x64
 port is the top remaining lever for fib and the named follow-up.
+
+## 2026-07-24 — F6b: no-barrier propagation through Move (dart124 lessons item 8)
+
+The Dart-1.24.3 extraction's cheapest item, audited first: F6 already
+elides smi/old-const stores and the runtime barrier's three early-outs
+bound what's left, so the remaining compile-time gap was values LAUNDERED
+through `Move`s — merge shapes (richards' `destination:`) whose arms are
+inlined constants. The no-barrier pass is now a monotone fixpoint with
+`Move` propagating its source's verdict; a listing test pins both sides
+(a Param-valued store keeps the card `shr`, Move-of-ConstSmi elides it).
+
+Same-session pinned pair (threshold=20): richards 28 → 27 warm, all other
+benches flat. Honest reading: noise-adjacent — the elided sequence was
+already early-outing at runtime; taken because it is free, principled,
+and richards has inverted on a millisecond before.
+
+Gates: 735 lib tests; world differential off vs t=200 byte-identical
+(5860 run, 0 failed) plain and under GC_STRESS=1 / GC_STRESS=full:64 /
+DEOPT_STRESS=64; clippy clean on changed lines. **Measurement note for
+the record: stress differentials must run the RELEASE binary — the debug
+build under GC_STRESS=1 did not finish one pair in 40 minutes; release
+runs each pair in ~3 s.**
+
+Remaining item-8 slice (deferred, documented): fresh-`Alloc` receiver
+elision for constructor init runs — fold into the F3c slow-path
+restructuring, which touches the same Poll/alloc-slow sites.
