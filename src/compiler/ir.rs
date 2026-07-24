@@ -1799,8 +1799,17 @@ impl<'a> Translator<'a> {
             if !push_ok || n0 >= len {
                 return false;
             }
-            let (i1, n1) = decode_at(m, n0);
-            matches!(i1, Instr::ReturnTos) && n1 >= len
+            let (i1, _n1) = decode_at(m, n0);
+            // No `_n1 >= len` tail check (the original had one, and it made
+            // this arm DEAD — the MACVM port's 9cb272e finding 1): our
+            // frontend appends a dead implicit `ReturnSelf` after every
+            // method body, so the canonical `^false` is PushFalse;
+            // ReturnTos; ReturnSelf(dead) — `n1 >= len` was false for every
+            // method this frontend compiles, `canonical` never passed, and
+            // every `not` site silently stayed a generic CallSend. Anything
+            // after an unconditional ReturnTos is unreachable, so the
+            // leading pair fully determines the method's behavior.
+            matches!(i1, Instr::ReturnTos)
         };
         canonical(self.vm.universe.true_klass, false) && canonical(self.vm.universe.false_klass, true)
     }

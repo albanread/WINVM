@@ -135,6 +135,15 @@ pub(crate) fn successors(block: &IrBlock) -> Vec<BlockId> {
             | Ir::ArrayAt { fail, .. }
             | Ir::ArrayAtPut { fail, .. }
             | Ir::FUnbox { fail, .. }
+            // 9cb272e finding 2 (the MACVM port's verification pass): this
+            // group never learned `BoolNot`'s non-boolean trap edge. Benign
+            // only by accident — `reverse_postorder` seeds a DFS from every
+            // unvisited block, so the "unreachable" trap block still got laid
+            // out, just at the tail. But this function is the compiler's
+            // single source of CFG truth, and an edge it lies about is a trap
+            // for the next analysis that trusts it (F7's entry scan already
+            // does).
+            | Ir::BoolNot { fail, .. }
             | Ir::VecArith { fail, .. } => succs.push(*fail),
             Ir::GuardKlass { fail, .. } => succs.push(*fail),
             // S11 D7: `Alloc` is self-contained (fast path + internal slow
