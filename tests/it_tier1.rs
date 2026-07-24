@@ -6745,6 +6745,125 @@ fn poly_same_target_inlines_membership_guard() {
     }
 }
 
+/// dart124 items 2+3 slice 3: same-target CFG splice — the authentic
+/// richards predicate shape (`or:` + `not` + `and:` — multi-block, carries
+/// a real Send) grafted behind the membership guard. Warm-up is ORGANIC:
+/// interpreted probes accrue the PIC count tail through the row-7 path,
+/// then the compile must pick `leg=cfg`. Four seen siblings exercise both
+/// branch arms of the predicate through the graft; the unseen fifth takes
+/// the rejoining slow send; every result must match the interpreter.
+#[test]
+fn poly_same_target_cfg_splices_multiblock_predicate() {
+    let mut vm = test_vm();
+    let smi_klass = vm.universe.smi_klass;
+    load_source(
+        &mut vm,
+        "Object subclass: P3Base [\n\
+        \x20   | pending waiting holding |\n\
+        \x20   setP: p w: w h: h [ pending := p. waiting := w. holding := h ]\n\
+        \x20   busy [ ^holding or: [ pending not and: [ waiting ] ] ]\n\
+        ]\n\
+        P3Base subclass: P3A []\n\
+        P3Base subclass: P3B []\n\
+        P3Base subclass: P3C []\n\
+        P3Base subclass: P3D []\n\
+        P3Base subclass: P3E []\n\
+        Object subclass: P3Probe [\n\
+        \x20   probe: x [ ^x busy ]\n\
+        ]\n",
+    );
+    // The fixture world has bare True/False klasses — install the CANONICAL
+    // not flips (the graft's not→BoolNot fusion verifies against exactly
+    // these bodies).
+    let not_sel = vm.universe.intern(b"not");
+    let mut nb = BytecodeBuilder::new();
+    nb.push_false();
+    nb.ret_tos();
+    let true_not = nb.finish(&mut vm, not_sel, 0, 0);
+    let true_klass = vm.universe.true_klass;
+    install_method(&mut vm, true_klass, not_sel, true_not);
+    let mut nb = BytecodeBuilder::new();
+    nb.push_true();
+    nb.ret_tos();
+    let false_not = nb.finish(&mut vm, not_sel, 0, 0);
+    let false_klass = vm.universe.false_klass;
+    install_method(&mut vm, false_klass, not_sel, false_not);
+
+    let mut subs: Vec<KlassOop> = Vec::new();
+    for n in ["P3A", "P3B", "P3C", "P3D", "P3E"] {
+        subs.push(klass_named(&mut vm, n));
+    }
+    let base_klass = klass_named(&mut vm, "P3Base");
+    let probe_klass = klass_named(&mut vm, "P3Probe");
+    let probe_m = method_named(&mut vm, probe_klass, "probe:");
+    let set_m = method_named(&mut vm, base_klass, "setP:w:h:");
+
+    let t = vm.universe.true_obj;
+    let f = vm.universe.false_obj;
+    // (pending, waiting, holding) -> busy = holding or (not pending and waiting)
+    let cfgs: [(Oop, Oop, Oop, Oop); 4] = [
+        (f, f, t, t), // holding wins the first arm
+        (f, t, f, t), // second arm: not pending and waiting
+        (t, t, f, f), // pending kills the second arm
+        (f, f, f, f), // nothing set
+    ];
+    let probe_recv = alloc::alloc_slots(&mut vm, probe_klass).oop();
+
+    // Organic ROUND-ROBIN warm-up (richards' own access pattern): the first
+    // round forms the poly IC (mono → upgrade → appends, each seeding its
+    // arm's first hit), the following rounds accrue row-7 bumps — 6 rounds
+    // x 4 siblings lands the total well past the 16-sample evidence floor,
+    // flat by klass.
+    let mut recvs: Vec<(Oop, Oop)> = Vec::new();
+    for (i, &(p, w, h, expect)) in cfgs.iter().enumerate() {
+        let recv = alloc::alloc_slots(&mut vm, subs[i]).oop();
+        macvm::interpreter::run_method(&mut vm, set_m, recv, &[p, w, h]);
+        recvs.push((recv, expect));
+    }
+    for _ in 0..6 {
+        for &(recv, expect) in recvs.iter() {
+            let got = macvm::interpreter::run_method(&mut vm, probe_m, probe_recv, &[recv]);
+            assert_eq!(got.raw(), expect.raw(), "interpreted predicate");
+        }
+    }
+    // The unseen fifth sibling: never probed before the compile.
+    let recv_e = alloc::alloc_slots(&mut vm, subs[4]).oop();
+    macvm::interpreter::run_method(&mut vm, set_m, recv_e, &[f, t, f]);
+
+    let id = driver::compile_method(&mut vm, probe_klass, probe_m).expect("must compile");
+    {
+        let nm = vm.code_table.get(id).expect("installed");
+        assert!(
+            nm.inline_deps.len() >= 4,
+            "at least one (klass, selector) dep per seen sibling (inner \
+             fusions may add true/false deps): got {}",
+            nm.inline_deps.len()
+        );
+    }
+
+    let call: CallStubFn = unsafe { std::mem::transmute(vm.stubs.call_stub_entry()) };
+    for &(recv, expect) in recvs.iter() {
+        let nm = vm.code_table.get(id).expect("installed");
+        let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+        let vm_ptr: *mut VmState = &mut vm;
+        let result = unsafe { call(entry, vm_ptr, [probe_recv.raw(), recv.raw()].as_ptr(), 2) };
+        assert_eq!(
+            result,
+            expect.raw(),
+            "grafted predicate fast path must match the interpreter"
+        );
+    }
+    let nm = vm.code_table.get(id).expect("installed");
+    let entry = unsafe { nm.code.base.add(nm.entry_off as usize) } as u64;
+    let vm_ptr: *mut VmState = &mut vm;
+    let result = unsafe { call(entry, vm_ptr, [probe_recv.raw(), recv_e.raw()].as_ptr(), 2) };
+    assert_eq!(
+        result,
+        t.raw(),
+        "unseen sibling must take the rejoining slow send and still agree"
+    );
+}
+
 /// Step-9 soak-gate regression (THE materializer ordering bug): an inlined
 /// callee's in-body trap deopts with the CALLER's frozen operand stack
 /// non-empty — `lo + (self next ...)` freezes `[lo]` across the spliced

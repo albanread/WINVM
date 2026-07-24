@@ -358,6 +358,13 @@ pub fn ic_transition(
                 pairs.at_put(1, m0.oop());
                 pairs.at_put(2, rcvr_klass_h.get(vm).oop());
                 pairs.at_put(3, m.oop());
+                // Count seeding: the triggering dispatch IS arm 1's first hit.
+                // Arm 0's mono-era history was never counted — it starts 0
+                // and earns its evidence from row-7 hits like everyone else.
+                pairs.at_put(
+                    2 * IC_POLY_MAX_PAIRS + 1,
+                    SmallInt::new(1).oop(),
+                );
                 ic.set_poly(vm, pairs, epoch);
                 Some(m)
             }
@@ -403,6 +410,11 @@ pub fn ic_transition(
                     if (arity as usize) < IC_POLY_MAX_PAIRS {
                         pairs.at_put(2 * arity as usize, rcvr_klass.oop());
                         pairs.at_put(2 * arity as usize + 1, m.oop());
+                        // The appending dispatch IS the new arm's first hit.
+                        pairs.at_put(
+                            2 * IC_POLY_MAX_PAIRS + arity as usize,
+                            SmallInt::new(1).oop(),
+                        );
                         // `pairs` itself may be old, the new pair young.
                         crate::memory::store::post_write_barrier(vm, pairs.as_mem());
                         ic.set_poly(vm, pairs, epoch); // row 9

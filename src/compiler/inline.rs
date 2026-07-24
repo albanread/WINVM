@@ -389,12 +389,18 @@ pub fn decide_with_budget(
                     .iter()
                     .all(|c| c.method.oop().raw() == dedup.method.oop().raw());
             let no_smi_case = cases.iter().all(|c| c.klass.oop().raw() != smi_klass_bits);
+            // Eligibility ladder mirrors the Mono `Inline` arm: a send-free
+            // leaf takes the cheap splice, and a body WITH sends (richards'
+            // predicates carry a `not`) qualifies via the CFG walker — its
+            // inner sends compile from the callee's own warm ICs, exactly as
+            // every production super-send/B5 graft already does. Slice-3
+            // lowering picks the leg (`leaf` vs `cfg`).
             if same_target
                 && no_smi_case
                 && total >= DOMINANT_MIN_SAMPLES
                 && dedup.method.primitive() == 0
                 && inline_cost(dedup.method) <= budget.per_call_cost
-                && is_leaf(dedup.method)
+                && (is_leaf(dedup.method) || is_inline_eligible_cfg(dedup.method))
             {
                 return InlineDecision::SameTargetPoly {
                     klasses: cases.iter().map(|c| c.klass).collect(),

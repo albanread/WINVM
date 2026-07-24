@@ -880,3 +880,36 @@ Known residue, next lever (slice 3): the TaskState PREDICATES
 splicer, not just the leaf splicer. richards' remaining gap to the
 measured 4.6 ms/×10 ceiling (dart 1.24.3, RESULTS.md in dart_origins) is
 that plus F3c.
+
+## 2026-07-24 — same-target CFG graft: the predicates splice, richards 22 → 21 (dart124 items 2+3, slice 3)
+
+The slice-2 residue, closed: `SameTargetPoly`'s decision gate widened from
+`is_leaf` to `is_leaf || is_inline_eligible_cfg` (the Mono `Inline` arm's
+own ladder), and the lowering gained a CFG leg — `GuardKlassIn` fronts a
+guard-free `try_inline_cfg` graft; the graft's own continuation block is
+claimed as a stub that moves the graft result into the shared `dst` and
+jumps to OUR rejoin, so the fast (graft) and slow (real send) paths both
+enter it with `dst` written. `MACVM_TRACE=sametarget` on richards now
+reads `#isTaskHoldingOrWaiting arms=4 leg=cfg blocks=8` — the fused
+or:/and:/not predicate grafts whole, its inner `not` fusing to `BoolNot`
+against the callee's own warm ICs.
+
+The e2e test's ORGANIC warm-up (round-robin interpreted probes, richards'
+own access pattern) exposed a counting gap: the mono→poly upgrade and the
+poly-append dispatches never counted themselves, and mono-era hits are
+invisible — a sequential warm-up left the site at 12 samples, under the
+16 floor. Rows 6 and 9 now seed the triggering arm's count at 1 (that
+dispatch IS a hit); mono-era history stays honestly uncounted.
+
+richards 21/22/21 (slice-2 same-session baseline 22/22/24); others flat.
+**Day cumulative: richards 28 → 21 (−25%), vs Cog's 32-34 → ~1.55×
+AHEAD.** Gates: 742 lib; it_tier1 poly suite ×5 green including the new
+multi-block-predicate e2e (source-compiled or:/not/and: body, both branch
+arms exercised through the graft, unseen fifth sibling through the
+rejoining send, organic PIC counts); world differential off vs t=200
+byte-identical plain + GC_STRESS=1 + full:64 + DEOPT_STRESS=64 (release).
+
+Remaining richards decomposition: F3c (spill-all across safepoints — the
+slow-path SaveLiveRegisters blueprint, lessons item 1) is now the
+dominant residual on the road to the measured 4.6 ms/×10 cross-VM
+ceiling.
