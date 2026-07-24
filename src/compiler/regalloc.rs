@@ -261,6 +261,7 @@ pub fn compute_intervals(
     std::collections::HashMap<u32, u32>,
     Vec<(VReg, u32)>,
     Vec<u32>,
+    Vec<u32>,
 ) {
     let block_order = reverse_postorder(method);
 
@@ -314,6 +315,16 @@ pub fn compute_intervals(
     // in the method, and widening them is sound.
     let mut deopt_live_exact: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
     let mut deopt_live_widen: Vec<(u32, u32)> = Vec::new(); // (vreg, safepoint pos)
+    // F3c S1 (f3c_design.md): polls stop pinning organically-spanning
+    // intervals — their registers are saved by the poll's own slow path.
+    // Three new fact streams, all folded below: every `Ir::Poll` position;
+    // every CALL-SHAPED (non-poll) safepoint position (the set that still
+    // pins); and each ROOT LoopPoll deopt reference (vreg, poll pos) — the
+    // organic-span rule decides per pair whether membership pinning stays.
+    let mut poll_positions: Vec<u32> = Vec::new();
+    let mut pinning_positions: Vec<u32> = Vec::new();
+    let mut pin_exact: Vec<u32> = Vec::new();
+    let mut poll_deopt: Vec<(u32, u32)> = Vec::new();
     let n_slots = method.argc as u32 + method.ntemps as u32;
 
     for &bid in &block_order {
@@ -322,6 +333,11 @@ pub fn compute_intervals(
         for (idx, ir) in block.code.iter().enumerate() {
             if is_safepoint(ir) {
                 safepoint_positions.push(pos);
+                if matches!(ir, Ir::Poll) {
+                    poll_positions.push(pos);
+                } else {
+                    pinning_positions.push(pos);
+                }
             }
             if matches!(ir, Ir::CallSend { .. } | Ir::CallRuntime { .. }) {
                 call_positions.push(pos);
@@ -360,8 +376,23 @@ pub fn compute_intervals(
                 // path-insensitivity that made interval-widening UNSOUND
                 // (root cause 1/3's lesson) is made harmless by the fill,
                 // NOT by pretending liveness is linear.
+                // F3c S1: a ROOT LoopPoll's references route to the
+                // organic-span decision (`poll_deopt`, folded below) instead
+                // of unconditional membership pinning; traps and INLINED
+                // LoopPolls (a poll inside a spliced loop body — its widen
+                // arm below pins every rebuilt-frame entity) pin exactly as
+                // before. `deopt_live_exact` keeps EVERY reference either
+                // way — it feeds `extra_oop_live`'s oopmap bits, not the
+                // pin decision.
+                let is_root_poll =
+                    matches!(raw.kind, SafepointKind::LoopPoll) && raw.inline.is_none();
                 let mut record = |v: u32| {
                     deopt_live_exact.push((v, pos));
+                    if is_root_poll {
+                        poll_deopt.push((v, pos));
+                    } else {
+                        pin_exact.push(v);
+                    }
                     for &sp in &safepoint_positions {
                         if sp < pos {
                             deopt_live_exact.push((v, sp));
@@ -398,8 +429,12 @@ pub fn compute_intervals(
                 // Same task-#94 earlier-safepoint coverage as the plain-trap
                 // arm above — an inlined site's rebuilt frames read the very
                 // same slots, exposed to the very same mid-callee GC.
+                // (F3c S1: inlined-site references always PIN — depth-2
+                // rebuild entities are exactly the "dead in compiled code"
+                // class the organic-span rule refuses to exempt.)
                 let mut record = |v: u32| {
                     deopt_live_exact.push((v, pos));
+                    pin_exact.push(v);
                     for &sp in &safepoint_positions {
                         if sp < pos {
                             deopt_live_exact.push((v, sp));
@@ -662,14 +697,66 @@ pub fn compute_intervals(
         max_use.entry(v).or_insert(0);
     }
 
+    // F3c S1 (f3c_design.md, the organic-span rule): the pin membership for
+    // register-eligible methods — trap/inlined exact refs, ctx widen refs,
+    // and every poll ref whose ORGANIC interval does NOT span its poll
+    // (nothing to save there: the register may be legally reused before the
+    // poll, so the slot is the only sound home). Computed AFTER the
+    // deopt-referenced [0,0] defaults above, so a vreg referenced ONLY by
+    // deopt metadata spans nothing and correctly stays pinned.
+    let pinned_membership: std::collections::HashSet<u32> = pin_exact
+        .iter()
+        .copied()
+        .chain(deopt_live_widen.iter().map(|&(v, _)| v))
+        .collect();
+    let poll_pin: std::collections::HashSet<u32> = poll_deopt
+        .iter()
+        .filter(|&&(v, p)| {
+            let s = *min_def.get(&v).unwrap_or(&0);
+            let e = *max_use.get(&v).unwrap_or(&s);
+            !(s <= p && e > p)
+        })
+        .map(|&(v, _)| v)
+        .collect();
+    // Full pin (today's rule, unchanged) for OSR compiles — the OSR entry
+    // seeds SLOTS and must not meet slot-less loop-carried vregs (S4's
+    // job) — and for FP intervals (S4 polish; not oops, but their deopt
+    // plumbing wants the slot).
+    let full_pin_method = method.is_osr;
+
+    // `MACVM_TRACE=pollsave`: why does a polled method still pin? One line
+    // per method-with-polls naming each fact stream's size — the S1
+    // residue diagnosis channel.
+    if !poll_positions.is_empty()
+        && std::env::var("MACVM_TRACE").is_ok_and(|t| t.split(',').any(|c| c == "pollsave"))
+    {
+        eprintln!(
+            "[pollsave] osr={} polls={} pinning_positions={} pin_exact={} poll_deopt={} widen={}",
+            method.is_osr,
+            poll_positions.len(),
+            pinning_positions.len(),
+            pin_exact.len(),
+            poll_deopt.len(),
+            deopt_live_widen.len(),
+        );
+    }
+
     let intervals = (0..method.vregs.len() as u32)
         .filter_map(|vid| {
             let start = *min_def.get(&vid)?;
             let end = *max_use.get(&vid).unwrap_or(&start);
-            let crosses_safepoint = deopt_referenced.contains(&vid)
-                || safepoint_positions
-                    .iter()
-                    .any(|&sp| start <= sp && end > sp);
+            let crosses_safepoint = if full_pin_method || method.vregs[vid as usize].is_fp {
+                deopt_referenced.contains(&vid)
+                    || safepoint_positions
+                        .iter()
+                        .any(|&sp| start <= sp && end > sp)
+            } else {
+                pinned_membership.contains(&vid)
+                    || poll_pin.contains(&vid)
+                    || pinning_positions
+                        .iter()
+                        .any(|&sp| start <= sp && end > sp)
+            };
             let crosses_call = call_positions.iter().any(|&cp| start <= cp && end > cp);
             Some(LiveInterval {
                 vreg: VReg(vid),
@@ -692,6 +779,7 @@ pub fn compute_intervals(
         block_start_pos,
         extra_oop_live,
         call_positions,
+        poll_positions,
     )
 }
 
@@ -802,6 +890,62 @@ const RESIDENCY_CANDIDATES: &[u8] = &[12, 13, 14];
 /// the size of the `reg_used` marking array. Register NUMBERS index it, so
 /// it is emphatically not `ALLOCATABLE_REGS.len()` (on x86-64 the pool has
 /// 7 entries but numbers run up to 9).
+/// F3c S1 (f3c_design.md): one live-register save at one poll. `reg`'s value
+/// (holding `vreg`) is stored to `save_slot` — the frame's save area, one
+/// fixed slot per allocatable GPR appended after the ordinary spill area —
+/// by the poll's SLOW path only, and the poll's OopMap sets that slot's bit
+/// when `is_oop`. The `LoopPoll` deopt scope resolves `vreg` to the same
+/// slot, so GC root updates land where the restore (and the materializer)
+/// read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollSave {
+    pub vreg: VReg,
+    pub reg: u8,
+    pub save_slot: SpillSlot,
+    pub is_oop: bool,
+}
+
+fn allocatable_index(r: u8) -> u16 {
+    ALLOCATABLE_REGS
+        .iter()
+        .position(|&x| x == r)
+        .expect("PollSave register must come from the allocatable pool") as u16
+}
+
+/// F3c S1 twin of [`verify_spill_all`], same release-mode rationale: every
+/// non-FP register interval organically spanning a poll must be covered by
+/// that poll's save record — an uncovered one would be invisible to the
+/// poll's OopMap and the LoopPoll materializer, which is exactly the
+/// silent-heap-corruption class the design doc names.
+pub fn verify_poll_saves(
+    intervals: &[LiveInterval],
+    poll_positions: &[u32],
+    poll_saves: &[(u32, Vec<PollSave>)],
+) {
+    for &p in poll_positions {
+        let empty: &[PollSave] = &[];
+        let saves = poll_saves
+            .iter()
+            .find(|(pos, _)| *pos == p)
+            .map(|(_, s)| s.as_slice())
+            .unwrap_or(empty);
+        for iv in intervals {
+            if let Some(Assignment::Reg(r)) = iv.assignment {
+                if !iv.is_fp && iv.start <= p && iv.end > p {
+                    assert!(
+                        saves.iter().any(|s| s.vreg == iv.vreg && s.reg == r),
+                        "regalloc: {:?} holds reg {} across poll @{} without a save \
+                         record (F3c S1 invariant)",
+                        iv.vreg,
+                        r,
+                        p
+                    );
+                }
+            }
+        }
+    }
+}
+
 const MAX_REG_NUM: usize = 16;
 
 /// D3.5's policy, in order: (1) every `crosses_safepoint` interval spills
@@ -1174,6 +1318,14 @@ pub struct RegallocResult {
     /// makes `extra_oop_live`'s earlier-safepoint facts sound without
     /// path-sensitive liveness. Sorted, deduplicated.
     pub deopt_nil_init_slots: Vec<SpillSlot>,
+    /// F3c S1: per-poll live-register save records, sorted by position (the
+    /// same linear numbering as `safepoint_positions`). Empty for OSR
+    /// compiles and poll-free/loop-free methods.
+    pub poll_saves: Vec<(u32, Vec<PollSave>)>,
+    /// Slots the frame reserves AFTER the spill area for poll saves —
+    /// `ALLOCATABLE_REGS.len()` when any poll saves registers, else 0.
+    /// Total frame slots = `frame_slots + save_area_slots`.
+    pub save_area_slots: u16,
 }
 
 pub fn regalloc(method: &IrMethod) -> RegallocResult {
@@ -1184,6 +1336,7 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         block_start_pos,
         extra_oop_live,
         call_positions,
+        poll_positions,
     ) = compute_intervals(method);
     // S24 A1 (design Risk 1): PIN the block compilation's closure vreg live
     // for the whole method — the root deopt scope's receiver ValueLoc names
@@ -1351,6 +1504,59 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
     };
     deopt_nil_init_slots.sort_by_key(|s| s.0);
     deopt_nil_init_slots.dedup();
+
+    // F3c S1: per-poll save records for intervals that KEPT registers
+    // across a poll (the pin exemption above). One fixed save slot per
+    // allocatable GPR, appended after the spill area; poll-free methods
+    // (and OSR compiles, which still full-pin) reserve nothing.
+    let mut poll_saves: Vec<(u32, Vec<PollSave>)> = Vec::new();
+    if !method.is_osr {
+        for &p in &poll_positions {
+            let saves: Vec<PollSave> = intervals
+                .iter()
+                .filter_map(|iv| match iv.assignment {
+                    Some(Assignment::Reg(r)) if !iv.is_fp && iv.start <= p && iv.end > p => {
+                        Some(PollSave {
+                            vreg: iv.vreg,
+                            reg: r,
+                            save_slot: SpillSlot(frame_slots + allocatable_index(r)),
+                            is_oop: iv.is_oop,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !saves.is_empty() {
+                poll_saves.push((p, saves));
+            }
+        }
+    }
+    let save_area_slots: u16 = if poll_saves.is_empty() {
+        0
+    } else {
+        ALLOCATABLE_REGS.len() as u16
+    };
+    verify_poll_saves(&intervals, &poll_positions, &poll_saves);
+    if !poll_positions.is_empty()
+        && std::env::var("MACVM_TRACE").is_ok_and(|t| t.split(',').any(|c| c == "pollsave"))
+    {
+        for &p in &poll_positions {
+            let saved = poll_saves
+                .iter()
+                .find(|(pos, _)| *pos == p)
+                .map_or(0, |(_, s)| s.len());
+            let spanning_spilled = intervals
+                .iter()
+                .filter(|iv| {
+                    iv.start <= p
+                        && iv.end > p
+                        && matches!(iv.assignment, Some(Assignment::Spill(_)))
+                })
+                .count();
+            eprintln!("[pollsave] poll@{p}: saved_regs={saved} spanning_spilled={spanning_spilled}");
+        }
+    }
+
     RegallocResult {
         block_order,
         intervals,
@@ -1360,6 +1566,8 @@ pub fn regalloc(method: &IrMethod) -> RegallocResult {
         block_start_pos,
         extra_oop_live,
         deopt_nil_init_slots,
+        poll_saves,
+        save_area_slots,
     }
 }
 
@@ -1432,7 +1640,7 @@ mod tests {
             vec![VRegInfo { is_oop: true, is_fp: false }, VRegInfo { is_oop: true, is_fp: false }],
         );
 
-        let (_order, intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
+        let (_order, intervals, _safepoints, _bsp, _extra, _calls, _polls) = compute_intervals(&method);
         let iv = intervals
             .iter()
             .find(|iv| iv.vreg == v0)
@@ -1466,7 +1674,7 @@ mod tests {
         };
         let method = hand_method(vec![block0, block1], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
-        let (order, intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra, _calls, _polls) = compute_intervals(&method);
         assert_eq!(
             order,
             vec![BlockId(0), BlockId(1)],
@@ -1475,6 +1683,149 @@ mod tests {
         assert_eq!(intervals.len(), 1, "one vreg -> one interval, never two");
         assert_eq!(intervals[0].start, 0);
         assert_eq!(intervals[0].end, 3);
+    }
+
+    /// F3c S1: an interval whose ONLY safepoint crossing is a `Poll` keeps
+    /// its register, and the poll's save record covers it (save slot =
+    /// frame_slots + allocatable index). The OSR variant of the same method
+    /// full-pins exactly as before, with no save area at all.
+    #[test]
+    fn poll_crossing_keeps_register_with_save_record() {
+        let v0 = VReg(0);
+        let mk = |osr: bool| {
+            let block = IrBlock {
+                id: BlockId(0),
+                bci: 0,
+                code: vec![
+                    Ir::ConstPool {
+                        dst: v0,
+                        lit: PoolLit(0),
+                    },
+                    Ir::Poll,
+                    Ir::Ret { val: v0 },
+                ],
+                entry_stack: Vec::new(),
+                deopt_sites: Vec::new(),
+            };
+            let mut m = hand_method(
+                vec![block],
+                vec![VRegInfo {
+                    is_oop: true,
+                    is_fp: false,
+                }],
+            );
+            m.is_osr = osr;
+            m
+        };
+
+        let ra = regalloc(&mk(false));
+        let iv = ra.intervals.iter().find(|iv| iv.vreg == v0).unwrap();
+        let Some(Assignment::Reg(r)) = iv.assignment else {
+            panic!(
+                "poll-only crossing must keep a register (F3c S1), got {:?}",
+                iv.assignment
+            );
+        };
+        assert_eq!(ra.save_area_slots as usize, ALLOCATABLE_REGS.len());
+        let (_, saves) = ra
+            .poll_saves
+            .first()
+            .expect("the poll must carry a save record");
+        let s = saves.iter().find(|s| s.vreg == v0).expect("v0 covered");
+        assert_eq!(s.reg, r);
+        assert!(s.is_oop);
+        assert_eq!(s.save_slot.0, ra.frame_slots + allocatable_index(r));
+
+        let ra_osr = regalloc(&mk(true));
+        let iv = ra_osr.intervals.iter().find(|iv| iv.vreg == v0).unwrap();
+        assert!(
+            matches!(iv.assignment, Some(Assignment::Spill(_))),
+            "an OSR compile keeps the full pin (S4's job), got {:?}",
+            iv.assignment
+        );
+        assert!(ra_osr.poll_saves.is_empty());
+        assert_eq!(ra_osr.save_area_slots, 0);
+    }
+
+    /// F3c S1, the organic-span rule: a vreg the poll's DEOPT references but
+    /// whose organic interval does NOT span the poll stays slot-pinned (its
+    /// register could be legally reused before the poll — nothing to save),
+    /// while an organically-spanning sibling keeps its register with a
+    /// covering save record.
+    #[test]
+    fn poll_deopt_nonspanning_vreg_stays_pinned() {
+        use crate::compiler::ir::DeoptRaw;
+        use crate::compiler::scopes::SafepointKind;
+        let v0 = VReg(0);
+        let v1 = VReg(1);
+        let block = IrBlock {
+            id: BlockId(0),
+            bci: 0,
+            code: vec![
+                Ir::ConstPool {
+                    dst: v0,
+                    lit: PoolLit(0),
+                }, // pos 0
+                Ir::ConstPool {
+                    dst: v1,
+                    lit: PoolLit(0),
+                }, // pos 1
+                Ir::Move {
+                    dst: VReg(2),
+                    src: v0,
+                }, // pos 2: v0's LAST organic use — before the poll
+                Ir::Poll, // pos 3: the deopt references v0 anyway
+                Ir::Ret { val: v1 }, // pos 4: v1 organically spans the poll
+            ],
+            entry_stack: Vec::new(),
+            deopt_sites: vec![(
+                3,
+                DeoptRaw {
+                    stack: vec![v0],
+                    bci: 7,
+                    kind: SafepointKind::LoopPoll,
+                    reexecute: true,
+                    stack_closures: Vec::new(),
+                    inline: None,
+                },
+            )],
+        };
+        let method = hand_method(
+            vec![block],
+            vec![
+                VRegInfo {
+                    is_oop: true,
+                    is_fp: false,
+                },
+                VRegInfo {
+                    is_oop: true,
+                    is_fp: false,
+                },
+                VRegInfo {
+                    is_oop: true,
+                    is_fp: false,
+                },
+            ],
+        );
+        let ra = regalloc(&method);
+        let iv0 = ra.intervals.iter().find(|iv| iv.vreg == v0).unwrap();
+        assert!(
+            matches!(iv0.assignment, Some(Assignment::Spill(_))),
+            "non-spanning poll-deopt vreg must stay pinned, got {:?}",
+            iv0.assignment
+        );
+        let iv1 = ra.intervals.iter().find(|iv| iv.vreg == v1).unwrap();
+        let Some(Assignment::Reg(r1)) = iv1.assignment else {
+            panic!(
+                "organically-spanning vreg must keep its register, got {:?}",
+                iv1.assignment
+            );
+        };
+        let (_, saves) = ra.poll_saves.first().expect("save record present");
+        assert!(
+            saves.iter().any(|s| s.vreg == v1 && s.reg == r1),
+            "v1's register must be covered by the poll's save record"
+        );
     }
 
     /// THE S12 invariant, enforced early: every oop interval live across a
@@ -1502,7 +1853,7 @@ mod tests {
         };
         let method = hand_method(vec![block], vec![VRegInfo { is_oop: true, is_fp: false }]);
 
-        let (_order, mut intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
+        let (_order, mut intervals, _safepoints, _bsp, _extra, _calls, _polls) = compute_intervals(&method);
         assert!(
             intervals[0].crosses_safepoint,
             "v0 is defined before and used after the call"
@@ -1758,7 +2109,7 @@ mod tests {
             deopt_sites: Vec::new(),
         };
         let method = hand_method(vec![block0, dead], Vec::new());
-        let (order, _intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
+        let (order, _intervals, _safepoints, _bsp, _extra, _calls, _polls) = compute_intervals(&method);
         assert_eq!(
             order.len(),
             2,
@@ -1890,7 +2241,7 @@ mod tests {
             vec![entry, header, body, exit, bailout],
             (0..6).map(|_| VRegInfo { is_oop: true, is_fp: false }).collect(),
         );
-        let (order, intervals, _safepoints, _bsp, _extra, _calls) = compute_intervals(&method);
+        let (order, intervals, _safepoints, _bsp, _extra, _calls, _polls) = compute_intervals(&method);
 
         // Confirms this hand-built shape actually reproduces the bug's own
         // precondition: the exit block linearized before the body block.

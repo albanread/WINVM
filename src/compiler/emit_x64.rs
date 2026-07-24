@@ -297,6 +297,11 @@ struct Emitter<'a> {
     /// store of such a value can never create an old→young edge, so
     /// `StoreField`/`ArrayAtPut` skip the 11-instruction barrier entirely.
     no_barrier: Vec<bool>,
+    /// F3c S1: per-poll live-register save records (regalloc's
+    /// `poll_saves`, keyed by the shared linear position `pos`). The
+    /// `Ir::Poll` slow path stores/restores exactly these around
+    /// `stub_poll`; empty for OSR compiles and poll-free methods.
+    poll_saves: Vec<(u32, Vec<crate::compiler::regalloc::PollSave>)>,
     /// F2-lite: single-def `ConstSmi` vregs and their tagged word — a
     /// spilled read rematerializes the immediate instead of reloading the
     /// slot (the slot still holds the value for deopt/OSR metadata).
@@ -975,6 +980,7 @@ pub fn emit_x64(
         resident,
         resident_reloads,
         no_barrier,
+        poll_saves: regalloc.poll_saves.clone(),
         const_smi_remat,
         labels,
         literal_ids,
@@ -1023,7 +1029,9 @@ pub fn emit_x64(
     // 16-rounded, so RSP stays 16-aligned AT every call instruction with
     // no per-site adjustment — the property Win64 requires.
     let frame_bytes = {
-        let raw = 8 * regalloc.frame_slots as i64;
+        // F3c S1: spills + the poll-save area (one slot per allocatable
+        // GPR when any poll saves registers, else zero).
+        let raw = 8 * (regalloc.frame_slots + regalloc.save_area_slots) as i64;
         ((raw + 15) & !15) + OUTGOING_ARG_BYTES
     };
     e.asm.emit("sub", &[r64(RSP), imm(frame_bytes)]);
@@ -1923,6 +1931,23 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             );
             e.asm.emit("test", &[r32(RAX), r32(RAX)]);
             e.asm.jcc(Cond::E, skip);
+            // F3c S1: SAVE the live registers into the frame's save area
+            // BEFORE the only GC/deopt-capable instruction on this path.
+            // The poll's OopMap describes these slots, the LoopPoll scope
+            // resolves register-resident vregs to them, and the restore
+            // below reads back whatever the root walk rewrote. The dormant
+            // fast path (`jz skip`) never executes any of this — that is
+            // the entire F3c win.
+            let saves: Vec<crate::compiler::regalloc::PollSave> = e
+                .poll_saves
+                .iter()
+                .find(|(p, _)| *p == e.pos)
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            for s in &saves {
+                e.asm
+                    .emit("mov", &[mem(RBP, spill_offset(s.save_slot)), r64(s.reg)]);
+            }
             let lit = e.stub_poll_lit;
             // The poll is a deopt safepoint keyed on the RETURN address.
             //
@@ -1933,6 +1958,13 @@ fn emit_op(e: &mut Emitter, op: &Ir) {
             // merge; the safepoint belongs to the call.
             let ret_pc = e.emit_runtime_call(lit);
             e.record_safepoint_at(ret_pc);
+            // F3c S1: restore the saved registers — the GC's root walk may
+            // have rewritten the save slots (moved oops), so this reload IS
+            // the re-sync for register-resident values.
+            for s in &saves {
+                e.asm
+                    .emit("mov", &[r64(s.reg), mem(RBP, spill_offset(s.save_slot))]);
+            }
             // The slow call may have GC'd — re-sync residents before the
             // fast path merges back in.
             e.emit_resident_reloads();
@@ -2471,6 +2503,7 @@ mod tests {
                 resident: Vec::new(),
                 resident_reloads: Vec::new(),
                 no_barrier: Vec::new(),
+                poll_saves: Vec::new(),
                 const_smi_remat: Vec::new(),
                 labels: Vec::new(),
                 literal_ids: Vec::new(),
@@ -4041,6 +4074,7 @@ mod tests {
             resident: vec![None; 1],
             resident_reloads: Vec::new(),
             no_barrier: vec![false; 1],
+            poll_saves: Vec::new(),
             const_smi_remat: vec![None; 1],
             labels: vec![Label(0)],
             literal_ids: Vec::new(),

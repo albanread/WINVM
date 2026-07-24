@@ -15,7 +15,7 @@
 
 use crate::codecache::nmethod::Nmethod;
 use crate::compiler::ir::VReg;
-use crate::compiler::regalloc::{Assignment, LiveInterval};
+use crate::compiler::regalloc::{Assignment, LiveInterval, PollSave};
 
 // ── vreg → ValueLoc resolution (step 3b) ──────────────────────────────────
 
@@ -63,12 +63,36 @@ use crate::compiler::regalloc::{Assignment, LiveInterval};
 /// instead of the real addition, which cascaded into DNU handling deeply
 /// enough to overflow the native stack. `extra_oop_live` must be checked
 /// EVERYWHERE `build_for_position`'s own interval check is, not just there.
+/// F3c S1 wrapper: contexts where a poll save can never apply — OSR-map
+/// building (OSR compiles full-pin, `regalloc`'s `is_osr` gate) and the
+/// spill-resolution goldens. Real deopt-scope building goes through
+/// [`resolve_frame_loc_in`] with the compile's `poll_saves`, or a
+/// register-resident vreg at a LoopPoll would silently resolve `Nil`.
 pub fn resolve_frame_loc(
     vreg: VReg,
     pos: u32,
     intervals: &[LiveInterval],
     extra_oop_live: &[(VReg, u32)],
 ) -> ValueLoc {
+    resolve_frame_loc_in(vreg, pos, intervals, extra_oop_live, &[])
+}
+
+pub fn resolve_frame_loc_in(
+    vreg: VReg,
+    pos: u32,
+    intervals: &[LiveInterval],
+    extra_oop_live: &[(VReg, u32)],
+    poll_saves: &[(u32, Vec<PollSave>)],
+) -> ValueLoc {
+    // F3c S1: a register-resident vreg at a POLL resolves to its SAVE slot —
+    // the poll's slow path stored it there before `stub_poll` (the only
+    // deopt-capable instruction on the path) runs, and GC root updates land
+    // in the same slot, so slot semantics are identical to a spill's.
+    if let Some((_, saves)) = poll_saves.iter().find(|(p, _)| *p == pos) {
+        if let Some(s) = saves.iter().find(|s| s.vreg == vreg) {
+            return ValueLoc::FrameSlot(-8 * (s.save_slot.0 as i32 + 1));
+        }
+    }
     for iv in intervals {
         if iv.vreg == vreg
             && (iv.start <= pos && iv.end > pos

@@ -158,3 +158,39 @@ poll deopts under DEOPT_STRESS and materializes the interpreter frame
 from SAVE slots with the exact pre-deopt values" — the direct heir of
 the OSR uninit-slot and materializer-ordering bugs this machinery's
 history is made of.
+
+## S1 landing findings (2026-07-24, post-implementation)
+
+S1 landed fully gated — 744 lib tests (two new tripwires: register-kept-
+with-covering-save-record + OSR negative; the organic-span rule), world
+differential byte-identical plain + GC_STRESS=1 + full:64 + **DEOPT_
+STRESS=64** (the flagship: forced poll-deopts materializing from save
+slots across 5860 tests) — and the benches are FLAT, with the cause
+diagnosed by the new `MACVM_TRACE=pollsave` channel on arith:
+
+```
+[pollsave] osr=true polls=1 pinning_positions=3 pin_exact=27 poll_deopt=7 widen=0
+[pollsave] poll@23: saved_regs=0 spanning_spilled=5
+```
+
+Two blockers, both structural and both now named:
+
+1. **Hot loop methods only ever compile as OSR.** Trigger unification
+   (S24 L2) saturates the invocation counter on by_key install, so every
+   later CALL enters the OSR-earned nmethod — a second, non-OSR compile
+   never happens. S1's `!is_osr` gate therefore excludes exactly the only
+   compile that exists for the loops it targets. The fix is S4 (OSR
+   envelope): the OSR entry already has the resident-reload pattern
+   (`emit_resident_reloads_at(header)`) — register-exempt vregs need the
+   same "seed slot, then load register at entry" treatment.
+2. **Smi-overflow fail edges pin the loop slots anyway** (`pin_exact=27`
+   on a 5-instruction loop): every `SmiArith` trap site records
+   receiver+slots+stack, and trap references are membership-pinned
+   regardless of organic span. S1b: extend the save-record mechanism to
+   UncommonTrap sites — the trap's cold block saves spanning registers to
+   the same save slots before the `brk`, and the trap materializer reads
+   them exactly as the LoopPoll one now does. Same soundness argument,
+   same slots, one more record producer.
+
+Sequencing update: S1b before S2 (alloc slow paths) — the trap pins
+dominate every smi loop. S4 remains the unlock for the whole family.

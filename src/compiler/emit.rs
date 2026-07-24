@@ -341,6 +341,11 @@ struct Emitter<'a> {
     /// GC'd, moving the oops the resident registers point at; the canonical
     /// slots were updated by the GC's frame walk).
     resident_reloads: Vec<(u32, u32, u8, crate::compiler::regalloc::SpillSlot, bool /*is_fp*/)>,
+    /// F3c S1: per-poll live-register save records (regalloc `poll_saves`,
+    /// keyed by the shared linear position). `emit_poll`'s slow path
+    /// stores/restores exactly these around `bl stub_poll`; empty for OSR
+    /// compiles and poll-free methods.
+    poll_saves: Vec<(u32, Vec<crate::compiler::regalloc::PollSave>)>,
 }
 
 impl<'a> Emitter<'a> {
@@ -1381,6 +1386,21 @@ impl<'a> Emitter<'a> {
             ],
         );
         self.asm.cbz(xr(16), skip);
+        // F3c S1: SAVE the live registers into the frame's save area BEFORE
+        // the only GC/deopt-capable instruction on this path — the poll's
+        // OopMap describes these slots, the LoopPoll scope resolves
+        // register-resident vregs to them, and the restore below reads back
+        // whatever the root walk rewrote. The dormant fast path (`cbz`)
+        // never executes any of this — that is the entire F3c win.
+        let saves: Vec<crate::compiler::regalloc::PollSave> = self
+            .poll_saves
+            .iter()
+            .find(|(p, _)| *p == self.pos)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        for s in &saves {
+            emit_spill_access(self.asm, "str", x(s.reg), s.save_slot);
+        }
         self.asm.call_far(self.stub_poll_lit);
         // S13 step 10b: the poll is a deopt SAFEPOINT. Record its `SafepointPc`
         // at the `bl stub_poll` RETURN address — the offset right AFTER the
@@ -1398,6 +1418,12 @@ impl<'a> Emitter<'a> {
             bci: self.current_bci,
             position: self.pos,
         });
+        // F3c S1: restore the saved registers — the GC's root walk may have
+        // rewritten the save slots (moved oops), so this reload IS the
+        // re-sync for register-resident values.
+        for s in &saves {
+            emit_spill_access(self.asm, "ldr", x(s.reg), s.save_slot);
+        }
         // S14 perf recovery: `rt_poll` may have GC'd (moving the oops the
         // resident registers point at) — re-sync residents from their
         // canonical slots ON THE SLOW PATH ONLY. The `cbz` fast path jumps
@@ -1821,10 +1847,14 @@ pub fn emit(
                 _ => None,
             })
             .collect(),
+        poll_saves: regalloc.poll_saves.clone(),
     };
 
     // Prologue (D5.2): frame_bytes = 8*frame_slots, rounded to 16.
-    let frame_bytes = ((8 * regalloc.frame_slots as i64) + 15) & !15;
+    // F3c S1: + the poll-save area (one slot per allocatable GPR when any
+    // poll saves registers, else zero).
+    let frame_bytes =
+        ((8 * (regalloc.frame_slots + regalloc.save_area_slots) as i64) + 15) & !15;
     e.asm.emit(
         "stp",
         &[x(29), x(30), crate::compiler::assembler::mem_pre(31, -16)],

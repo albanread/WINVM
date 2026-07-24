@@ -1353,9 +1353,11 @@ fn compile_method_full(
     for sp in &safepoint_pcs {
         let map = oopmap::build_for_position(
             &regalloc_result.intervals,
-            regalloc_result.frame_slots,
+            // F3c S1: the TOTAL slot universe — spills + the poll-save area.
+            regalloc_result.frame_slots + regalloc_result.save_area_slots,
             sp.position,
             &regalloc_result.extra_oop_live,
+            &regalloc_result.poll_saves,
         );
         let idx = oopmap::intern(&mut oopmaps, map);
         safepoint_pcdescs.push(PcDesc {
@@ -1453,8 +1455,18 @@ fn compile_method_full(
         ),
         literal_off: blob.literal_off,
         relocs: blob.relocs,
-        frame_slots: regalloc_result.frame_slots,
-        slot_is_oop: regalloc_result.slot_is_oop.clone(),
+        // F3c S1: publish the TOTAL frame (spills + poll-save area). Save
+        // slots have NO static oop-ness (the same register holds different
+        // vregs at different polls), so they publish conservatively `true`
+        // — `oopmap::verify`'s slot_is_oop cross-check stays meaningful for
+        // the spill region, and the save region's per-poll truth is
+        // enforced at build time by `regalloc::verify_poll_saves`.
+        frame_slots: regalloc_result.frame_slots + regalloc_result.save_area_slots,
+        slot_is_oop: {
+            let mut v = regalloc_result.slot_is_oop.clone();
+            v.extend(std::iter::repeat(true).take(regalloc_result.save_area_slots as usize));
+            v
+        },
         pcdescs,
         oopmaps,
         ic_sites,
@@ -1618,6 +1630,19 @@ fn build_deopt_metadata(
     let intervals = &regalloc_result.intervals;
     let extra_oop_live = &regalloc_result.extra_oop_live;
     let n_slots = ir_method.argc as usize + ir_method.ntemps as usize;
+    // F3c S1: every scope resolution in THIS function must see the poll-save
+    // records (a register-resident vreg at a LoopPoll resolves to its save
+    // slot). The local closure shadows the imported 4-arg resolver so all
+    // sites below switch atomically — a new site added later cannot forget.
+    let poll_saves = &regalloc_result.poll_saves;
+    let resolve_frame_loc = |vreg: ir::VReg,
+                             position: u32,
+                             intervals: &[regalloc::LiveInterval],
+                             extra: &[(ir::VReg, u32)]| {
+        crate::compiler::scopes::resolve_frame_loc_in(
+            vreg, position, intervals, extra, poll_saves,
+        )
+    };
     let mut rec = ScopeDescRecorder::new();
     let mut pos = 0u32;
     for &bid in &regalloc_result.block_order {
