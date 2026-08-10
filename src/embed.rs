@@ -136,17 +136,18 @@ pub fn current_ui_vm_generation() -> u64 {
 }
 
 thread_local! {
-    /// True while a C6 delegate callback ([`VmHandle::dispatch_callback`]) is
-    /// running on THIS thread. See [`callback_active`].
-    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+    /// How many delegate/wndproc callbacks ([`VmHandle::dispatch_callback`])
+    /// are running on THIS thread — a DEPTH, not a flag, because Win32 nests
+    /// (G0/V1). See [`callback_active`].
+    static CALLBACK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Is a C6 delegate callback currently executing on this thread? (CG3 review.)
+/// Is a delegate callback currently executing on this thread? (CG3 review.)
 ///
-/// A delegate callback is a **top-level** VM entry, sound precisely because the
-/// UI worker is quiescent when AppKit calls back. A *nested* callback — an
-/// AppKit modal / menu-tracking / live-resize run loop pumped from INSIDE a
-/// handler (which CG5+ introduces) — would re-borrow the same `&mut VmState`,
+/// On **macOS/Cocoa** a delegate callback is a **top-level** VM entry, sound
+/// precisely because the UI worker is quiescent when AppKit calls back. A
+/// *nested* callback — an AppKit modal / menu-tracking / live-resize run loop
+/// pumped from INSIDE a handler — would re-borrow the same `&mut VmState`,
 /// clobber the single per-thread `sigsetjmp` recovery slot, and overwrite the
 /// one idle-baseline watermark, so a later fault would `siglongjmp` into a
 /// returned frame and rewind to the wrong baseline. The delegate dispatch
@@ -154,23 +155,38 @@ thread_local! {
 /// callback is already active, fails **closed** (returns the shape default —
 /// the same safe answer a stale/unknown delegate gets) instead. No such nesting
 /// path exists in CG3, but failing closed keeps the door sound in advance.
+///
+/// On **Windows** nesting is the normal case, not a hazard to refuse: a handler
+/// calls `CreateWindowExW`/`SendMessageW`, which drives the wndproc, which
+/// re-enters the image, to arbitrary depth (G0/V1). Each of the three
+/// single-valued things above is a LIFO stack there — a fresh recovery slot per
+/// entry ([`deopt_trap::push_entry_frame`]), a stack of idle baselines, and
+/// this counter — so `dispatch_callback` admits the nested entry instead of
+/// failing closed. The predicate keeps its name and meaning (`depth > 0`) for
+/// existing callers either way.
 pub fn callback_active() -> bool {
-    IN_CALLBACK.with(Cell::get)
+    CALLBACK_DEPTH.with(Cell::get) > 0
 }
 
-/// Set/clear the [`callback_active`] flag. Private: only [`VmHandle::
-/// dispatch_callback`] owns the flag's lifecycle, and it must clear it on EVERY
-/// exit arm — including the `siglongjmp` recovery arms, which skip `Drop`, so an
-/// RAII guard cannot be used here.
-fn set_callback_active(v: bool) {
-    IN_CALLBACK.with(|c| c.set(v));
+/// Enter/leave a callback, maintaining [`callback_active`]'s depth. Private:
+/// only [`VmHandle::dispatch_callback`] owns the counter's lifecycle, and it
+/// must decrement on EVERY exit arm — including the `siglongjmp` recovery arms,
+/// which skip `Drop`, so an RAII guard cannot be used here. A recovery arm
+/// decrements (never zeroes): the arm belongs to the INNERMOST entry, and any
+/// outer entries are still live below it on the native stack.
+fn enter_callback() {
+    CALLBACK_DEPTH.with(|c| c.set(c.get() + 1));
+}
+
+fn leave_callback() {
+    CALLBACK_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
 }
 
 /// Test-only hook to drive [`callback_active`] without a real nested callback,
 /// so the trampoline's fail-closed guard is unit-testable off the main thread.
 #[cfg(test)]
 pub(crate) fn set_callback_active_for_test(v: bool) {
-    set_callback_active(v);
+    CALLBACK_DEPTH.with(|c| c.set(u32::from(v)));
 }
 
 /// A running, embedded VM instance — owns its `VmState` (and, through it,
@@ -187,7 +203,16 @@ pub struct VmHandle {
     /// bloats the stack toward overflow and pins dead objects as GC roots) —
     /// the "recover into some other state, worse than useless" failure. See
     /// [`VmHandle::restore_after_guest_fatal`].
-    idle_baseline: IdleBaseline,
+    ///
+    /// A **stack**, in lockstep with `deopt_trap`'s recovery-slot stack (G0/V1):
+    /// a Win32 handler that calls `CreateWindowExW` re-enters the image from
+    /// inside its own doit, and that nested entry's watermark must not overwrite
+    /// the outer one — the outer doit's frames are still live below it, and
+    /// rewinding to the *inner* baseline would tear them down. Each entry pushes
+    /// on the way in and pops on the way out (recovery arms included); recovery
+    /// always restores the top, i.e. the innermost live entry. One element deep
+    /// on macOS, where entries never nest.
+    idle_baselines: Vec<IdleBaseline>,
     /// What to do when guest code raises an unhandled error — see
     /// [`ErrorPolicy`]. Default [`ErrorPolicy::Resume`].
     error_policy: ErrorPolicy,
@@ -489,7 +514,7 @@ impl VmHandle {
         }
         Ok(VmHandle {
             vm,
-            idle_baseline: IdleBaseline::default(),
+            idle_baselines: Vec::new(),
             error_policy: ErrorPolicy::default(),
         })
     }
@@ -508,7 +533,7 @@ impl VmHandle {
         deopt_trap::arm_foreign_fault_handler();
         VmHandle {
             vm: VmState::with_options(opts),
-            idle_baseline: IdleBaseline::default(),
+            idle_baselines: Vec::new(),
             error_policy: ErrorPolicy::default(),
         }
     }
@@ -517,15 +542,29 @@ impl VmHandle {
     /// initial (`rc == 0`) pass of every `sigsetjmp`-guarded entry, before any
     /// guest code runs. Its partner [`restore_after_guest_fatal`] rewinds to it
     /// if the doit aborts. Stored in `self` (not a `sigsetjmp`-frame local), so
-    /// it survives the `siglongjmp` that clobbers such locals.
+    /// it survives the `siglongjmp` that clobbers such locals; PUSHED, so a
+    /// nested entry (G0/V1) captures its own watermark without destroying the
+    /// outer entry's — see the [`idle_baselines`](Self::idle_baselines) doc.
     #[inline]
-    fn snapshot_idle_baseline(&mut self) {
-        self.idle_baseline = IdleBaseline {
+    fn push_idle_baseline(&mut self) {
+        self.idle_baselines.push(IdleBaseline {
             stack_sp: self.vm.stack.sp,
             stack_fp: self.vm.stack.fp,
             stack_has_frame: self.vm.stack.has_frame(),
             arena_len: self.vm.handle_arena.len(),
-        };
+        });
+    }
+
+    /// Leave an entry: drop its idle baseline and release its recovery slot,
+    /// restoring both LIFO tops to the enclosing entry's. Every exit arm of
+    /// every `sigsetjmp`-guarded entry point calls this exactly once — normal
+    /// return, guest-fatal, and native-fault alike. It must run AFTER
+    /// `take_last_guest_fatal_message`/`take_last_crash_info`, which read the
+    /// faulting entry's own slot (still the top until this pops it).
+    #[inline]
+    fn pop_entry(&mut self) {
+        self.idle_baselines.pop();
+        deopt_trap::pop_entry_frame();
     }
 
     /// Set this VM's [`ErrorPolicy`] — how it responds when guest code raises
@@ -593,7 +632,11 @@ impl VmHandle {
     /// return to its ready state rather than limp on in "some other state."
     #[inline]
     fn restore_after_guest_fatal(&mut self) {
-        let b = self.idle_baseline;
+        // The TOP baseline — the innermost live entry's (G0/V1). Never empty on
+        // a recovery arm (the arm's own entry pushed it before any guest code
+        // could fault), but a recovery path is the wrong place to panic, so an
+        // impossible-empty stack rewinds to the pristine boot watermark instead.
+        let b = self.idle_baselines.last().copied().unwrap_or_default();
         self.vm
             .stack
             .restore_baseline(b.stack_sp, b.stack_fp, b.stack_has_frame);
@@ -653,7 +696,7 @@ impl VmHandle {
     /// transcript sink first.
     #[allow(unsafe_code)]
     pub fn eval(&mut self, source: &str) -> Result<String, GuestError> {
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: `sigsetjmp` is called directly, inline, at this exact call
         // site — its frame (this `eval` invocation) stays live for the whole
         // recovery window: control does not return to the caller until
@@ -673,27 +716,40 @@ impl VmHandle {
             // Apply this VM's error policy: Resume rewinds to the clean idle
             // baseline and returns the error; Die terminates the worker (the
             // message is already on the transcript). See `handle_guest_fatal`.
-            return Err(self.handle_guest_fatal(message));
+            // The rewind reads this entry's baseline, so it runs BEFORE the pop.
+            let err = self.handle_guest_fatal(message);
+            self.pop_entry();
+            return Err(err);
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(self.handle_native_fault(sig, pc, far));
+            let err = self.handle_native_fault(sig, pc, far);
+            self.pop_entry();
+            return Err(err);
         }
 
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        let item = match frontend::parser::parse_one_top_item(source) {
-            Ok(Some(item)) => item,
-            Ok(None) => return Ok(String::new()),
-            Err(e) => return Err(GuestError::Compile(e)),
+        self.push_idle_baseline();
+        // The body runs in a labeled block so every way out — including the
+        // early exits below — funnels through the single `pop_entry` that
+        // balances this entry's baseline and recovery slot (G0/V1). A `?`/
+        // `return` past it would strand the frame as the LIFO recovery target.
+        let out = 'body: {
+            let item = match frontend::parser::parse_one_top_item(source) {
+                Ok(Some(item)) => item,
+                Ok(None) => break 'body Ok(String::new()),
+                Err(e) => break 'body Err(GuestError::Compile(e)),
+            };
+            match frontend::classdef::execute_top_item(&mut self.vm, item) {
+                Ok(Some(result)) => Ok(print_result(&mut self.vm, result)),
+                Ok(None) => Ok(String::new()),
+                Err(e) => Err(GuestError::Compile(e)),
+            }
         };
-        match frontend::classdef::execute_top_item(&mut self.vm, item) {
-            Ok(Some(result)) => Ok(print_result(&mut self.vm, result)),
-            Ok(None) => Ok(String::new()),
-            Err(e) => Err(GuestError::Compile(e)),
-        }
+        self.pop_entry();
+        out
     }
 
     /// Like [`eval`](Self::eval) but runs `source` purely for effect and does
@@ -706,7 +762,7 @@ impl VmHandle {
     /// discards the value.
     #[allow(unsafe_code)]
     pub fn exec(&mut self, source: &str) -> Result<(), GuestError> {
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose
         // frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
@@ -721,23 +777,33 @@ impl VmHandle {
             // Apply this VM's error policy: Resume rewinds to the clean idle
             // baseline and returns the error; Die terminates the worker (the
             // message is already on the transcript). See `handle_guest_fatal`.
-            return Err(self.handle_guest_fatal(message));
+            let err = self.handle_guest_fatal(message);
+            self.pop_entry();
+            return Err(err);
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(self.handle_native_fault(sig, pc, far));
+            let err = self.handle_native_fault(sig, pc, far);
+            self.pop_entry();
+            return Err(err);
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        let item = match frontend::parser::parse_one_top_item(source) {
-            Ok(Some(item)) => item,
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(GuestError::Compile(e)),
+        self.push_idle_baseline();
+        // Single-exit body — see `eval`'s note on the labeled block.
+        let out = 'body: {
+            let item = match frontend::parser::parse_one_top_item(source) {
+                Ok(Some(item)) => item,
+                Ok(None) => break 'body Ok(()),
+                Err(e) => break 'body Err(GuestError::Compile(e)),
+            };
+            frontend::classdef::execute_top_item(&mut self.vm, item)
+                .map(|_| ())
+                .map_err(GuestError::Compile)
         };
-        frontend::classdef::execute_top_item(&mut self.vm, item).map_err(GuestError::Compile)?;
-        Ok(())
+        self.pop_entry();
+        out
     }
 
     /// The C6 reverse-dispatch callback door (`cocoa_gui_design.md` §4, §5
@@ -767,20 +833,30 @@ impl VmHandle {
         body: impl FnOnce(&mut VmState) -> u64,
     ) -> u64 {
         use std::io::Write as _;
-        // Re-entrancy guard (CG3 review): a delegate callback is a TOP-LEVEL
-        // entry, sound only because the VM is quiescent. If one is already active
-        // on this thread — a nested AppKit callback pumped from a modal/tracking
-        // run loop inside a handler (CG5+) — fail CLOSED with the shape default
-        // rather than clobber the shared `sigsetjmp` slot + idle baseline (a
-        // later fault would `siglongjmp` into a returned frame) and alias
+        // Re-entrancy guard (CG3 review), macOS only: there, a delegate callback
+        // is a TOP-LEVEL entry, sound only because the VM is quiescent. If one is
+        // already active on this thread — a nested AppKit callback pumped from a
+        // modal/tracking run loop inside a handler — fail CLOSED with the shape
+        // default rather than clobber the shared `sigsetjmp` slot + idle baseline
+        // (a later fault would `siglongjmp` into a returned frame) and alias
         // `&mut VmState`. The delegate trampoline (`objc_delegate::dispatch`)
         // also checks this BEFORE re-borrowing the `VmHandle`, so the aliasing
         // `&mut` is avoided at source; this is the second line of defense for a
-        // direct caller and the one that owns the flag's lifecycle.
+        // direct caller and the one that owns the counter's lifecycle.
+        //
+        // On **Windows the guard is deliberately absent** (G0/V1): Win32 sends
+        // are synchronous, so a handler that calls `CreateWindowExW`/
+        // `SendMessageW` re-enters the image from inside its own doit, and
+        // refusing that entry would answer a default to a message the image must
+        // actually handle. What made nesting unsound is what this sprint
+        // replaced: the recovery slot, the idle baseline, and the depth are each
+        // a LIFO stack now, so a nested entry recovers to ITSELF and leaves the
+        // outer entry's frame intact.
+        #[cfg(not(windows))]
         if callback_active() {
             return default;
         }
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: as `eval` — `sigsetjmp` inline at this exact call site, whose
         // frame (this `dispatch_callback` invocation) stays live for the whole
         // recovery window; `body` runs deeper on the stack and any fault
@@ -790,12 +866,14 @@ impl VmHandle {
             // A delegate handler raised (`error:`/DNU). The error was already
             // written to the transcript before the unwind; rewind to the clean
             // idle baseline (never `Die` — the run loop must keep pumping) and
-            // answer the shape default. Clear the guard: the unwind skipped the
-            // normal-return clear below, and the run loop must be able to
-            // dispatch the NEXT callback.
+            // answer the shape default. Decrement the depth: the unwind skipped
+            // the normal-return decrement below, and the pump must be able to
+            // dispatch the NEXT callback. Decrement, not zero — an outer entry
+            // may still be live below this one (G0/V1).
             let _ = deopt_trap::take_last_guest_fatal_message();
             self.restore_after_guest_fatal();
-            set_callback_active(false);
+            leave_callback();
+            self.pop_entry();
             return default;
         }
         if rc != 0 {
@@ -805,7 +883,8 @@ impl VmHandle {
             // unlike a guest `error:`, so name it here.)
             let info = deopt_trap::take_last_crash_info();
             self.restore_after_guest_fatal();
-            set_callback_active(false);
+            leave_callback();
+            self.pop_entry();
             if let Some((sig, pc, far)) = info {
                 let _ = writeln!(
                     self.vm.out,
@@ -816,14 +895,15 @@ impl VmHandle {
         }
         // Capture the clean watermark before any guest code runs, so a fatal
         // abort rewinds to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        // Mark the callback active across `body` ONLY (after the `sigsetjmp`
-        // landing arms, so a fault unwinds through the arms above which clear
-        // it). Cleared explicitly on the normal-return path — an RAII guard
+        self.push_idle_baseline();
+        // Count the callback across `body` ONLY (after the `sigsetjmp` landing
+        // arms, so a fault unwinds through the arms above, which decrement).
+        // Decremented explicitly on the normal-return path — an RAII guard
         // can't be used, since a `siglongjmp` skips `Drop`.
-        set_callback_active(true);
+        enter_callback();
         let out = body(&mut self.vm);
-        set_callback_active(false);
+        leave_callback();
+        self.pop_entry();
         out
     }
 
@@ -853,7 +933,7 @@ impl VmHandle {
     #[allow(unsafe_code)]
     pub fn render_fragment(&mut self, code: &str) -> Result<String, GuestError> {
         let source = format!("(Visual coerce: ([{code}] value)) htmlFragment.");
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: as `eval` — `sigsetjmp` inline at this call site, whose frame
         // stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
@@ -864,33 +944,43 @@ impl VmHandle {
             // Apply this VM's error policy: Resume rewinds to the clean idle
             // baseline and returns the error; Die terminates the worker (the
             // message is already on the transcript). See `handle_guest_fatal`.
-            return Err(self.handle_guest_fatal(message));
+            // The rewind reads this entry's baseline, so it runs BEFORE the pop.
+            let err = self.handle_guest_fatal(message);
+            self.pop_entry();
+            return Err(err);
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(self.handle_native_fault(sig, pc, far));
+            let err = self.handle_native_fault(sig, pc, far);
+            self.pop_entry();
+            return Err(err);
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        let item = match frontend::parser::parse_one_top_item(&source) {
-            Ok(Some(item)) => item,
-            Ok(None) => return Ok(String::new()),
-            Err(e) => return Err(GuestError::Compile(e)),
+        self.push_idle_baseline();
+        // Single-exit body — see `eval`'s note on the labeled block.
+        let out = 'body: {
+            let item = match frontend::parser::parse_one_top_item(&source) {
+                Ok(Some(item)) => item,
+                Ok(None) => break 'body Ok(String::new()),
+                Err(e) => break 'body Err(GuestError::Compile(e)),
+            };
+            match frontend::classdef::execute_top_item(&mut self.vm, item) {
+                Ok(Some(result)) => match fragment_bytes(result) {
+                    Some(html) => Ok(html),
+                    // The fragment method answered a non-String — treat as a
+                    // render failure so the caller falls back to the placeholder.
+                    None => Err(GuestError::RuntimeError(
+                        "smappl visual did not render to a String".to_string(),
+                    )),
+                },
+                Ok(None) => Ok(String::new()),
+                Err(e) => Err(GuestError::Compile(e)),
+            }
         };
-        match frontend::classdef::execute_top_item(&mut self.vm, item) {
-            Ok(Some(result)) => match fragment_bytes(result) {
-                Some(html) => Ok(html),
-                // The fragment method answered a non-String — treat as a
-                // render failure so the caller falls back to the placeholder.
-                None => Err(GuestError::RuntimeError(
-                    "smappl visual did not render to a String".to_string(),
-                )),
-            },
-            Ok(None) => Ok(String::new()),
-            Err(e) => Err(GuestError::Compile(e)),
-        }
+        self.pop_entry();
+        out
     }
 
     /// Fires a live widget's stored action closure (`SmapplRegistry fire:
@@ -911,7 +1001,7 @@ impl VmHandle {
         // text, so it needs no quoting — but guard the assumption cheaply.
         debug_assert!(action_id.bytes().all(|b| b.is_ascii_alphanumeric()));
         let source = format!("SmapplRegistry fire: '{action_id}'.");
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
@@ -922,28 +1012,39 @@ impl VmHandle {
             // Apply this VM's error policy: Resume rewinds to the clean idle
             // baseline and returns the error; Die terminates the worker (the
             // message is already on the transcript). See `handle_guest_fatal`.
-            return Err(self.handle_guest_fatal(message));
+            // The rewind reads this entry's baseline, so it runs BEFORE the pop.
+            let err = self.handle_guest_fatal(message);
+            self.pop_entry();
+            return Err(err);
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(self.handle_native_fault(sig, pc, far));
+            let err = self.handle_native_fault(sig, pc, far);
+            self.pop_entry();
+            return Err(err);
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        let item = match frontend::parser::parse_one_top_item(&source) {
-            Ok(Some(item)) => item,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(GuestError::Compile(e)),
+        self.push_idle_baseline();
+        // Single-exit body — see `eval`'s note on the labeled block.
+        let out = 'body: {
+            let item = match frontend::parser::parse_one_top_item(&source) {
+                Ok(Some(item)) => item,
+                Ok(None) => break 'body Ok(None),
+                Err(e) => break 'body Err(GuestError::Compile(e)),
+            };
+            match frontend::classdef::execute_top_item(&mut self.vm, item) {
+                // A String answer is the dialog overlay; anything else (self,
+                // nil) is a side-effect-only action, so there is nothing to
+                // inject.
+                Ok(Some(result)) => Ok(fragment_bytes(result)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(GuestError::Compile(e)),
+            }
         };
-        match frontend::classdef::execute_top_item(&mut self.vm, item) {
-            // A String answer is the dialog overlay; anything else (self, nil)
-            // is a side-effect-only action, so there is nothing to inject.
-            Ok(Some(result)) => Ok(fragment_bytes(result)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(GuestError::Compile(e)),
-        }
+        self.pop_entry();
+        out
     }
 
     /// Evaluates `code` (wrapped `[<code>] value`, so multi-statement bodies
@@ -956,7 +1057,7 @@ impl VmHandle {
     #[allow(unsafe_code)]
     pub fn eval_to_string(&mut self, code: &str) -> Result<String, GuestError> {
         let source = format!("([{code}] value).");
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
@@ -967,28 +1068,38 @@ impl VmHandle {
             // Apply this VM's error policy: Resume rewinds to the clean idle
             // baseline and returns the error; Die terminates the worker (the
             // message is already on the transcript). See `handle_guest_fatal`.
-            return Err(self.handle_guest_fatal(message));
+            // The rewind reads this entry's baseline, so it runs BEFORE the pop.
+            let err = self.handle_guest_fatal(message);
+            self.pop_entry();
+            return Err(err);
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(self.handle_native_fault(sig, pc, far));
+            let err = self.handle_native_fault(sig, pc, far);
+            self.pop_entry();
+            return Err(err);
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        let item = match frontend::parser::parse_one_top_item(&source) {
-            Ok(Some(item)) => item,
-            Ok(None) => return Ok(String::new()),
-            Err(e) => return Err(GuestError::Compile(e)),
+        self.push_idle_baseline();
+        // Single-exit body — see `eval`'s note on the labeled block.
+        let out = 'body: {
+            let item = match frontend::parser::parse_one_top_item(&source) {
+                Ok(Some(item)) => item,
+                Ok(None) => break 'body Ok(String::new()),
+                Err(e) => break 'body Err(GuestError::Compile(e)),
+            };
+            match frontend::classdef::execute_top_item(&mut self.vm, item) {
+                Ok(Some(result)) => fragment_bytes(result).ok_or_else(|| {
+                    GuestError::RuntimeError("expression did not answer a String".to_string())
+                }),
+                Ok(None) => Ok(String::new()),
+                Err(e) => Err(GuestError::Compile(e)),
+            }
         };
-        match frontend::classdef::execute_top_item(&mut self.vm, item) {
-            Ok(Some(result)) => fragment_bytes(result).ok_or_else(|| {
-                GuestError::RuntimeError("expression did not answer a String".to_string())
-            }),
-            Ok(None) => Ok(String::new()),
-            Err(e) => Err(GuestError::Compile(e)),
-        }
+        self.pop_entry();
+        out
     }
 
     /// Evaluates `code` (wrapped `[<code>] value`, like
@@ -1001,7 +1112,7 @@ impl VmHandle {
     #[allow(unsafe_code)]
     pub fn eval_to_bytes(&mut self, code: &str) -> Result<Vec<u8>, GuestError> {
         let source = format!("([{code}] value).");
-        let slot = deopt_trap::claim_jmp_slot();
+        let slot = deopt_trap::push_entry_frame();
         // SAFETY: as `render_fragment` — `sigsetjmp` inline at this call site,
         // whose frame stays live for the whole recovery window.
         let rc = unsafe { deopt_trap::sigsetjmp(deopt_trap::jmp_buf_ptr(slot), 1) };
@@ -1012,33 +1123,48 @@ impl VmHandle {
             // Apply this VM's error policy: Resume rewinds to the clean idle
             // baseline and returns the error; Die terminates the worker (the
             // message is already on the transcript). See `handle_guest_fatal`.
-            return Err(self.handle_guest_fatal(message));
+            // The rewind reads this entry's baseline, so it runs BEFORE the pop.
+            let err = self.handle_guest_fatal(message);
+            self.pop_entry();
+            return Err(err);
         }
         if rc != 0 {
             let (sig, pc, far) = deopt_trap::take_last_crash_info()
                 .expect("sigsetjmp returned nonzero without a recorded crash");
-            return Err(self.handle_native_fault(sig, pc, far));
+            let err = self.handle_native_fault(sig, pc, far);
+            self.pop_entry();
+            return Err(err);
         }
         // Capture the clean watermark before any guest code runs, so a
         // guest-fatal abort can rewind to exactly here (`restore_after_guest_fatal`).
-        self.snapshot_idle_baseline();
-        let item = match frontend::parser::parse_one_top_item(&source) {
-            Ok(Some(item)) => item,
-            Ok(None) => return Ok(Vec::new()),
-            Err(e) => return Err(GuestError::Compile(e)),
-        };
-        match frontend::classdef::execute_top_item(&mut self.vm, item) {
-            Ok(Some(result)) => {
-                let b = crate::oops::wrappers::ByteArrayOop::try_from(result).ok_or_else(|| {
-                    GuestError::RuntimeError("expression did not answer a ByteArray".to_string())
-                })?;
-                let mut bytes = Vec::new();
-                b.copy_bytes_out(&mut bytes);
-                Ok(bytes)
+        self.push_idle_baseline();
+        // Single-exit body — see `eval`'s note on the labeled block. (The `?`
+        // that used to sit in the `Ok(Some(_))` arm is now a `break`: an early
+        // `return` here would skip `pop_entry` and strand this frame as the
+        // thread's recovery target.)
+        let out = 'body: {
+            let item = match frontend::parser::parse_one_top_item(&source) {
+                Ok(Some(item)) => item,
+                Ok(None) => break 'body Ok(Vec::new()),
+                Err(e) => break 'body Err(GuestError::Compile(e)),
+            };
+            match frontend::classdef::execute_top_item(&mut self.vm, item) {
+                Ok(Some(result)) => match crate::oops::wrappers::ByteArrayOop::try_from(result) {
+                    Some(b) => {
+                        let mut bytes = Vec::new();
+                        b.copy_bytes_out(&mut bytes);
+                        Ok(bytes)
+                    }
+                    None => Err(GuestError::RuntimeError(
+                        "expression did not answer a ByteArray".to_string(),
+                    )),
+                },
+                Ok(None) => Ok(Vec::new()),
+                Err(e) => Err(GuestError::Compile(e)),
             }
-            Ok(None) => Ok(Vec::new()),
-            Err(e) => Err(GuestError::Compile(e)),
-        }
+        };
+        self.pop_entry();
+        out
     }
 
     /// Installs `sink` as where guest output (`Transcript show:`,
@@ -1319,6 +1445,196 @@ fn fragment_bytes(result: Oop) -> Option<String> {
     let mut bytes = Vec::new();
     b.copy_bytes_out(&mut bytes);
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+// ── G0/V1 gate: re-entrant embed entries ────────────────────────────────────
+//
+// `docs/dolphin/g0_reentrant_entries.md`, sprint G0 of `dolphin_ui_sprints.md`.
+// Nesting is Windows-only by construction (it exists to serve the synchronous
+// Win32 wndproc; macOS/Cocoa keeps its "always top-level" doctrine and its
+// fail-closed guard), and the integration suite below is macOS-only, so the
+// gate lives in its own module here.
+#[cfg(all(test, windows))]
+mod g0_nested_entries {
+    use super::*;
+    use crate::runtime::JitMode;
+    use std::cell::RefCell;
+
+    /// The shape default a `dispatch_callback` answers when it recovers — a
+    /// distinctive value so a level that failed closed or recovered can never
+    /// be mistaken for one that returned its own answer.
+    const RECOVERED: u64 = 0xB0BB;
+
+    fn boot_test_vm() -> VmHandle {
+        VmHandle::boot(
+            VmOptions {
+                heap_mib: 64,
+                jit: JitMode::Off,
+                ..Default::default()
+            },
+            Path::new("world"),
+        )
+        .expect("boot against the real world/ directory must succeed")
+    }
+
+    /// One level of the nest, and a Rust stand-in for the seam this whole
+    /// sprint exists for: a handler calls native code (`CreateWindowExW`),
+    /// which drives the wndproc, which re-enters the image — to arbitrary
+    /// depth. Each level runs a real doit through `eval` before recursing, so
+    /// the LIFO carries BOTH entry kinds interleaved.
+    ///
+    /// # Safety
+    /// The raw `*mut VmHandle` is the miniature of G0 change 3's re-entry
+    /// token: the outer entry's `&mut VmState` (the `_vm` this body ignores)
+    /// is quiescent for the whole nested window, exactly as the FFI stub's
+    /// "touches no VM state between publishing the token and the native call's
+    /// return" contract requires. The handle itself never moves — it is owned
+    /// by the test's own frame, which outlives every level.
+    #[allow(unsafe_code)]
+    fn nest(handle: *mut VmHandle, depth: u64, log: &RefCell<Vec<u64>>, base_slots: usize) -> u64 {
+        let h = unsafe { &mut *handle };
+        h.dispatch_callback(RECOVERED, |_vm| {
+            let h = unsafe { &mut *handle };
+            // The anti-clobber invariant, checked from INSIDE the nest: every
+            // live entry holds its own fresh recovery slot and its own idle
+            // baseline. Pre-G0 both were single-valued, so level 2 would have
+            // overwritten level 1's `sigjmp_buf` and watermark.
+            assert_eq!(
+                deopt_trap::current_thread_jmp_slots(),
+                base_slots + depth as usize,
+                "depth {depth}: each live entry must own a distinct recovery slot"
+            );
+            assert_eq!(
+                h.idle_baselines.len(),
+                depth as usize,
+                "depth {depth}: each live entry must own its idle baseline"
+            );
+            assert!(
+                callback_active(),
+                "depth {depth}: the depth counter is live"
+            );
+
+            // Real guest work: parses, allocates, and answers a value unique to
+            // this level — so a clobbered entry shows up as a wrong answer, not
+            // just as a bookkeeping mismatch.
+            let mine: u64 = h
+                .eval(&format!("{depth} * 100"))
+                .expect("a doit inside a nested entry must evaluate")
+                .trim()
+                .parse()
+                .expect("the doit answers a printString of a number");
+
+            let deeper = if depth < 5 {
+                nest(handle, depth + 1, log, base_slots)
+            } else {
+                0
+            };
+            log.borrow_mut().push(mine);
+            mine + deeper
+        })
+    }
+
+    /// The G0 step-2 gate: five nested embed entries, each allocating and
+    /// answering its own distinct value, all five landing. Pre-G0 this could
+    /// not get past level 1 — `dispatch_callback` refused nesting outright
+    /// (fail-closed) and every entry shared one `sigjmp_buf` and one watermark.
+    #[test]
+    fn nested_entry_depth_5() {
+        let mut vm = boot_test_vm();
+        // Warm the machinery once so `base_slots` measures a settled thread.
+        assert_eq!(vm.eval("3 + 4").expect("warm-up doit"), "7");
+
+        let base_slots = deopt_trap::current_thread_jmp_slots();
+        assert!(!callback_active(), "no callback in flight before the walk");
+        assert!(
+            vm.idle_baselines.is_empty(),
+            "a returned entry leaves no baseline behind"
+        );
+
+        let log = RefCell::new(Vec::new());
+        let handle: *mut VmHandle = &mut vm;
+        let total = nest(handle, 1, &log, base_slots);
+
+        // Every level ran and answered its own value — innermost first on the
+        // way out — and the sum proves none of them answered `RECOVERED`.
+        assert_eq!(*log.borrow(), vec![500, 400, 300, 200, 100]);
+        assert_eq!(
+            total, 1500,
+            "100+200+300+400+500 — every level's own answer"
+        );
+
+        // And the thread is exactly as the walk found it: slots released,
+        // baselines popped, depth back to zero, VM still healthy.
+        assert_eq!(
+            deopt_trap::current_thread_jmp_slots(),
+            base_slots,
+            "the entry frames must balance — a stranded slot climbs toward the 64 cap"
+        );
+        assert!(!callback_active(), "the callback depth unwound to zero");
+        assert!(vm.idle_baselines.is_empty(), "the baseline stack unwound");
+        assert_eq!(vm.eval("6 * 7").expect("the VM still works"), "42");
+    }
+
+    /// The other half of the same walk: a guest fatal raised at depth 3 unwinds
+    /// EXACTLY one level. The depth-3 entry answers its shape default; depths 2
+    /// and 1 carry on, evaluate more guest code, and answer their own values.
+    ///
+    /// This is what the single-slot model could not do: one reused `sigjmp_buf`
+    /// meant the `siglongjmp` landed in whichever entry wrote it last — for a
+    /// nest, a frame that had already returned (the hazard `VmHandle`'s own doc
+    /// calls out).
+    #[test]
+    fn guest_fatal_at_depth_3_unwinds_one_level() {
+        let mut vm = boot_test_vm();
+        assert_eq!(vm.eval("3 + 4").expect("warm-up doit"), "7");
+        let base_slots = deopt_trap::current_thread_jmp_slots();
+
+        let log = RefCell::new(Vec::new());
+        let handle: *mut VmHandle = &mut vm;
+        let total = nest_raising(handle, 1, &log);
+
+        // Depth 2 saw depth 3 answer its default; depth 1 saw depth 2 answer
+        // its own value — one level unwound, no more.
+        assert_eq!(
+            *log.borrow(),
+            vec![(2, RECOVERED), (1, 200)],
+            "the raise must consume exactly the entry it was raised in"
+        );
+        assert_eq!(total, 100, "depth 1 answered its own value");
+        assert_eq!(deopt_trap::current_thread_jmp_slots(), base_slots);
+        assert!(!callback_active());
+        assert!(vm.idle_baselines.is_empty());
+        assert_eq!(vm.eval("6 * 7").expect("the VM still works"), "42");
+    }
+
+    /// The raising nest: depth 3 raises the same guest fatal an `error:`/DNU
+    /// raises (`runtime::error::dnu_fallback` and `primitives::prim_error` both
+    /// call exactly this), standing in for a handler that blew up. Depths 1 and
+    /// 2 log what the level below answered, then evaluate more guest code to
+    /// prove the recovery did NOT rewind them.
+    #[allow(unsafe_code)]
+    fn nest_raising(handle: *mut VmHandle, depth: u64, log: &RefCell<Vec<(u64, u64)>>) -> u64 {
+        // SAFETY: as `nest` above.
+        let h = unsafe { &mut *handle };
+        h.dispatch_callback(RECOVERED, |_vm| {
+            if depth == 3 {
+                deopt_trap::raise_guest_fatal(format!("g0 probe: handler raised at depth {depth}"));
+            }
+            let h = unsafe { &mut *handle };
+            let deeper = nest_raising(handle, depth + 1, log);
+            log.borrow_mut().push((depth, deeper));
+            // The load-bearing check: this OUTER entry is still usable after
+            // the inner one recovered — its own frames were never rewound.
+            assert_eq!(
+                h.eval("1 + 1")
+                    .expect("the outer entry still evaluates")
+                    .trim(),
+                "2",
+                "depth {depth} was disturbed by a recovery below it"
+            );
+            depth * 100
+        })
+    }
 }
 
 // WINVM: this module is the embedded-VmHandle integration suite — it boots

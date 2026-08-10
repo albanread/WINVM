@@ -123,14 +123,57 @@ which FFI methods already are).
 
 ## Implementation sequence (each step ends green)
 
-1. **Slot-stack kernel** (`deopt_trap.rs`): `push`/`pop`/top + the platform-safe
+1. ✅ **Slot-stack kernel** (`deopt_trap.rs`): `push`/`pop`/top + the platform-safe
    lookup, proven in isolation by a nested-LIFO `sigsetjmp`/`siglongjmp` unit
    test in the module's own test suite (it already has real-fault recovery
    tests to model on). De-risks the riskiest kernel before any embed change.
-2. **Baseline stack + depth + wiring** (`embed.rs`): migrate eval/exec/
+2. ✅ **Baseline stack + depth + wiring** (`embed.rs`): migrate eval/exec/
    dispatch_callback; remove fail-closed. Gate: existing embed tests green +
    `nested_entry_depth_5` (no re-entry token yet — the test double calls the
    handle directly).
 3. **Re-entry token** (`ffi.rs`): the `&mut` seam; gate with a test that nests
    *through* a real FFI stub double.
 4. Tests 2–4 + replace the Cocoa fail-closed test; full suite green = G0 done.
+
+### Step 2 as landed (2026-08-10)
+
+Three decisions the spec left open, resolved by the implementation:
+
+- **`push_entry_frame`/`pop_entry_frame` are platform-neutral, the machinery
+  behind them is not.** On Windows they are the LIFO stack; on POSIX `push` *is*
+  `claim_jmp_slot` and `pop` is a no-op (the single slot is released by
+  `deregister_setjmp` at `VmHandle` Drop, exactly as before). So macOS keeps
+  byte-identical behavior *and* the seven `sigsetjmp` entry points in `embed.rs`
+  carry no `cfg` of their own. Only the fail-closed guard is written as a `cfg`
+  at its site, because that is a genuine behavior fork.
+- **All seven entry points migrated**, not just the three the spec named:
+  `render_fragment`, `fire_widget_action`, `eval_to_string` and `eval_to_bytes`
+  are entries too, and any of them can be invoked from the dev control channel
+  *inside* a live handler. Each body now sits in a labeled block so every exit —
+  including the early `Ok(None)`/parse-error arms and the `?` that used to sit in
+  `eval_to_bytes` — funnels through one `pop_entry`; a `return` past it would
+  strand the frame as the thread's LIFO recovery target.
+- **The lookup's fallback is load-bearing.** `lookup_jmp_slot_for_current_thread`
+  consults `entry_slot_top()` first and falls back to the owner scan, so
+  single-slot `claim_jmp_slot` users (this module's own recovery tests) keep
+  working. Mutation-checked: deleting the top-of-stack shortcut makes
+  `guest_fatal_at_depth_3_unwinds_one_level` fail exactly as predicted — the
+  scan finds the OUTERMOST slot, so a raise at depth 3 unwinds all three levels
+  instead of one.
+
+Gate tests live in `src/embed.rs::g0_nested_entries` (`#[cfg(all(test,
+windows))]`): `nested_entry_depth_5` (five nested `dispatch_callback` entries,
+each running a real doit through `eval` so both entry kinds interleave on the
+LIFO, each asserting from *inside* the nest that it owns a distinct recovery
+slot and its own idle baseline) and `guest_fatal_at_depth_3_unwinds_one_level`
+(spec gate test 2, pulled forward — it is the direct proof of LIFO recovery).
+
+⚠️ **Coverage gap found while landing this.** `embed.rs`'s main test module is
+`#[cfg(all(test, target_os = "macos"))]` — a Phase-2 WINVM decision whose stated
+reason ("relies on `sigsetjmp`-based guest-fatal recovery, stubbed on Windows")
+is now obsolete: the VEH + hand-written setjmp/longjmp landed in `eb8bdd7`. So
+~90 embed tests, including the recovery-to-a-clean-baseline ones that guard
+exactly the machinery this sprint reshapes, do not run on Windows at all. The
+G0 module above is the only Windows coverage of `VmHandle`'s entry paths.
+Un-gating that suite (the FFI/worker/Cocoa demos will need their own narrower
+gates) is worth its own slice before G1 leans harder on this substrate.

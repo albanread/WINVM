@@ -411,6 +411,13 @@ static JMP_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// Only ever called from ordinary (non-signal) code — `VmHandle::boot`
 /// (S21 step 2), once, before any guest code runs on that thread.
+///
+/// Since G0 step 2 the embed entries go through [`push_entry_frame`] instead,
+/// which on POSIX is exactly this function; on **Windows** that path claims a
+/// fresh slot per entry, so this one survives there only for this module's own
+/// single-slot recovery tests — hence the platform-conditional `dead_code`
+/// allow (the same shape `PROBE_IN_PROGRESS` uses below).
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn claim_jmp_slot() -> usize {
     let me = current_thread_id();
     let _g = JMP_REGISTRY_LOCK.lock().unwrap();
@@ -431,10 +438,24 @@ pub(crate) fn claim_jmp_slot() -> usize {
 //    FRESH slot so a nested entry cannot clobber the outer frame's `sigjmp_buf`,
 //    and a fault recovers the LIFO top. `push`/`pop` are ordinary-code helpers
 //    (run at entry/exit, never in the fault handler); `entry_slot_top` is the
-//    value the handler's slot lookup will consult once the embed wiring lands
-//    (G0 step 2). This slice is the foundation only — proven by a bookkeeping
-//    unit test — with the `sigsetjmp` integration and `lookup_jmp_slot_for_
-//    current_thread` change deliberately deferred to keep it additive + green.
+//    recovery target [`lookup_jmp_slot_for_current_thread`] consults (G0 step 2,
+//    wired below).
+//
+//    **The machinery is Windows-only** (scope decision 2026-07-24): the whole
+//    nesting path serves the Win32 wndproc, so the stack, the top-of-stack fault
+//    lookup, and `crate::embed`'s fail-closed removal are `#[cfg(windows)]`.
+//    macOS/Cocoa keeps the single-slot, top-level-only model byte-identical —
+//    its "always top-level" doctrine never nests — so **no thread-local is ever
+//    read from a POSIX signal handler** (a TLS read there can call
+//    `__tls_get_addr`, which is not async-signal-safe). A Windows VEH is not a
+//    signal handler: it runs in the faulting thread's own context with TLS
+//    intact, so `entry_slot_top`'s `Cell::get` is sound there.
+//
+//    [`push_entry_frame`]/[`pop_entry_frame`] are nonetheless a PLATFORM-NEUTRAL
+//    pair, so the seven `sigsetjmp` entry points in `crate::embed` carry no `cfg`
+//    of their own: on POSIX they degrade to exactly today's behavior (claim this
+//    thread's one reusable slot; release it at `VmHandle` Drop, not at exit).
+#[cfg(windows)]
 thread_local! {
     /// The LIFO of registry slots this thread has pushed as entry frames.
     /// Touched only in ordinary code; the fault handler never reads it.
@@ -453,7 +474,7 @@ thread_local! {
 /// clobber the outer frame's `sigjmp_buf` — records it as this thread's LIFO
 /// top, and returns it for the caller's INLINE `sigsetjmp` (the [`jmp_buf_ptr`]
 /// rule: `sigsetjmp` at the caller's own live frame, never through a wrapper).
-#[allow(dead_code)] // wired into eval/exec/dispatch_callback in G0 step 2
+#[cfg(windows)]
 pub(crate) fn push_entry_frame() -> usize {
     let me = current_thread_id();
     let slot = {
@@ -472,10 +493,19 @@ pub(crate) fn push_entry_frame() -> usize {
     slot
 }
 
+/// The POSIX twin of [`push_entry_frame`] (see the section comment above):
+/// entries never nest on macOS/Cocoa, so a "frame push" is exactly today's
+/// single reusable per-thread slot — byte-identical behavior, and no
+/// thread-local for the signal handler to read.
+#[cfg(not(windows))]
+pub(crate) fn push_entry_frame() -> usize {
+    claim_jmp_slot()
+}
+
 /// Pop this thread's top entry frame (normal return, or after a recovery arm
 /// rewound to it): release the slot back to the registry and restore the
 /// previous frame as the LIFO top.
-#[allow(dead_code)] // wired in G0 step 2
+#[cfg(windows)]
 pub(crate) fn pop_entry_frame() {
     ENTRY_SLOT_STACK.with(|st| {
         let mut stack = st.borrow_mut();
@@ -486,11 +516,17 @@ pub(crate) fn pop_entry_frame() {
     });
 }
 
-/// This thread's current LIFO top entry slot, or `None`. The recovery-target
-/// accessor the fault handler's slot lookup will consult once wired (G0 step 2)
-/// — under the signal-safety constraint documented at
-/// [`lookup_jmp_slot_for_current_thread`].
-#[allow(dead_code)]
+/// The POSIX twin of [`pop_entry_frame`]: nothing to pop. The single slot
+/// stays claimed for the thread's whole life exactly as today and is released
+/// by [`deregister_setjmp`] at `VmHandle` Drop — releasing it at each entry's
+/// exit would be a behavior change on a path that never nests.
+#[cfg(not(windows))]
+pub(crate) fn pop_entry_frame() {}
+
+/// This thread's current LIFO top entry slot, or `None` — the recovery target
+/// [`lookup_jmp_slot_for_current_thread`] consults on Windows, under the
+/// signal-safety reasoning documented in the section comment above.
+#[cfg(windows)]
 pub(crate) fn entry_slot_top() -> Option<usize> {
     let t = TOP_ENTRY_SLOT.with(|c| c.get());
     if t == usize::MAX {
@@ -549,6 +585,16 @@ pub(crate) unsafe fn jmp_buf_ptr(i: usize) -> *mut core::ffi::c_int {
 /// restarts. Keyed by `pthread_self()`, so calling it from a thread that
 /// never claimed a slot is a harmless no-op.
 pub(crate) fn deregister_setjmp() {
+    // G0: this frees slots by owner, so it must not leave the entry stack
+    // naming one of them as the recovery target — a later fault would
+    // `longjmp` into a buffer the registry has since handed to someone else.
+    // A no-op in practice (entries are balanced, so the stack is empty between
+    // them); belt-and-braces for the unbalanced `fatal_exit` paths.
+    #[cfg(windows)]
+    {
+        ENTRY_SLOT_STACK.with(|st| st.borrow_mut().clear());
+        TOP_ENTRY_SLOT.with(|c| c.set(usize::MAX));
+    }
     let me = current_thread_id();
     let _g = JMP_REGISTRY_LOCK.lock().unwrap();
     for owner in JMP_OWNER.iter() {
@@ -597,8 +643,31 @@ pub fn current_thread_jmp_slots() -> usize {
 /// Async-signal-safe: does THIS (faulting) thread have a registered
 /// recovery slot? A fixed-array linear scan matched by `pthread_self()`,
 /// no lock, no allocation — the same shape as `lookup_pc_full` above, just
-/// keyed by owning thread instead of by pc range.
+/// keyed by owning thread instead of by pc range. Reads NO thread-local, which
+/// is what makes it safe from a POSIX signal handler (see the G0 section
+/// comment on [`push_entry_frame`]).
+#[cfg(not(windows))]
 fn lookup_jmp_slot_for_current_thread() -> Option<usize> {
+    let me = current_thread_id();
+    (0..JMP_REGISTRY_CAP).find(|&i| JMP_OWNER[i].load(Ordering::Acquire) == me)
+}
+
+/// The Windows twin (G0/V1): the recovery target is the **LIFO top** entry
+/// frame, not "whichever slot this thread owns first". With nested embed
+/// entries a thread owns one slot per live frame, and the linear scan would
+/// find the OUTERMOST — a fault in a nested wndproc entry would then
+/// `longjmp` past every intervening native frame into the outer entry, blowing
+/// away live Win32 state that is still executing below it. Falling back to the
+/// scan keeps single-slot `claim_jmp_slot` users (this module's own tests) working.
+///
+/// Called from `handle_win_fault`, a VEH — which, unlike a POSIX signal
+/// handler, runs in the faulting thread's ordinary context with TLS intact, so
+/// the `Cell::get` behind `entry_slot_top` is sound there.
+#[cfg(windows)]
+fn lookup_jmp_slot_for_current_thread() -> Option<usize> {
+    if let Some(top) = entry_slot_top() {
+        return Some(top);
+    }
     let me = current_thread_id();
     (0..JMP_REGISTRY_CAP).find(|&i| JMP_OWNER[i].load(Ordering::Acquire) == me)
 }
@@ -2567,7 +2636,9 @@ mod tests {
     /// This proves the stack the nested-entry `sigsetjmp` + embed wiring build
     /// on before either exists — the sprint's "surface a flaw in the re-entry
     /// model before anything is built on it" applied to its first brick.
+    /// Windows-only with the machinery it exercises (scope decision 2026-07-24).
     #[test]
+    #[cfg(windows)]
     fn entry_frame_stack_is_lifo_and_releases_slots() {
         let me = current_thread_id();
         let initial = entry_slot_top();
